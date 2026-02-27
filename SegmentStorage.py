@@ -1,6 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
+import pysam
 
 @dataclass(frozen=True, order=True)
 class Segment:
@@ -32,7 +33,7 @@ class SegmentCollection:
     """
     Collection of non-overlapping segments that can be added to and iterated over.
     """
-    def __init__ (self, segments: List[Segment] = None, merge_gap: int = 0):
+    def __init__ (self, segments: List[Segment]|SegmentCollection = None, merge_gap: int = 0):
         self.merge_gap = merge_gap
         self.count = 0
         self.storage: Dict[Tuple[str, str], List[Tuple[int, int]]] = dict()
@@ -92,6 +93,32 @@ class SegmentCollection:
 
     def is_empty(self) -> bool:
         return self.count == 0
+
+
+def get_concatenated_segments(sc: SegmentCollection, ref_fasta: str,
+                                    cand_fasta: str) -> Tuple[str, str]:
+    """
+    Concatenate segments in SegmentCollection order into two strings
+    (ref, cand) using the provided assembly FASTA files.
+    """
+    ref_parts: List[str] = []
+    cand_parts: List[str] = []
+
+    ref_fa = pysam.FastaFile(ref_fasta)
+    cand_fa = pysam.FastaFile(cand_fasta)
+    try:
+        for seg in sc:
+            if seg.assembly == "ref":
+                ref_parts.append(ref_fa.fetch(seg.contig, seg.start, seg.end))
+            elif seg.assembly == "cand":
+                cand_parts.append(cand_fa.fetch(seg.contig, seg.start, seg.end))
+            else:
+                raise ValueError(f"Unknown assembly label: {seg.assembly}")
+    finally:
+        ref_fa.close()
+        cand_fa.close()
+
+    return "".join(ref_parts), "".join(cand_parts)
 
 
 if __name__ == "__main__":

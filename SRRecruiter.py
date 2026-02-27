@@ -21,22 +21,19 @@ import pysam
 import pandas as pd
 from typing import Set, Iterable
 from SegmentStorage import *
-from aln_utils import calculate_pid, cigar_stats
+from aln_utils import cigar_stats
 
 class Recruiter:
 
-    def __init__(self,  seed: List[Segment], db_path: str,
+    def __init__(self,  db_path: str,
                  ref_bam_path: str, cand_bam_path: str,
-                 merge_gap: int, verbose: bool):
+                 merge_gap: int, verbose: bool,
+                 pid_threshold: float=0.99, plen_threshold: float=0.99):
         self.con = sqlite3.connect(db_path)
-        self.seed = seed
         self.bams = {"ref": pysam.AlignmentFile(ref_bam_path, "rb"),
                      "cand": pysam.AlignmentFile(cand_bam_path, "rb")}
-        self.plen_threshold = 0.9
-        self.pid_primary = 0.99
-        self.pid_secondary = 0.92
-        self.pid_supp = 1
-        self.min_supp_q_aln_len = 1000
+        self.plen_threshold = plen_threshold
+        self.pid_threshold = pid_threshold
         self.merge_gap = merge_gap
         self.max_rounds = 100
         self.verbose = verbose
@@ -52,7 +49,7 @@ class Recruiter:
         self.aln_df = pd.DataFrame(columns=["read_name", "asm", "contig",
                                             "start", "end", "pid", "plen"])
 
-    def run(self) -> Tuple[SegmentCollection, Set[str], pd.DataFrame]:
+    def run(self, seed: List[Segment]|SegmentCollection) -> Tuple[SegmentCollection, Set[str], pd.DataFrame]:
         """
         Runs segment and reads recruitment
         Output:
@@ -60,9 +57,10 @@ class Recruiter:
         reads - Set of read names
         """
         self.reset()
-        self.sc = SegmentCollection(self.seed, merge_gap=self.merge_gap)
+        self.sc = SegmentCollection(seed, merge_gap=self.merge_gap)
         cur_round: int = 0
-        while cur_round != self.max_rounds:
+        while True:
+            assert(cur_round < self.max_rounds) # TODO! raise error if max rounds exceeded
             cur_round += 1
             if self.verbose: print(f"[round {cur_round} start]\tnumber of segments: {len(self.sc)}\t"+
                                                               f"number of seen reads: {len(self.seen_reads)}")
@@ -72,8 +70,6 @@ class Recruiter:
                 break
             self.seen_reads.update(new_reads)
             self.expand_reads_to_segments(new_reads)
-            if self.verbose: print(f"[round {cur_round} start]\tnumber of segments: {len(self.sc)}\t"+
-                                                              f"number of seen reads: {len(self.seen_reads)}")
         if self.verbose: print(f"DONE segments recruited:", self.sc)
         return self.sc, self.seen_reads, self.aln_df
 
@@ -87,26 +83,12 @@ class Recruiter:
         reads: Set[str] = set()
         for seg in self.sc:
             for aln in self.bams[seg.assembly].fetch(seg.contig, seg.start, seg.end):
-                if aln.is_unmapped or aln.reference_start < seg.start or aln.reference_end > seg.end:
+                assert(not aln.is_unmapped)
+                if aln.reference_start < seg.start or aln.reference_end > seg.end:
                     continue
-                # secondary alignments:
-                pid = calculate_pid(aln)
-                soft_left, soft_right, hard_left, hard_right, q_aln_len, q_len, plen = cigar_stats(aln)
-                if aln.is_secondary:
-                    if pid < self.pid_secondary or plen is None or plen < self.plen_threshold:
-                        continue
-                    if aln.query_name not in self.seen_reads:
-                        reads.add(aln.query_name)
-                        continue
-                # supplementary alignments
-                if aln.is_supplementary:
-                    if pid < self.pid_supp or q_aln_len < self.min_supp_q_aln_len:
-                        continue
-                    if aln.query_name not in self.seen_reads:
-                        reads.add(aln.query_name)
-                        continue
-                # primary alignments
-                if pid < self.pid_primary or plen is None or plen < self.plen_threshold:
+                #pid = calculate_pid(aln)
+                soft_left, soft_right, hard_left, hard_right, q_aln_len, q_len, plen, pid = cigar_stats(aln)
+                if pid < self.pid_threshold or plen is None or plen < self.plen_threshold:
                     continue
                 if aln.query_name not in self.seen_reads:
                     reads.add(aln.query_name)
@@ -133,15 +115,10 @@ class Recruiter:
                       AND start IS NOT NULL
                       AND end IS NOT NULL
                       AND read_name IN ({{READS_IN}})
-                      AND (
-                            (aln_type IN ('primary','primary_wsup') AND pid >= ? AND plen >= ?)
-                         OR (aln_type = 'secondary'               AND pid >= ? AND plen >= ?)
-                         OR (aln_type = 'supplementary'           AND pid >= ? AND q_aln_len >= ?)
-                      )
+                      AND pid >= ?
+                      AND plen >= ?
                     """
-        tail_params = [self.pid_primary, self.plen_threshold,
-                       self.pid_secondary, self.plen_threshold,
-                       self.pid_supp, self.min_supp_q_aln_len]
+        tail_params = [self.pid_threshold, self.plen_threshold]
         for chunk in _chunks(list(reads), 1000):
             reads_in = ",".join(["?"] * len(chunk))
             sql = base_sql.replace("{READS_IN}", reads_in)

@@ -15,19 +15,6 @@ License: MIT License
 import pysam
 from typing import Tuple, Optional
 
-def calculate_pid(aln: pysam.AlignedSegment) -> float:
-    """
-    Estimate query percent identity from edit distance tag (NM).
-    Returns:
-        pid - percent of identical bases in alignment
-    """
-    try:
-        nm = aln.get_tag("NM")
-        qlen = aln.query_length
-        return 1 - (nm / qlen) if qlen > 0 else 0
-    except KeyError:
-        return 0
-
 def cigar_stats(aln: pysam.AlignedSegment) -> Tuple[int, int, int, int, int, int, Optional[float]]:
     """
     Calculate stats from CIGAR string.
@@ -73,6 +60,11 @@ def cigar_stats(aln: pysam.AlignedSegment) -> Tuple[int, int, int, int, int, int
         if op in (0, 1, 7, 8):
             q_aln_len += l
 
+
     q_len = q_aln_len + soft_left + soft_right + hard_left + hard_right
+    assert(q_len > 0)
+    assert(aln.has_tag("NM"))
+    nm = aln.get_tag("NM")
+    pid = 1 - nm / q_aln_len
     plen = (q_aln_len / q_len) if q_len > 0 else None
-    return soft_left, soft_right, hard_left, hard_right, q_aln_len, q_len, plen
+    return soft_left, soft_right, hard_left, hard_right, q_aln_len, q_len, plen, pid
