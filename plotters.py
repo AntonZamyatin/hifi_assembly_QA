@@ -22,10 +22,20 @@ from aln_utils import cigar_stats
 from typing import List
 from SegmentStorage import SegmentCollection, Segment
 
+
+PID_TIE_EPS_DEFAULT = 0.001
+SUPPORT_COLORS = {
+    "ref_only": "#2166ac",   # blue
+    "ref_best": "#92c5de",   # light blue
+    "cand_only": "#b2182b",  # red
+    "cand_best": "#f4a3c2",  # pink
+    "equal_best": "#9cd9af", # light green
+}
+
 def alignment_plot(bamfile: str, segments: List[Segment],
                    pid_threshold: float = 0.99, binsize: int = 1000,
-                   ax=None, read_buckets=None, orientation: str = "x",
-                   return_max=False):
+                   ax=None, read_buckets=None, read_bucket_colors=None, orientation: str = "x",
+                   return_max=False, pid_tie_eps: float = 1e-12):
     """
     Generate a simple alignment plot for a given BAM file, contig, and region.
 
@@ -38,15 +48,18 @@ def alignment_plot(bamfile: str, segments: List[Segment],
     if not segments:
         raise ValueError("segments must be a non-empty list")
     segments = sorted(segments, key=lambda s: (s.contig, s.start, s.end))
-    bins = [0 for i in range(math.ceil(sum((s.end - s.start) for s in segments) / binsize))]
+    bins = [0.0 for i in range(math.ceil(sum((s.end - s.start) for s in segments) / binsize))]
     bucket_bins = None
     name_to_bucket = None
     if read_buckets is not None:
-        bucket_bins = [[0 for _ in range(len(bins))] for _ in range(len(read_buckets))]
+        bucket_bins = [[0.0 for _ in range(len(bins))] for _ in range(len(read_buckets))]
         name_to_bucket = {}
         for i, bucket in enumerate(read_buckets):
             for name in bucket:
                 name_to_bucket[name] = i
+
+    # Collect valid alignments first; later keep only best-PID alignments per read.
+    valid_alns = []
     offset = 0
     for seg in segments:
         for aln in bam.fetch(seg.contig, start=seg.start, end=seg.end):
@@ -54,18 +67,37 @@ def alignment_plot(bamfile: str, segments: List[Segment],
             if pid >= pid_threshold:
                 startbin = math.floor((max(aln.reference_start, seg.start) - seg.start + offset) / binsize)
                 endbin = math.ceil((min(aln.reference_end, seg.end) - seg.start + offset) / binsize)
-                if bucket_bins is None:
-                    for i in range(startbin, endbin):
-                        bins[i] += 1
-                else:
-                    bucket_idx = name_to_bucket.get(aln.query_name, None)
-                    if bucket_idx is None:
-                        for i in range(startbin, endbin):
-                            bins[i] += 1
-                    else:
-                        for i in range(startbin, endbin):
-                            bucket_bins[bucket_idx][i] += 1
+                if startbin < endbin:
+                    valid_alns.append((aln.query_name, float(pid), startbin, endbin))
         offset += (seg.end - seg.start)
+
+    # Keep only best-PID alignments for each read; split weight across ties.
+    best_pid_by_read = {}
+    for read_name, pid, startbin, endbin in valid_alns:
+        if read_name not in best_pid_by_read or pid > best_pid_by_read[read_name]:
+            best_pid_by_read[read_name] = pid
+
+    best_aln_counts_by_read = {}
+    for read_name, pid, startbin, endbin in valid_alns:
+        if pid + pid_tie_eps >= best_pid_by_read.get(read_name, float("-inf")):
+            best_aln_counts_by_read[read_name] = best_aln_counts_by_read.get(read_name, 0) + 1
+
+    for read_name, pid, startbin, endbin in valid_alns:
+        if pid + pid_tie_eps < best_pid_by_read.get(read_name, float("-inf")):
+            continue
+        n = best_aln_counts_by_read.get(read_name, 1)
+        w = 1.0 / float(max(n, 1))
+        if bucket_bins is None:
+            for i in range(startbin, endbin):
+                bins[i] += w
+        else:
+            bucket_idx = name_to_bucket.get(read_name, None)
+            if bucket_idx is None:
+                for i in range(startbin, endbin):
+                    bins[i] += w
+            else:
+                for i in range(startbin, endbin):
+                    bucket_bins[bucket_idx][i] += w
     if ax is None:
         fig, ax = plt.subplots(figsize=(16, 5))
         standalone = True
@@ -78,7 +110,12 @@ def alignment_plot(bamfile: str, segments: List[Segment],
         else:
             raise ValueError("orientation must be 'x' or 'y'")
     else:
-        colors = [f"C{i % 10}" for i in range(len(bucket_bins))] + ['#9e9e9e']
+        if read_bucket_colors is None:
+            colors = [f"C{i % 10}" for i in range(len(bucket_bins))] + ['#9e9e9e']
+        else:
+            if len(read_bucket_colors) != len(bucket_bins):
+                raise ValueError("read_bucket_colors length must match read_buckets length")
+            colors = list(read_bucket_colors) + ['#6e6e6e']
         series = bucket_bins + [bins]
         if orientation == "x":
             ax.stackplot(x, series, colors=colors, step='pre')
@@ -110,7 +147,13 @@ def alignment_plot(bamfile: str, segments: List[Segment],
         plt.ylabel('Number of Alignments')
         plt.title('Alignment Plot for Segments (' + str(len(segments)) + ')')
         plt.show()
-    if return_max: return ax, max(bins)
+    if return_max:
+        if bucket_bins is None:
+            return ax, max(bins) if bins else 0.0
+        total = np.array(bins, dtype=float)
+        for s in bucket_bins:
+            total += np.array(s, dtype=float)
+        return ax, float(np.max(total)) if len(total) > 0 else 0.0
     return ax
 
 
@@ -201,7 +244,8 @@ def dotplot_kmer(seq_a: str, seq_b: str, k: int = 15, binsize: int = 1000,
 
 
 def reads_alignment_dotplot(sc: SegmentCollection, read_names: set[str], pid_threshold: float,
-                            plen_threshold: float, db_path: str, ax=None, line_alpha: float = 0.3):
+                            plen_threshold: float, db_path: str, ax=None, line_alpha: float = 1,
+                            line_width_px: float = 6.0, pid_tie_eps: float = PID_TIE_EPS_DEFAULT):
     """
     Plot read support as a dot-plot (lines) between candidate (X) and reference (Y).
     Alignments are fetched from the read-indexed alignment database.
@@ -280,35 +324,54 @@ def reads_alignment_dotplot(sc: SegmentCollection, read_names: set[str], pid_thr
             if pid < pid_threshold or plen < plen_threshold:
                 continue
             by_read.setdefault(read_name, {}).setdefault(asm, []).append(
-                (contig, start, end, strand)
+                (contig, start, end, strand, pid, plen)
             )
 
-    # Plot lines between candidate (X) and reference (Y) alignments.
-    for read_name, per_asm in by_read.items():
+    # Build one plotted line per read using best-PID alignment on each assembly.
+    lines = []
+    for read_name in reads:
+        per_asm = by_read.get(read_name, {})
         ref_alns = per_asm.get("ref", [])
         cand_alns = per_asm.get("cand", [])
         if not ref_alns or not cand_alns:
             continue
-        for r_contig, r_start, r_end, r_strand in ref_alns:
-            r_mapped = _map_pos(ref_segs, r_contig, r_start, r_end)
-            if r_mapped is None:
-                continue
-            r0, r1 = r_mapped
-            if r_strand == 0:
-                r0, r1 = r1, r0
-            for c_contig, c_start, c_end, c_strand in cand_alns:
-                c_mapped = _map_pos(cand_segs, c_contig, c_start, c_end)
-                if c_mapped is None:
-                    continue
-                c0, c1 = c_mapped
-                if c_strand == 0:
-                    c0, c1 = c1, c0
-                ax.plot([c0, c1], [r0, r1], color="red", alpha=line_alpha, linewidth=0.5)
+        r_contig, r_start, r_end, r_strand, r_pid, r_plen = max(
+            ref_alns, key=lambda x: (x[4], x[5], x[2] - x[1])
+        )
+        c_contig, c_start, c_end, c_strand, c_pid, c_plen = max(
+            cand_alns, key=lambda x: (x[4], x[5], x[2] - x[1])
+        )
+
+        r_mapped = _map_pos(ref_segs, r_contig, r_start, r_end)
+        c_mapped = _map_pos(cand_segs, c_contig, c_start, c_end)
+        if r_mapped is None or c_mapped is None:
+            continue
+
+        r0, r1 = r_mapped
+        c0, c1 = c_mapped
+        if r_strand == 0:
+            r0, r1 = r1, r0
+        if c_strand == 0:
+            c0, c1 = c1, c0
+        lines.append((c0, c1, r0, r1, c_pid, r_pid))
+
+    # Plot fixed-width lines with PID-based colors.
+    if lines:
+        dpi = ax.figure.dpi if ax.figure is not None else 72.0
+        lw_points = line_width_px * 72.0 / dpi
+        for c0, c1, r0, r1, c_pid, r_pid in lines:
+            if c_pid - r_pid > pid_tie_eps:
+                color = SUPPORT_COLORS["cand_best"]
+            elif r_pid - c_pid > pid_tie_eps:
+                color = SUPPORT_COLORS["ref_best"]
+            else:
+                color = SUPPORT_COLORS["equal_best"]
+            ax.plot([c0, c1], [r0, r1], color=color, alpha=line_alpha, linewidth=lw_points)
 
     # Draw segment boundaries (hardcoded styling)
     boundary_color = "#b0b0b0"
-    boundary_alpha = 0.8
-    boundary_lw = 0.6
+    boundary_alpha = 1
+    boundary_lw = 1
     for _, start, end, off in cand_segs[:-1]:
         ax.axvline(off + (end - start), color=boundary_color,
                    alpha=boundary_alpha, linewidth=boundary_lw)
@@ -373,6 +436,7 @@ def report_plot(seq_ref: str, seq_cand: str, segments: SegmentCollection, read_n
     sc_sorted = sorted(segments, key=lambda s: (s.contig, s.start, s.end))
     cand_len = _total_len(sc_sorted, "cand")
     ref_len = _total_len(sc_sorted, "ref")
+
     height = max(4.0, 16.0 * (ref_len / max(cand_len, 1)) + 4)
     fig, ax = plt.subplots(figsize=(16.0, height), dpi=dpi)
 
@@ -398,6 +462,80 @@ def report_plot(seq_ref: str, seq_cand: str, segments: SegmentCollection, read_n
 
     # Marginal alignment plots
     if cand_bam is not None and ref_bam is not None:
+        cand_segs = [s for s in sc_sorted if s.assembly == "cand"]
+        ref_segs = [s for s in sc_sorted if s.assembly == "ref"]
+
+        def _interval_in_segments(seg_list: List[Segment], contig: str, start: int, end: int) -> bool:
+            for seg in seg_list:
+                if seg.contig == contig and start >= seg.start and end <= seg.end:
+                    return True
+            return False
+
+        segs_by_asm = {"cand": cand_segs, "ref": ref_segs}
+
+        def _classify_reads_for_support_colors(db_file: str, reads_set: set[str],
+                                               pid_thr: float, eps: float = 0.001):
+            reads = list(reads_set)
+            out = {
+                "ref_only": set(),          # blue
+                "cand_only": set(),         # red
+                "ref_best": set(),          # light blue
+                "cand_best": set(),         # pink
+                "equal_best": set(),        # light gray
+            }
+            if not reads:
+                return out
+            con = sqlite3.connect(db_file)
+            try:
+                chunk_size = 800
+                for i in range(0, len(reads), chunk_size):
+                    chunk = reads[i:i + chunk_size]
+                    reads_in = ",".join(["?"] * len(chunk))
+                    rows = con.execute(
+                        f"""
+                        SELECT assembly, read_name, contig, start, end, pid
+                        FROM aln
+                        WHERE assembly IN ('cand', 'ref')
+                          AND read_name IN ({reads_in})
+                        """,
+                        chunk,
+                    ).fetchall()
+                    per_read = {}
+                    for asm, rn, contig, start, end, pid in rows:
+                        asm = str(asm)
+                        if pid is None or float(pid) < pid_thr:
+                            continue
+                        if not _interval_in_segments(segs_by_asm[asm], str(contig), int(start), int(end)):
+                            continue
+                        if rn not in per_read:
+                            per_read[rn] = {}
+                        info = per_read[rn].setdefault(asm, {"n_aln": 0, "max_pid": float("-inf")})
+                        info["n_aln"] += 1
+                        info["max_pid"] = max(info["max_pid"], float(pid))
+                    for rn in chunk:
+                        asm_vals = per_read.get(rn, {})
+                        ref_info = asm_vals.get("ref", {"n_aln": 0, "max_pid": 0.0})
+                        cand_info = asm_vals.get("cand", {"n_aln": 0, "max_pid": 0.0})
+                        has_ref = ref_info["n_aln"] > 0
+                        has_cand = cand_info["n_aln"] > 0
+                        if has_ref and not has_cand:
+                            out["ref_only"].add(rn)
+                        elif has_cand and not has_ref:
+                            out["cand_only"].add(rn)
+                        elif has_ref and has_cand:
+                            ref_pid = ref_info["max_pid"]
+                            cand_pid = cand_info["max_pid"]
+                            d = cand_pid - ref_pid
+                            if abs(d) <= eps:
+                                out["equal_best"].add(rn)
+                            elif d > 0:
+                                out["cand_best"].add(rn)
+                            else:
+                                out["ref_best"].add(rn)
+            finally:
+                con.close()
+            return out
+
         from mpl_toolkits.axes_grid1 import make_axes_locatable
         divider = make_axes_locatable(ax)
         ax_top = divider.append_axes("top", size=2, pad=0, sharex=ax)
@@ -405,12 +543,37 @@ def report_plot(seq_ref: str, seq_cand: str, segments: SegmentCollection, read_n
         ax_top.tick_params(axis="x", labelbottom=False)
         ax_right.tick_params(axis="y", labelleft=False)
 
-        cand_segs = [s for s in sc_sorted if s.assembly == "cand"]
-        ref_segs = [s for s in sc_sorted if s.assembly == "ref"]
+        read_classes = _classify_reads_for_support_colors(
+            db_path, read_names, pid_threshold, eps=PID_TIE_EPS_DEFAULT
+        )
+        cand_buckets = [
+            read_classes["cand_only"],  # red
+            read_classes["cand_best"],  # pink
+            read_classes["equal_best"], # light gray
+        ]
+        cand_colors = [
+            SUPPORT_COLORS["cand_only"],
+            SUPPORT_COLORS["cand_best"],
+            SUPPORT_COLORS["equal_best"],
+        ]
+        ref_buckets = [
+            read_classes["ref_only"],   # blue
+            read_classes["ref_best"],   # light blue
+            read_classes["equal_best"], # light gray
+        ]
+        ref_colors = [
+            SUPPORT_COLORS["ref_only"],
+            SUPPORT_COLORS["ref_best"],
+            SUPPORT_COLORS["equal_best"],
+        ]
         ax_top, maxx = alignment_plot(cand_bam, cand_segs, pid_threshold=pid_threshold, binsize=binsize,
-                                      ax=ax_top, read_buckets=[read_names], orientation="x", return_max=True)
+                                      ax=ax_top, read_buckets=cand_buckets,
+                                      read_bucket_colors=cand_colors,
+                                      orientation="x", return_max=True)
         ax_right, maxy = alignment_plot(ref_bam, ref_segs, pid_threshold=pid_threshold, binsize=binsize,
-                                        ax=ax_right, read_buckets=[read_names], orientation="y", return_max=True)
+                                        ax=ax_right, read_buckets=ref_buckets,
+                                        read_bucket_colors=ref_colors,
+                                        orientation="y", return_max=True)
 
         m = max(maxx, maxy)
         ax_top.set_ylim(0, m)
