@@ -5,7 +5,7 @@ import pysam
 
 @dataclass(frozen=True, order=True)
 class Segment:
-    assembly: str   # e.g. "ref" or "cand"
+    assembly: str   # e.g. "asm1" or "asm2"
     contig: str
     start: int
     end: int
@@ -96,7 +96,8 @@ class SegmentCollection:
 
 
 def get_concatenated_segments(sc: SegmentCollection, ref_fasta: str,
-                                    cand_fasta: str) -> Tuple[str, str]:
+                                    cand_fasta: str, asm1: str = "asm1",
+                                    asm2: str = "asm2") -> Tuple[str, str]:
     """
     Concatenate segments in SegmentCollection order into two strings
     (ref, cand) using the provided assembly FASTA files.
@@ -108,9 +109,9 @@ def get_concatenated_segments(sc: SegmentCollection, ref_fasta: str,
     cand_fa = pysam.FastaFile(cand_fasta)
     try:
         for seg in sc:
-            if seg.assembly == "ref":
+            if seg.assembly == asm1:
                 ref_parts.append(ref_fa.fetch(seg.contig, seg.start, seg.end))
-            elif seg.assembly == "cand":
+            elif seg.assembly == asm2:
                 cand_parts.append(cand_fa.fetch(seg.contig, seg.start, seg.end))
             else:
                 raise ValueError(f"Unknown assembly label: {seg.assembly}")

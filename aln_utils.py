@@ -15,7 +15,7 @@ License: MIT License
 import pysam
 from typing import Tuple, Optional
 
-def cigar_stats(aln: pysam.AlignedSegment) -> Tuple[int, int, int, int, int, int, Optional[float]]:
+def cigar_stats(aln: pysam.AlignedSegment) -> Tuple[int, int, int, int, int, int, Optional[float], float]:
     """
     Calculate stats from CIGAR string.
     Returns:
