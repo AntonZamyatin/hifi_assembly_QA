@@ -1,1 +1,49 @@
+# ── environments / caches ────────────────────────────────────────────────────
 /venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+*.swp
+
+# ── secrets (never commit) ───────────────────────────────────────────────────
+.secrets/
+
+# ── large data & result directories (kept on disk, out of git) ───────────────
+/data/
+/alignments/
+/genomes/
+/patching/
+/candidates/
+/segments/
+/tables/
+/recruitment_out/
+/recruitment_cand1/
+/reads_analysis/
+/anomaly_analysis/
+/examples/genomes/
+/examples/alignments/
+/examples/bgz/
+/examples/dbs/
+/examples/lja/
+/examples/quast/
+/examples/tmp/
+/examples/analysis/
+/examples/anomalies/
+/examples/anomalies_data/
+
+# ── large / generated binary artifacts anywhere ──────────────────────────────
+*.bam
+*.bai
+*.bgz
+*.fai
+*.gzi
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.fastq
+*.fastq.gz
+
+# ── IDE ──────────────────────────────────────────────────────────────────────
+/.idea/

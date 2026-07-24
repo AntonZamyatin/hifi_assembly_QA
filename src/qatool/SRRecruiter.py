@@ -22,10 +22,12 @@ import pysam
 import pysam
 import pandas as pd
 import math
+import os
 from collections import Counter
 from typing import Set, Iterable, List, Tuple, Dict
-from SegmentStorage import *
-from aln_utils import cigar_stats
+from qatool.SegmentStorage import *
+from qatool.aln_utils import cigar_stats
+from qatool.plotters import report_plot
 
 class Recruiter:
 
@@ -37,8 +39,18 @@ class Recruiter:
                  pid_threshold: float=0.99, plen_threshold: float=0.99,
                  extension_window: int=100, extension_k: int=5,
                  ext_max: int=100_000, ext_rounds: int=100,
-                 max_rounds=100):
+                 max_rounds=100, out_dir: str | None = "recruitment_out",
+                 best_pid_delta: float = 0.0001):
+        self.db_path = db_path
         self.con = sqlite3.connect(db_path)
+        _tables = {r[0] for r in self.con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )}
+        if "aln" not in _tables:
+            raise RuntimeError(
+                f"Database '{db_path}' has no 'aln' table. "
+                "Run prepare_data.sh (or build_aln_db.py) to populate it first."
+            )
         if asm1 == asm2:
             raise ValueError("asm1 and asm2 must be different")
         self.asm1 = asm1
@@ -56,6 +68,8 @@ class Recruiter:
         self.extension_k = extension_k
         self.ext_max = ext_max
         self.ext_rounds = ext_rounds
+        self.out_dir = out_dir
+        self.best_pid_delta = best_pid_delta
 
         self.sc: SegmentCollection = SegmentCollection(merge_gap=self.merge_gap)
         self.seen_reads: Set[str] = set()
@@ -73,6 +87,29 @@ class Recruiter:
         self._sealed = {}
         self._common_cache = {}
 
+    def _concat_seqs_for_segments(self, sc_sorted: List[Segment], assembly: str) -> str:
+        fa = self.fastas[assembly]
+        parts: List[str] = []
+        for seg in sc_sorted:
+            if seg.assembly != assembly:
+                continue
+            parts.append(fa.fetch(seg.contig, seg.start, seg.end))
+        return "".join(parts)
+
+    def _write_round_plot(self, round_id: int):
+        if self.out_dir is None:
+            return
+        os.makedirs(self.out_dir, exist_ok=True)
+        sc_sorted = sorted(self.sc, key=lambda s: (s.contig, s.start, s.end))
+        seq_asm1 = self._concat_seqs_for_segments(sc_sorted, self.asm1)
+        seq_asm2 = self._concat_seqs_for_segments(sc_sorted, self.asm2)
+        out_path = os.path.join(self.out_dir, f"round_{round_id}.png")
+        """report_plot(
+            seq_asm1, seq_asm2, self.sc, self.seen_reads,
+            self.db_path, self.pid_threshold, self.plen_threshold,
+            output_path=out_path, asm1=self.asm1, asm2=self.asm2, show=False
+        )"""
+
     def run(self, seed: List[Segment]|SegmentCollection) -> Tuple[SegmentCollection, Set[str], pd.DataFrame]:
         """
         Runs segment and reads recruitment
@@ -83,6 +120,7 @@ class Recruiter:
         self.reset()
         self.sc = SegmentCollection(seed, merge_gap=self.merge_gap)
         self._prime_contig_lengths()
+        self._clamp_seed_to_contig_bounds()
         cur_round: int = 0
         while True:
             # assert(cur_round < self.max_rounds) # TODO! raise error if max rounds exceeded
@@ -100,6 +138,7 @@ class Recruiter:
                 break
             self.seen_reads.update(new_reads)
             self.expand_reads_to_segments(new_reads)
+            self._write_round_plot(cur_round)
         if self.verbose: print(f"DONE segments recruited:", self.sc)
         # Final pass: include reads fully contained in the final segments
         final_reads = self.expand_segments_to_reads()
@@ -112,6 +151,24 @@ class Recruiter:
             return
         for asm, bam in self.bams.items():
             self._contig_lens[asm] = {name: int(length) for name, length in zip(bam.references, bam.lengths)}
+
+    def _clamp_seed_to_contig_bounds(self):
+        clamped = []
+        changed = False
+        for seg in self.sc:
+            contig_len = self._contig_lens.get(seg.assembly, {}).get(seg.contig)
+            if contig_len is None:
+                clamped.append(seg)
+                continue
+            new_start = max(0, seg.start)
+            new_end = min(seg.end, contig_len)
+            if new_start != seg.start or new_end != seg.end:
+                print(f"WARNING: seed segment {seg.assembly}:{seg.contig}:{seg.start}-{seg.end} "
+                      f"exceeds contig bounds [0, {contig_len}), clamped to {new_start}-{new_end}")
+                changed = True
+            clamped.append(Segment(seg.assembly, seg.contig, new_start, new_end))
+        if changed:
+            self.sc = SegmentCollection(clamped, merge_gap=self.merge_gap)
 
     def _remap_sealed_to_current_segments(self):
         if not self._sealed:
@@ -127,42 +184,51 @@ class Recruiter:
         cached = self._common_cache.get(read_name)
         if cached is not None:
             return cached
-        asm_list = [self.asm1, self.asm2]
-        sql = """
-            SELECT assembly, contig, start, end, strand, pid, plen
-            FROM aln
-            WHERE assembly IN (?,?)
-              AND read_name = ?
-              AND pid >= ?
-              AND plen >= ?
-        """
-        params = [asm_list[0], asm_list[1], read_name, self.pid_threshold, self.plen_threshold]
-        rows = self.con.execute(sql, params).fetchall()
-        by_asm: Dict[str, List[Tuple[str, int, int]]] = {asm_list[0]: [], asm_list[1]: []}
-        for asm, contig, start, end, strand, pid, plen in rows:
-            by_asm[str(asm)].append((str(contig), int(start), int(end)))
-        if not by_asm[asm_list[0]] or not by_asm[asm_list[1]]:
-            self._common_cache[read_name] = False
-            return False
-        if len(by_asm[asm_list[0]]) != len(by_asm[asm_list[1]]):
+
+        rows = self.con.execute(
+            """SELECT assembly, contig, start, end, pid
+               FROM aln
+               WHERE assembly IN (?,?)
+                 AND read_name = ?
+                 AND pid >= ?
+                 AND plen >= ?""",
+            [self.asm1, self.asm2, read_name, self.pid_threshold, self.plen_threshold],
+        ).fetchall()
+
+        # Step 1: best PID per assembly
+        best_pid: Dict[str, float] = {}
+        for asm, contig, start, end, pid in rows:
+            pid = float(pid)
+            if pid > best_pid.get(asm, float("-inf")):
+                best_pid[asm] = pid
+
+        if self.asm1 not in best_pid or self.asm2 not in best_pid:
             self._common_cache[read_name] = False
             return False
 
-        def _revcomp(seq: str) -> str:
-            comp = str.maketrans("ACGTNacgtn", "TGCANtgcan")
-            return seq.translate(comp)[::-1]
+        if abs(best_pid[self.asm1] - best_pid[self.asm2]) > self.best_pid_delta:
+            self._common_cache[read_name] = False
+            return False
 
-        def _seq_hashes(asm: str, loci: List[Tuple[str, int, int]]) -> Counter:
+        # Step 2: collect best loci (within delta) per assembly
+        loci: Dict[str, List[Tuple[str, int, int]]] = {self.asm1: [], self.asm2: []}
+        for asm, contig, start, end, pid in rows:
+            if float(pid) + self.best_pid_delta >= best_pid[asm]:
+                loci[asm].append((str(contig), int(start), int(end)))
+
+        # Step 3: compare sequence hash multisets
+        _comp = str.maketrans("ACGTNacgtn", "TGCANtgcan")
+
+        def _seq_hashes(asm: str, loci_list: List[Tuple[str, int, int]]) -> Counter:
             fa = self.fastas[asm]
             out: Counter = Counter()
-            for contig, start, end in loci:
-                seq = fa.fetch(contig, start, end)
-                seq_rc = _revcomp(seq)
+            for contig, start, end in loci_list:
+                seq = fa.fetch(contig, start, end).upper()
                 out[hashlib.sha1(seq.encode()).digest()] += 1
-                out[hashlib.sha1(seq_rc.encode()).digest()] += 1
+                out[hashlib.sha1(seq.translate(_comp)[::-1].encode()).digest()] += 1
             return out
 
-        is_common = _seq_hashes(asm_list[0], by_asm[asm_list[0]]) == _seq_hashes(asm_list[1], by_asm[asm_list[1]])
+        is_common = _seq_hashes(self.asm1, loci[self.asm1]) == _seq_hashes(self.asm2, loci[self.asm2])
         self._common_cache[read_name] = is_common
         return is_common
 
@@ -173,16 +239,14 @@ class Recruiter:
         uncommon_reads: Set[str] = set()
         for aln in self.bams[asm].fetch(contig, w_start, w_end):
             assert(not aln.is_unmapped)
-            soft_left, soft_right, hard_left, hard_right, q_aln_len, q_len, plen, pid = cigar_stats(aln)
+            soft_left, soft_right, hard_left, hard_right, q_aln_len, q_len, plen, pid, _ = cigar_stats(aln)
             if pid < self.pid_threshold or plen is None or plen < self.plen_threshold:
                 continue
             if self._read_is_common(aln.query_name):
                 common_reads.add(aln.query_name)
             else:
                 uncommon_reads.add(aln.query_name)
-                if uncommon_reads:
-                    return False
-        if len(common_reads) > self.extension_k and not uncommon_reads:
+        if len(common_reads) > self.extension_k or not uncommon_reads:
             print("SEALED", asm, contig, w_start, w_end, len(common_reads))
             return True
         return False
@@ -222,13 +286,30 @@ class Recruiter:
             while not sealed_left:
                 w_start = start
                 w_end = min(start + self.extension_window, end)
-                if self._check_window_for_extension(seg.assembly, seg.contig, w_start, w_end):
-                    sealed_left = True
-                    break
                 if start <= left_limit:
                     sealed_left = True
                     break
-                new_start = max(left_limit, start - self.extension_window)
+                if w_end <= w_start:
+                    sealed_left = True
+                    break
+                left_ends: List[int] = []
+                common_left_ends: List[int] = []
+                for aln in self.bams[seg.assembly].fetch(seg.contig, w_start, w_end):
+                    left_ends.append(int(aln.reference_start))
+                    if self._read_is_common(aln.query_name):
+                        common_left_ends.append(int(aln.reference_start))
+                if not left_ends:
+                    sealed_left = True
+                    break
+                if self._check_window_for_extension(seg.assembly, seg.contig, w_start, w_end):
+                    candidates = [s for s in common_left_ends if s <= start]
+                    if not candidates:
+                        sealed_left = True
+                        break
+                    target = max(candidates)
+                else:
+                    target = min(left_ends)
+                new_start = max(left_limit, target)
                 if new_start == start:
                     sealed_left = True
                     break
@@ -239,13 +320,30 @@ class Recruiter:
             while not sealed_right:
                 w_end = end
                 w_start = max(end - self.extension_window, start)
-                if self._check_window_for_extension(seg.assembly, seg.contig, w_start, w_end):
-                    sealed_right = True
-                    break
                 if end >= right_limit:
                     sealed_right = True
                     break
-                new_end = min(right_limit, end + self.extension_window)
+                if w_end <= w_start:
+                    sealed_right = True
+                    break
+                right_ends: List[int] = []
+                common_right_ends: List[int] = []
+                for aln in self.bams[seg.assembly].fetch(seg.contig, w_start, w_end):
+                    right_ends.append(int(aln.reference_end))
+                    if self._read_is_common(aln.query_name):
+                        common_right_ends.append(int(aln.reference_end))
+                if not right_ends:
+                    sealed_right = True
+                    break
+                if self._check_window_for_extension(seg.assembly, seg.contig, w_start, w_end):
+                    candidates = [e for e in common_right_ends if e >= end]
+                    if not candidates:
+                        sealed_right = True
+                        break
+                    target = min(candidates)
+                else:
+                    target = max(right_ends)
+                new_end = min(right_limit, target)
                 if new_end == end:
                     sealed_right = True
                     break
@@ -293,7 +391,7 @@ class Recruiter:
                 if aln.query_name in self.seen_reads:
                     continue
                 #pid = calculate_pid(aln)
-                soft_left, soft_right, hard_left, hard_right, q_aln_len, q_len, plen, pid = cigar_stats(aln)
+                soft_left, soft_right, hard_left, hard_right, q_aln_len, q_len, plen, pid, _ = cigar_stats(aln)
                 if pid < self.pid_threshold or plen is None or plen < self.plen_threshold:
                     continue
                 reads.add(aln.query_name)
