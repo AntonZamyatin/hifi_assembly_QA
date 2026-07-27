@@ -295,6 +295,9 @@ class Recruiter:
                 left_ends: List[int] = []
                 common_left_ends: List[int] = []
                 for aln in self.bams[seg.assembly].fetch(seg.contig, w_start, w_end):
+                    _, _, _, _, _, _, plen, pid, _ = cigar_stats(aln)
+                    if pid < self.pid_threshold or plen is None or plen < self.plen_threshold:
+                        continue
                     left_ends.append(int(aln.reference_start))
                     if self._read_is_common(aln.query_name):
                         common_left_ends.append(int(aln.reference_start))
@@ -302,14 +305,19 @@ class Recruiter:
                     sealed_left = True
                     break
                 if self._check_window_for_extension(seg.assembly, seg.contig, w_start, w_end):
+                    # Window is common-dominated: snap out to the nearest bridging common
+                    # read (the one whose start is closest to the boundary), then seal.
+                    # Do not keep crawling through the common region.
                     candidates = [s for s in common_left_ends if s <= start]
-                    if not candidates:
-                        sealed_left = True
-                        break
-                    target = max(candidates)
-                else:
-                    target = min(left_ends)
-                new_start = max(left_limit, target)
+                    if candidates:
+                        new_start = max(max(candidates), left_limit)
+                        if new_start != start:
+                            print("LEFT_ext", seg.assembly, seg.contig, w_start, w_end)
+                            start = new_start
+                    sealed_left = True
+                    break
+                # Discriminating window: extend to the outermost qualifying read.
+                new_start = max(left_limit, min(left_ends))
                 if new_start == start:
                     sealed_left = True
                     break
@@ -329,6 +337,9 @@ class Recruiter:
                 right_ends: List[int] = []
                 common_right_ends: List[int] = []
                 for aln in self.bams[seg.assembly].fetch(seg.contig, w_start, w_end):
+                    _, _, _, _, _, _, plen, pid, _ = cigar_stats(aln)
+                    if pid < self.pid_threshold or plen is None or plen < self.plen_threshold:
+                        continue
                     right_ends.append(int(aln.reference_end))
                     if self._read_is_common(aln.query_name):
                         common_right_ends.append(int(aln.reference_end))
@@ -336,14 +347,19 @@ class Recruiter:
                     sealed_right = True
                     break
                 if self._check_window_for_extension(seg.assembly, seg.contig, w_start, w_end):
+                    # Window is common-dominated: snap out to the nearest bridging common
+                    # read (the one whose end is closest to the boundary), then seal.
+                    # Do not keep crawling through the common region.
                     candidates = [e for e in common_right_ends if e >= end]
-                    if not candidates:
-                        sealed_right = True
-                        break
-                    target = min(candidates)
-                else:
-                    target = max(right_ends)
-                new_end = min(right_limit, target)
+                    if candidates:
+                        new_end = min(min(candidates), right_limit)
+                        if new_end != end:
+                            print("RIGHT_ext", seg.assembly, seg.contig, w_start, w_end)
+                            end = new_end
+                    sealed_right = True
+                    break
+                # Discriminating window: extend to the outermost qualifying read.
+                new_end = min(right_limit, max(right_ends))
                 if new_end == end:
                     sealed_right = True
                     break
