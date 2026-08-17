@@ -11,6 +11,7 @@ from qatool.SegmentStorage import SegmentCollection
 from qatool.plotters.axis import _build_axis_map
 from qatool.plotters.colors import SUPPORT_COLORS, PID_TIE_EPS_DEFAULT
 from qatool.plotters.db import _fetch_aln_from_db
+from qatool.plotters.reads_dotplot import _map_in_segment, _overlapping_segment
 
 
 def reads_alignment_dotplot(sc: SegmentCollection, read_names: set[str], pid_threshold: float,
@@ -26,11 +27,33 @@ def reads_alignment_dotplot(sc: SegmentCollection, read_names: set[str], pid_thr
 
     If aln_by_asm is provided it is used directly and no DB query is issued.
     """
-    def _map_pos(lookup: dict, contig: str, start: int, end: int):
-        for s, e, off in lookup.get(contig, ()):
-            if start >= s and end <= e:
-                return off + (start - s), off + (end - s)
-        return None
+    def _visible_t_range(lookup: dict, contig: str, start: int, end: int, strand: int):
+        """(t_lo, t_hi, segment) for the on-screen part of one alignment.
+
+        t runs 0..1 along the read — the parameterisation this overlay already assumes
+        when it draws a straight line between the two assemblies' coordinates.  An
+        alignment overhanging a segment edge yields a sub-range instead of being dropped.
+        """
+        seg = _overlapping_segment(lookup, contig, start, end)
+        if seg is None:
+            return None
+        s, e, _ = seg
+        vs, ve = max(start, s), min(end, e)
+        if ve <= vs:
+            return None
+        span = end - start
+        if span <= 0:
+            return None
+        if strand == 1:
+            t_a, t_b = (vs - start) / span, (ve - start) / span
+        else:
+            t_a, t_b = (end - ve) / span, (end - vs) / span
+        return (min(t_a, t_b), max(t_a, t_b), seg)
+
+    def _at_t(seg, start: int, end: int, strand: int, t: float):
+        """Plot coordinate of read-fraction t along one alignment."""
+        ref = start + t * (end - start) if strand == 1 else end - t * (end - start)
+        return _map_in_segment(seg, ref)
 
     standalone = ax is None
     if standalone:
@@ -85,17 +108,21 @@ def reads_alignment_dotplot(sc: SegmentCollection, read_names: set[str], pid_thr
             asm2_alns, key=lambda x: (x[4], x[5], x[2] - x[1])
         )
 
-        r_mapped = _map_pos(asm1_lookup, r_contig, r_start, r_end)
-        c_mapped = _map_pos(asm2_lookup, c_contig, c_start, c_end)
-        if r_mapped is None or c_mapped is None:
+        r_vis = _visible_t_range(asm1_lookup, r_contig, r_start, r_end, r_strand)
+        c_vis = _visible_t_range(asm2_lookup, c_contig, c_start, c_end, c_strand)
+        if r_vis is None or c_vis is None:
+            continue
+        # Clip both sides to the stretch of read visible on BOTH assemblies; clipping
+        # them independently would leave the two ends describing different read spans.
+        t0 = max(r_vis[0], c_vis[0])
+        t1 = min(r_vis[1], c_vis[1])
+        if t1 <= t0:
             continue
 
-        r0, r1 = r_mapped
-        c0, c1 = c_mapped
-        if r_strand == 0:
-            r0, r1 = r1, r0
-        if c_strand == 0:
-            c0, c1 = c1, c0
+        r0 = _at_t(r_vis[2], r_start, r_end, r_strand, t0)
+        r1 = _at_t(r_vis[2], r_start, r_end, r_strand, t1)
+        c0 = _at_t(c_vis[2], c_start, c_end, c_strand, t0)
+        c1 = _at_t(c_vis[2], c_start, c_end, c_strand, t1)
         lines.append((c0, c1, r0, r1, c_pid, r_pid, read_name))
 
     # Plot fixed-width lines with PID-based colors, batched by color into LineCollections.
