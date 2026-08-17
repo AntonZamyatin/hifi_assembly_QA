@@ -14,12 +14,30 @@ lets a single matrix hold every origin at once.
   f_I[u, v]  last state I, having emitted r[u-1] and consumed t[0..v-1]
   f_D[u, v]  last state D, consuming t[v-1]
 
-Origins and ends.  With `origin=None` the pass is free-start: the begin state is
-seeded at every template position, which is exactly the marginalisation over
-origins of §7 and the reason `B -> D` must stay excluded (see params.py).  With
-`full_template=False` it is free-end: the score sums terminal mass over every
-template consumption, which absorbs trailing padding.  `f_D` is excluded from
-that sum, and that exclusion *is* `D -> E` being forbidden.
+Two extents, not one.  A window has a *template* extent, which must be long
+enough to hold the read plus indel slack, and an *origin* extent, the set of
+start positions the window is responsible for.  They are not the same interval
+and conflating them is a correctness bug, so `origin` controls the second
+independently:
+
+  origin=None      every position in the template  (whole-unit free-start pass)
+  origin=(lo, hi)  half-open range of origins, template may extend past `hi`
+  origin=o         exactly one origin
+
+The model's sum runs over every origin in the recruited *unit*, and a read in a
+repeat has several placements, so a single call is in general one term of that
+sum rather than the whole of it.  Totals are combined by log-sum-exp over
+windows, which is valid only when their origin ranges are disjoint: template
+extents overlap by design, origin extents must not, or shared origins are
+counted twice.  `origin=None` over the whole unit is the exact case where one
+call is the entire sum, and it is what stage F is checked against.
+
+Ends.  `full_template=False` is free-end: the score sums terminal mass over
+every template consumption, which absorbs trailing padding.  `f_D` is excluded
+from that sum, and that exclusion *is* `D -> E` being forbidden.  There is no
+analogous "end extent" to bound, because a path that runs off the right of the
+window simply carries no mass there; `WindowScore.edge_mass` reports when that
+has happened.
 
 Termination.  Under the default `tau = 0` no termination factor is applied: the
 returned value is `log sum_m [f_M(L,m) + f_I(L,m)]`, the length-conditioned
@@ -60,6 +78,22 @@ def _as_qual(qual, length: int) -> np.ndarray:
     if arr.shape != (length,):
         raise ValueError(f"qual has length {arr.shape}, read has length {length}")
     return arr
+
+
+def _origin_range(origin, T: int) -> tuple[int, int]:
+    """Normalise `origin` to a half-open range of legal start positions.
+
+    Origin `T` is never legal: it would put the read's start past the last
+    template base.
+    """
+    if origin is None:
+        return 0, T
+    lo, hi = (origin, origin + 1) if isinstance(origin, (int, np.integer)) \
+        else (int(origin[0]), int(origin[1]))
+    if not 0 <= lo < hi <= T:
+        raise ValueError(
+            f"origin range [{lo}, {hi}) outside template of length {T}")
+    return lo, hi
 
 
 def _la(a: float, b: float) -> float:
@@ -131,8 +165,7 @@ def _dp(read: np.ndarray, qual: np.ndarray, tmpl: np.ndarray,
     """
     tr = params.log_trans()
     L, T = read.shape[0], tmpl.shape[0]
-    if origin is not None and not 0 <= origin < T:
-        raise ValueError(f"origin {origin} outside template of length {T}")
+    lo, hi = _origin_range(origin, T)
 
     combine = max if use_max else _la
 
@@ -153,16 +186,14 @@ def _dp(read: np.ndarray, qual: np.ndarray, tmpl: np.ndarray,
         pI = np.full(shape, _STATE_NONE, dtype=np.int8)
         pD = np.full(shape, _STATE_NONE, dtype=np.int8)
 
-    # Begin state. B -> M at origin o aligns r[0] to t[o], landing at v = o+1.
-    # B -> I emits r[0] without consuming template, so it stays at v = o.
+    # Begin state, seeded across the origin range only. B -> M at origin o aligns
+    # r[0] to t[o] and so lands at v = o+1; B -> I emits r[0] without consuming
+    # template and so stays at v = o. That one-position offset is why the two
+    # slices differ.
     start_m = np.full(T + 1, NEG_INF)
     start_i = np.full(T + 1, NEG_INF)
-    if origin is None:
-        start_m[1:] = tr.b_m
-        start_i[:T] = tr.b_i
-    else:
-        start_m[origin + 1] = tr.b_m
-        start_i[origin] = tr.b_i
+    start_m[lo + 1:hi + 1] = tr.b_m
+    start_i[lo:hi] = tr.b_i
 
     for u in range(1, L + 1):
         q = int(qual[u - 1])
@@ -243,13 +274,17 @@ def _prepare(read, qual, template, params, qt):
 
 def forward(read, qual, template, params: PhmmParams | None = None,
             qt: QualityTable | None = None, *,
-            origin: int | None = None, full_template: bool = False) -> WindowScore:
-    """Sum over every alignment path, and over origins unless one is given.
+            origin=None, full_template: bool = False) -> WindowScore:
+    """Sum over every alignment path, and over the origins in `origin`.
 
-    `origin=None` marginalises over all template positions (the production
-    case); an integer pins the start.  `full_template=True` additionally forces
-    the path to finish at the right edge, giving classical global alignment when
-    combined with `origin=0` -- used by the oracle tests, not in scoring.
+    `origin=None` covers the whole template, `(lo, hi)` a half-open range, an
+    integer a single position.  Use the range form whenever the template is
+    padded past the origins this call is responsible for -- summing several such
+    calls is only valid if their ranges are disjoint.
+
+    `full_template=True` additionally forces the path to finish at the right
+    edge, giving classical global alignment when combined with `origin=0`.  That
+    combination is for the oracle tests; scoring never uses it.
     """
     r, q, t, p, table = _prepare(read, qual, template, params, qt)
     fM, fI, _, _ = _dp(r, q, t, p, table, origin, full_template, False, False)
@@ -264,7 +299,7 @@ def forward(read, qual, template, params: PhmmParams | None = None,
 
 def viterbi(read, qual, template, params: PhmmParams | None = None,
             qt: QualityTable | None = None, *,
-            origin: int | None = None, full_template: bool = False) -> ViterbiResult:
+            origin=None, full_template: bool = False) -> ViterbiResult:
     """Best single path, with traceback. Never used for scoring (Remark 6)."""
     r, q, t, p, table = _prepare(read, qual, template, params, qt)
     L, T = r.shape[0], t.shape[0]
@@ -302,6 +337,13 @@ def viterbi(read, qual, template, params: PhmmParams | None = None,
 
 
 def forward_window(read, qual, template, params: PhmmParams | None = None,
-                   qt: QualityTable | None = None) -> WindowScore:
-    """The production primitive: free start, free end, no termination factor."""
-    return forward(read, qual, template, params, qt, origin=None, full_template=False)
+                   qt: QualityTable | None = None, *, origin=None) -> WindowScore:
+    """Free start over `origin`, free end, no termination factor.
+
+    With `origin=None` over a whole recruited unit this is the model's full
+    origin sum.  Over a padded window around one alignment it is a single term
+    of that sum, and the caller must combine terms by log-sum-exp over disjoint
+    origin ranges.
+    """
+    return forward(read, qual, template, params, qt, origin=origin,
+                   full_template=False)

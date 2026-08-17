@@ -148,6 +148,53 @@ def test_window_additivity():
           f"free start {got!r} != logsumexp over origins {want!r}")
 
 
+def test_windows_compose_over_disjoint_origin_ranges():
+    """The composition rule the origin-anchored kernel of stage F depends on.
+
+    A window has two extents: its template must hold the read plus slack, while
+    its origin range is only the placements it is responsible for. Summing
+    windows is exact when the origin ranges partition the unit -- note the
+    templates here all run to the end of the unit and so overlap heavily, which
+    is required, since a read starting near the right of one range still needs
+    sequence to align into.
+
+    Making the ranges overlap instead double-counts, which the second half
+    checks: it is the failure mode that would silently inflate every repeat.
+    """
+    rng = random.Random(2024)
+    unit = _rand_seq(60, rng)
+    tmpl = unit * 3
+    read = unit
+    params = PhmmParams()
+
+    full = forward_window(read, 40, tmpl, params, QT).logp
+    parts = [forward_window(read, 40, tmpl, params, QT, origin=(lo, hi)).logp
+             for lo, hi in ((0, 60), (60, 120), (120, 180))]
+    m = max(parts)
+    composed = m + math.log(sum(math.exp(x - m) for x in parts))
+    check(abs(composed - full) < 1e-12,
+          f"disjoint windows summed to {composed!r}, whole-unit pass gave {full!r}")
+
+    overlapped = parts + [forward_window(read, 40, tmpl, params, QT,
+                                         origin=(30, 90)).logp]
+    m = max(overlapped)
+    inflated = m + math.log(sum(math.exp(x - m) for x in overlapped))
+    check(inflated > full + 0.2,
+          f"overlapping ranges must double-count noticeably; got "
+          f"{inflated - full:.3e} nats above the true sum")
+
+
+def test_origin_range_rejects_bad_bounds():
+    read, tmpl = "ACGTACGT", "ACGTACGTACGT"
+    for bad in ((5, 5), (-1, 4), (0, 99), (12, 13)):
+        try:
+            forward(read, 40, tmpl, PhmmParams(), QT, origin=bad)
+        except ValueError:
+            continue
+        _failures.append(f"origin={bad} must raise")
+        print(f"  FAIL: origin={bad} must raise")
+
+
 def test_homopolymer_degeneracy():
     """model.tex Remark 6, corrected: the ratio is 5, not 7.
 
@@ -329,6 +376,8 @@ def main():
     tests = [
         test_exact_path_enumeration,
         test_window_additivity,
+        test_windows_compose_over_disjoint_origin_ranges,
+        test_origin_range_rejects_bad_bounds,
         test_homopolymer_degeneracy,
         test_mismatch_costs_s,
         test_monotone_in_edit_distance,

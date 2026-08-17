@@ -14,14 +14,29 @@ is known, **L** can go sideways, **XL** a project of its own.
 **One core function, parameterised by window.** The primitive is
 
 ```python
-forward_window(read, qual, template, params) -> WindowScore
+forward_window(read, qual, template, params, origin=None) -> WindowScore
 ```
 
-returning `log Σ_p P(r, ℓ | Q, p)` over every origin `p` in `template`, plus
-diagnostics. Everything is a special case: pad = 0 is fixed-origin, a 100 kb
-template is the free-start pass of model.tex §5.8. A thin adapter extracts the
-window from a FASTA given `(contig, pos, pad)` — no database, no recruiter, no
-BAM. Simulation and real data hit the same code path.
+returning `log Σ_{p ∈ origin} P(r, ℓ | Q, p)` plus diagnostics. A thin adapter
+extracts the template from a FASTA given `(contig, pos, pad)` — no database, no
+recruiter, no BAM. Simulation and real data hit the same code path.
+
+**A window has two extents, and they are not the same interval.** Its *template*
+extent must be long enough to hold the read plus indel slack. Its *origin*
+extent is the set of start positions the window is responsible for. Conflating
+them is a correctness bug, so `origin` controls the second independently:
+`None` for the whole template, `(lo, hi)` for a half-open range, an integer for
+one position.
+
+This matters because the model's `Σ_p` runs over every origin in the recruited
+*unit*, while a padded window around one alignment covers only that alignment's
+neighbourhood. A read in a repeat has several placements — and those secondary
+placements *are* the copy-number signal — so in general one call is one term of
+the sum. Terms combine by log-sum-exp, valid only when the origin ranges are
+disjoint: template extents overlap by design, origin extents must not, or shared
+origins are counted twice and every repeat is silently inflated. The whole-unit
+free-start pass (`origin=None` over the unit) is the case where one call is the
+entire sum, and it is the oracle stage F is measured against.
 
 **Padding is a parameter with a self-check.** The true origin differs from a
 reported alignment start by indel drift plus soft-clipping, so the window must
@@ -113,6 +128,11 @@ handled by reverse-complementing the read, once, at the adapter boundary.
 - **Window additivity.** `forward_window` over a template equals `logsumexp` of
   pad-0 calls at each origin, to 1e-9. This is the definition of correctness for
   the windowing.
+- **Windows compose over disjoint origin ranges.** Partitioning a unit's origins
+  across several calls, each with a template running to the unit's end, must sum
+  to the whole-unit pass to 1e-12 — the rule stage F's anchored kernel depends on.
+  Overlapping the ranges instead must visibly inflate the total, since that is
+  the silent failure mode it guards against.
 - **Homopolymer degeneracy.** Template `AAAAAAA`, read `AAAAAA`: forward/Viterbi
   = exactly **5**, not 7. A deletion at template position 1 needs `B→D` and at
   position 7 needs `D→E`, both forbidden; the 5 survivors carry an identical
