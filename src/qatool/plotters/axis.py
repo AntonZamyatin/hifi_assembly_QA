@@ -56,6 +56,37 @@ def _bins_to_genome_intervals(bin_values: list, segs_info: list, binsize: int) -
     return [(c, s, e) for c, s, e in merged]
 
 
+def contig_runs(segs_info, total):
+    """Yield (contig, bar_off, bar_end) merging consecutive same-contig segments.
+
+    The recruiter groups same-contig segments together, so a run is the span a single
+    contig colour bar should cover.
+    """
+    if not segs_info:
+        return
+    cur_contig, _, _, cur_off = segs_info[0]
+    for i in range(1, len(segs_info)):
+        if segs_info[i][0] != cur_contig:
+            yield cur_contig, cur_off, segs_info[i][3]
+            cur_contig, _, _, cur_off = segs_info[i]
+    yield cur_contig, cur_off, total
+
+
+def plot_to_genome(segs_info, pos):
+    """
+    Plot coordinate -> (contig, genomic position); inverse of the offset mapping
+    built by _build_axis_map.
+
+    Returns None when pos falls outside every segment.  With a binsize-aligned axis
+    map that includes the padding after a segment whose length is not a whole number
+    of bins: those coordinates have no genomic counterpart.
+    """
+    for contig, start, end, offset in segs_info:
+        if offset <= pos < offset + (end - start):
+            return contig, start + int(pos - offset)
+    return None
+
+
 def _coord_ticks(segs_info, total_len):
     """Major and minor tick positions for genome coordinates across concatenated segments.
     Major ticks: one per segment at its start (segment boundary).

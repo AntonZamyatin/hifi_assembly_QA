@@ -15,6 +15,9 @@ dependencies = [
     "matplotlib",
 ]
 
+[project.optional-dependencies]
+view = ["bokeh", "panel"]
+
 [[project.authors]]
 name = "Anton Zamyatin"
 email = "zamyatin.anton@gmail.com"

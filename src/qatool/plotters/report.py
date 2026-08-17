@@ -22,7 +22,7 @@ from qatool.plotters.colors import (
     SUPPORT_COLORS, OCCURRENCE_COLORS,
     PID_TIE_EPS_DEFAULT, BEST_PID_DELTA_DEFAULT,
 )
-from qatool.plotters.axis import _build_axis_map, _coord_ticks
+from qatool.plotters.axis import _build_axis_map, _coord_ticks, contig_runs
 from qatool.plotters.db import _fetch_aln_from_db, _collect_bam_read_names
 from qatool.plotters.classify import (
     _classify_reads_for_support_colors,
@@ -143,20 +143,9 @@ def _draw_contig_bars(fig, ax, divider, asm1_segs_info, asm2_segs_info,
     _fig_h_px = (height - 2.15) * dpi             # approximate main-axes height (minus bar+top)
     _legend_entries = {}                          # contig -> color, for bars too small to label
 
-    def _contig_runs(segs_info, total):
-        """Yield (contig, bar_off, bar_end) merging consecutive same-contig segments."""
-        if not segs_info:
-            return
-        cur_contig, _, _, cur_off = segs_info[0]
-        for i in range(1, len(segs_info)):
-            if segs_info[i][0] != cur_contig:
-                yield cur_contig, cur_off, segs_info[i][3]
-                cur_contig, _, _, cur_off = segs_info[i]
-        yield cur_contig, cur_off, total
-
     ax_xbar.set_xlim(0, plot_w)
     ax_xbar.set_ylim(0, 1)
-    for contig, bar_off, bar_end in _contig_runs(asm2_segs_info, plot_w):
+    for contig, bar_off, bar_end in contig_runs(asm2_segs_info, plot_w):
         bar_w = bar_end - bar_off
         ax_xbar.add_patch(plt.Rectangle(
             (bar_off, 0), bar_w, 1,
@@ -171,7 +160,7 @@ def _draw_contig_bars(fig, ax, divider, asm1_segs_info, asm2_segs_info,
 
     ax_ybar.set_xlim(0, 1)
     ax_ybar.set_ylim(0, plot_h)
-    for contig, bar_off, bar_end in _contig_runs(asm1_segs_info, plot_h):
+    for contig, bar_off, bar_end in contig_runs(asm1_segs_info, plot_h):
         bar_h = bar_end - bar_off
         ax_ybar.add_patch(plt.Rectangle(
             (0, bar_off), 1, bar_h,
