@@ -9,6 +9,17 @@ comment.  `LogTrans` has no `d_e` field because termination from D is forbidden
 observation can distinguish from terminating earlier), and no `b_d` field
 because B -> D duplicates the path from origin s+1 -- redundancy created by the
 marginalisation over origins, not by the alignment model.
+
+Both exclusions get *stronger* under the windowed scoring of docs/phmm.md, not
+weaker.  A window is template padded on both sides, and it is tempting to add
+B -> D and D -> E to walk across that padding.  They are not needed: the free
+start absorbs leading padding (the read's first base may align at any template
+position) and the free end absorbs trailing padding (the sum runs over every
+template consumption m).  Adding the transitions on top of a free start would
+count "begin at v, delete t_v" and "begin at v+1" as two paths for one
+alignment, and symmetrically at the end.  A classical pair HMM needs B -> D
+because it starts at a fixed position; a free-start pass has already spent that
+degree of freedom on the origin sum, which is where the copy-number signal is.
 """
 
 from __future__ import annotations
@@ -31,7 +42,14 @@ def _log(x: float) -> float:
 
 @dataclass(frozen=True)
 class LogTrans:
-    """Log transition probabilities, one field per edge of the §5.3 table."""
+    """Log transition probabilities, one field per edge of the §5.3 table.
+
+    `m_e` and `i_e` are -inf under the default `tau = 0` and are unused by the
+    length-conditioned forward pass, which returns log sum_m [f_M(l,m) +
+    f_I(l,m)] and leaves the uniform termination prefactor off.  They are kept
+    because they are what makes row M a distribution, and because a positive
+    `tau` is a legitimate choice for the joint model over (r, l).
+    """
 
     b_m: float
     b_i: float
@@ -54,16 +72,30 @@ class PhmmParams:
     the estimates of stage G.  They must never be fitted per candidate: doing so
     lets a poorer assembly compensate with looser error rates (model.tex §12.5).
 
-    `tau` cancels from the comparison whenever the gap parameters are
-    context-independent, because the normaliser Z is then origin- and
-    candidate-independent (§5.6).  It matters only once context dependence lands.
+    `tau` defaults to zero, i.e. read length is conditioned on rather than
+    generated.  A HiFi read stops because the size-selected SMRTbell insert ran
+    out, not because a per-base stopping process fired, so the geometric length
+    distribution a positive `tau` implies (mean 1/tau) describes no real
+    library.  The model discards it anyway: §5.6 divides by Z(l) and lets the
+    empirical f(l) carry length.  `tau` is therefore a normalisation device, and
+    must never be fitted to observed read lengths -- doing so would import the
+    length model the conditioning exists to remove.
+
+    A positive `tau` recovers the joint model over (r, l).  Every path with l
+    emitting states terminates exactly once, from M or from I, at probability
+    `tau` either way, so termination is a uniform prefactor and appears out
+    front in §5.5 eq. (9) rather than inside the recursion.  What does *not*
+    factor out is `tau` sitting inside M->M and I->M: paths with different indel
+    counts carry different powers of those.  Measured at l = 15 kb that is a
+    -1.5 nat shift on the read, but only -0.01 nats of difference between two
+    candidates disagreeing by 100 indels, so it is common mode and cancels.
     """
 
     delta_i: float = 1e-4       # gap open, insertion
     delta_d: float = 1e-4       # gap open, deletion
     gamma_i: float = 0.3        # gap extend, insertion
     gamma_d: float = 0.3        # gap extend, deletion
-    tau: float = 1e-4           # termination
+    tau: float = 0.0            # termination; 0 = condition on read length
 
     def __post_init__(self) -> None:
         for f in fields(self):

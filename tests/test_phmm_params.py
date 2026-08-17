@@ -50,19 +50,38 @@ def test_mismatch_cost_matches_doc():
           "s = 1 must correspond to eps = 3/(3+e)")
 
 
-def test_transition_rows_are_distributions():
-    p = PhmmParams()
-    t = p.log_trans()
-    rows = {
+def _row_sums(t: LogTrans) -> dict:
+    return {
         "B": (t.b_m, t.b_i),
         "M": (t.m_m, t.m_i, t.m_d, t.m_e),
         "I": (t.i_i, t.i_m, t.i_e),
         "D": (t.d_d, t.d_m),
     }
-    for name, logs in rows.items():
-        total = sum(math.exp(x) for x in logs)
-        check(abs(total - 1.0) < 1e-12,
-              f"row {name} sums to {total!r}, must be 1")
+
+
+def test_transition_rows_are_distributions():
+    """Must hold both at the conditioned default and for the joint model."""
+    for p in (PhmmParams(), PhmmParams(tau=1e-4)):
+        for name, logs in _row_sums(p.log_trans()).items():
+            total = sum(math.exp(x) for x in logs)
+            check(abs(total - 1.0) < 1e-12,
+                  f"tau={p.tau}: row {name} sums to {total!r}, must be 1")
+
+
+def test_default_conditions_on_read_length():
+    """A HiFi read ends with the SMRTbell insert, not a per-base stopping process.
+
+    tau = 0 makes length conditioned rather than generated.  The termination
+    edges then carry no mass, which must not break the row sums above, and the
+    length-conditioned forward simply omits the uniform prefactor.
+    """
+    p = PhmmParams()
+    check(p.tau == 0.0, f"default tau must be 0, got {p.tau}")
+    t = p.log_trans()
+    check(t.m_e == -math.inf and t.i_e == -math.inf,
+          "tau = 0 must send both termination edges to -inf, not to a small number")
+    check(math.isfinite(t.m_m) and math.isfinite(t.i_m),
+          "the surviving transitions must stay finite at tau = 0")
 
 
 def test_forbidden_transitions_absent():
@@ -127,6 +146,7 @@ def main():
     tests = [
         test_mismatch_cost_matches_doc,
         test_transition_rows_are_distributions,
+        test_default_conditions_on_read_length,
         test_forbidden_transitions_absent,
         test_quality_table_agrees_with_mismatch_cost,
         test_emissions_are_finite_and_normalised,

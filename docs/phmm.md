@@ -31,10 +31,45 @@ the window edges; a score is only trusted when edge mass is negligible *and*
 stable under doubling pad. This makes the API self-validating, which matters
 because every later stage depends on it.
 
+Pad should be per read, not a global constant. The `aln` table already carries
+`soft_left`, `soft_right`, `hard_left`, `hard_right`, and a read reported at
+`pos` with `soft_left = c` has its true origin near `pos − c`. Sizing from those
+plus slack for indel drift is cheaper than a uniform large pad, and the edge-mass
+diagnostic catches the cases where it was still too small.
+
 **Context-independent gaps first.** With `(δ_I, δ_D, γ_I, γ_D, τ)` constant, the
 normaliser `Z(ℓ, p, A)` depends on neither `p` nor `A` (§5.6), so it cancels from
 ΔLLR — and `τ` cancels with it. The two-tier scheme of §5.8 collapses to a single
 pass. Context dependence is deferred and must be justified by measurement.
+
+**`τ = 0`: read length is conditioned on, not generated.** A HiFi read ends
+because the size-selected SMRTbell insert ran out, not because a per-base
+stopping process fired, so the geometric length distribution a positive `τ`
+implies (mean `1/τ`) describes no real library — as §5.6 concedes. The model
+discards it anyway by dividing through `Z(ℓ)` and letting the empirical `f(ℓ)`
+carry length, which makes `τ` a normalisation device rather than a parameter.
+It must never be fitted to observed read lengths.
+
+`forward_window` therefore returns `log Σ_m [f_M(ℓ,m) + f_I(ℓ,m)]` and leaves
+the termination prefactor off. That prefactor is uniform — every path with `ℓ`
+emitting states terminates exactly once, from M or I, at probability `τ` either
+way — which is why §5.5 eq. (9) carries it out front. What does not factor out
+is `τ` inside `M→M` and `I→M`, since paths with different indel counts carry
+different powers of those; measured at ℓ = 15 kb that is a −1.5 nat shift on the
+read but only −0.01 nats between candidates disagreeing by 100 indels, so it is
+common mode. A positive `τ` remains available for the joint model over `(r, ℓ)`.
+
+**`B→D` and `D→E` stay excluded, and padding is the reason.** A padded window
+invites adding them to walk across the flanks. They are not needed: the free
+start absorbs leading padding (the first read base may align at any template
+position) and the free end absorbs trailing padding (the sum runs over every
+`m`). Adding them on top would count "begin at `v`, delete `t_v`" and "begin at
+`v+1`" as two paths for one alignment, and symmetrically at the end. A classical
+pair HMM needs `B→D` because it starts at a fixed position; a free-start pass has
+already spent that degree of freedom on the origin sum, which is where the
+copy-number signal lives. Remark 3 attributes the degeneracy correctly — it comes
+from marginalising over origins — so a wider window makes the exclusions more
+necessary, not less.
 
 **The reference implementation is permanent.** `reference.py` is the oracle every
 later stage is tested against, not scaffolding.
@@ -90,6 +125,14 @@ handled by reverse-complementing the read, once, at the adapter boundary.
   test, because if it breaks the method is blind to collapses.
 - **Edge mass.** Reported edge mass falls monotonically as pad grows, and the
   score converges.
+- **Termination is a prefactor.** At `τ = 0` the score is finite and the
+  termination edges are never consulted; at `τ > 0` the score shifts by exactly
+  `ℓ`-independent `log τ` relative to `τ = 0`, confirming eq. (9) carries it out
+  front and that no path terminates twice.
+- **No origin double-counting.** Scoring a read against a template padded by an
+  extra `k` bases on either side must leave the score unchanged once edge mass is
+  negligible. This is the observable consequence of excluding `B→D` and `D→E`;
+  reintroducing either makes the score grow with pad.
 
 ### Stage C — Normaliser Z (S)
 
