@@ -1,0 +1,1421 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1.1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{microtype}
+\usepackage[hidelinks]{hyperref}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.6\baselineskip}
+
+\newtheorem{proposition}{Proposition}
+\newtheorem{remark}{Remark}
+
+\DeclareMathOperator{\LSE}{LSE}
+\newcommand{\Prob}{\Pr}
+
+\title{A likelihood model for local comparison of genome assemblies\\
+{\large Model statement and derivations}}
+\author{Anton Zamyatin}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+We state a probabilistic model for adjudicating between two candidate genome
+assemblies at a single locus using the long reads from which they were built.
+The model has three components: a Poisson process governing where reads
+originate, a normalised pair hidden Markov model giving the probability of an
+observed read given its origin, and a recruitment procedure that defines the
+locus as a closed comparison unit.  We show that the local comparison
+agrees with the genome-wide one up to a computable tolerance, that the read
+count must not be replaced by a locally profiled rate, and that the coverage rate must be
+estimated from a source independent of the assemblies.  The reported statistic
+is a robust score rather than a likelihood ratio, reducing to one under stated
+ideal conditions, and its guarantees are statements about expectations whose
+finite-depth error rates we quantify.  Two propositions establish that the more familiar conditional
+formulation is provably blind to copy-number differences among identical
+repeat units and to false duplication.
+\end{abstract}
+
+\tableofcontents
+
+\section{Overview}
+
+Two assemblies of the same individual, built from the same reads, disagree at a
+locus.  We want to know which one the reads support, by how much, and with what
+confidence.
+
+The approach is to treat each candidate as a \emph{hypothesis about the source
+of the reads} and ask which hypothesis assigns higher probability to what was
+actually observed.  Three things must be specified to make this concrete:
+
+\begin{enumerate}
+    \item \textbf{Where reads come from.}  A sequencing run scatters read
+          starts along the genome.  We model this as a Poisson process with a
+          known rate.  Section~\ref{sec:origin}.
+    \item \textbf{What a read looks like once it has an origin.}  The
+          sequencer copies the template imperfectly.  We model this with a
+          three-state pair HMM, completed into a proper distribution over
+          observable reads.  Section~\ref{sec:emission}.
+    \item \textbf{What ``the locus'' means.}  A local comparison is only
+          well-posed if the reads and the sequence they touch form a closed
+          set.  Section~\ref{sec:unit}.
+\end{enumerate}
+
+The reported score $\Delta S$ is built from a difference of log-likelihoods,
+plus a deliberate robust departure for reads only one candidate can explain
+(Section~\ref{sec:truncation}).  Everything else in this document is either a
+derivation of that difference, an argument about how to estimate the one
+external parameter it needs, or a statement of what the model cannot do.
+
+Table~\ref{tab:notation} collects the notation.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{ll}
+\toprule
+symbol & meaning \\
+\midrule
+$A_1, A_2$      & the two candidate assemblies \\
+$L_1, L_2$      & total length of the \emph{recruited} sequence in each candidate (bases) \\
+$k_1, k_2$      & number of disjoint recruited segments in each candidate \\
+$h_{12}(p,Y)$   & retention indicator: 1 if a read with mark $Y$ from origin $p$ is recruited \\
+$\alpha_A(p)$   & retention probability at origin $p$, $\int h_{12}(p,Y)e(Y\mid p,A)\,dY$ \\
+$S^{(a)}_j, C^{(a)}_j$ & read $j$'s mass at origins inside / outside the unit, candidate $a$ \\
+$L_A^{\mathrm{eff}}$ & effective exposure length under the recruitment rule \\
+$R=\{r_1,\dots,r_n\}$ & the recruited read set \\
+$n$             & number of recruited reads \\
+$r_j$           & sequence of read $j$, of length $\ell_j$ \\
+$Q_{ju}$        & Phred quality of base $u$ of read $j$ \\
+$\bar\ell$      & mean read length \\
+$p$             & an origin slot: a (position, strand) pair \\
+$t = t_1\cdots t_m$ & template: assembly sequence at slot $p$, on the relevant strand \\
+$Y=(r,Q)$       & a read mark: sequence and per-base qualities \\
+$e_{jp}$        & $e(Y_j\mid p,A)$, the mark likelihood at origin $p$ \\
+$Z(\ell,p,A)$   & normaliser over reads of length $\ell$ (Section~\ref{sec:normaliser}) \\
+$\lambda$       & read starts per base per strand \\
+$c$             & per-haplotype base coverage depth \\
+$c_k$           & k-mer coverage read off the heterozygous peak \\
+$\varepsilon_u$ & per-base error probability, $10^{-Q_u/10}$ \\
+$s$             & log-probability cost of one mismatch, $\log\!\big(3(1-\varepsilon)/\varepsilon\big)$ \\
+$\delta_I,\delta_D$ & gap-open probabilities (insertion, deletion) \\
+$\gamma_I,\gamma_D$ & gap-extend probabilities \\
+$\tau$          & termination probability \\
+$\kappa_v$      & template sequence context at position $v$ \\
+$m_1, m_2$      & counts of reads explicable by only one candidate \\
+$C$             & cap on the evidence contributed by one such read (nats) \\
+$\Delta\mathrm{LLR}$ & likelihood ratio over reads both candidates place \\
+$\Delta S$      & the reported statistic; positive favours $A_1$ \\
+$\eta$          & locality tolerance (Proposition~\ref{prop:locality}) \\
+$q$             & probability a read from missing sequence is retained and uniquely placeable \\
+\bottomrule
+\end{tabular}
+\caption{Notation used throughout.}
+\label{tab:notation}
+\end{table}
+
+\section{The comparison unit}
+\label{sec:unit}
+
+A locus is defined by recursive read--segment recruitment.  Starting from a seed
+interval, we alternately expand segments to the reads that align to them and
+reads to the segments they touch, in \emph{both} assemblies, until the process
+closes.  The result is a set of segments in each candidate, with total lengths
+$L_1$ and $L_2$, and a single shared read set $R$.
+
+Two properties of the closure matter for what follows.
+
+\paragraph{Symmetry.}  Recruitment runs against both candidates and the read set
+is their union.  Without this, reads recruited via $A_1$ would be selected for
+their fit to $A_1$, and including them in the comparison would be circular.
+
+\paragraph{Sealing.}  Expansion stops only at boundaries where the two
+candidates carry identical sequence and no recruited read crosses outward with
+appreciable probability.  This is what makes the local score meaningful, as
+follows.
+
+Write the whole-assembly length as $L_A^{\text{whole}} = L_A + L_{\text{out}}$
+and split the read set into recruited and outside parts.  Because the two
+candidates agree outside the unit, all terms involving $L_{\text{out}}$ cancel
+in any difference.  Two residues do not cancel automatically, and both arise
+the same way: a read may fit in more than one place.  A read we kept may also
+fit outside the unit, so part of its explanation is invisible to the local
+computation; and a read we did not keep may fit inside the unit, so it is
+missing from the local computation altogether.  Both must be bounded rather
+than assumed away.
+
+\subsection{Recruited reads that also fit elsewhere}
+
+For a recruited read $j$ and candidate $a$, split the origin sum into local and
+outside parts,
+\begin{equation}
+    S^{(a)}_j = \!\!\sum_{p\in A^{(a)}_{\text{rec}}}\!\! e^{(a)}_{jp},
+    \qquad
+    C^{(a)}_j = \!\!\sum_{p\in A^{(a)}_{\text{out}}}\!\! e^{(a)}_{jp} .
+\end{equation}
+These sit inside a logarithm, so a nonzero $C^{(a)}_j$ does not cancel --- it
+dilutes.  Crucially, $C^{(a)}_j$ cannot be zero: a pair HMM with positive
+mismatch and indel probabilities assigns strictly positive mass to every
+sufficiently long template window, so \emph{every} origin in the genome
+contributes something.  The correct statement is therefore a bound, not an
+identity.  The per-read discrepancy between the global and local comparison is
+\begin{equation}
+    \log\!\Big(1+\tfrac{C^{(1)}_j}{S^{(1)}_j}\Big)
+    - \log\!\Big(1+\tfrac{C^{(2)}_j}{S^{(2)}_j}\Big).
+\label{eq:per-read-discrepancy}
+\end{equation}
+
+\subsection{Unrecruited reads that also fit here}
+
+Symmetrically, a read that was \emph{not} recruited still contributes to the
+genome-wide comparison.  Writing $U_j$ for its mass at origins where the
+candidates agree --- identical for both, by assumption --- and $T^{(a)}_j$ for
+its mass at origins inside the unit of candidate $a$, its contribution to the
+global difference is
+\begin{equation}
+    \log\!\Big(1+\tfrac{T^{(1)}_j}{U_j}\Big)
+    - \log\!\Big(1+\tfrac{T^{(2)}_j}{U_j}\Big),
+\label{eq:unrecruited-discrepancy}
+\end{equation}
+which the local computation omits entirely.  This term is nonzero whenever an
+unrecruited read has candidate-specific placements inside the unit, which is
+exactly the situation in segmental duplications and tandem arrays, and also for
+reads excluded by the containment rule of Section~\ref{sec:exposure}.  It is
+not, however, unbounded work: the reads concerned are those with a qualifying
+alignment overlapping the unit that failed recruitment, a finite set
+enumerable from the same alignment index.
+
+\subsection{The bound}
+
+\begin{proposition}[Locality to tolerance eta]
+\label{prop:locality}
+Suppose $A_1$ and $A_2$ carry identical sequence outside the recruited unit.
+Then, for the \emph{uncapped} ratio $\Delta\mathrm{LLR}$ of
+\eqref{eq:llr-common},
+\begin{equation}
+    \big|\Delta\mathrm{LLR}_{\text{genome}}
+      - \Delta\mathrm{LLR}_{\text{local}}\big| \;\le\; \eta,
+    \qquad
+    \eta = \eta_{\text{in}} + \eta_{\text{out}}
+           + \eta_{\text{exposure}} + \eta_{\text{tail}},
+\end{equation}
+\begin{align}
+    \eta_{\text{in}} &= \sum_{j\,\text{recruited}}
+      \left|\log\frac{S^{(1)}_j+C^{(1)}_j}{S^{(1)}_j}
+          - \log\frac{S^{(2)}_j+C^{(2)}_j}{S^{(2)}_j}\right|, \\
+    \eta_{\text{out}} &= \sum_{j\,\text{unrecruited}}
+      \left|\log\frac{U_j+T^{(1)}_j}{U_j+T^{(2)}_j}\right|, \\
+    \eta_{\text{exposure}} &= \lambda\,\Big|
+        \textstyle\sum_p \alpha_{A_1}(p) - 2L_1^{\mathrm{eff}}
+      - \sum_p \alpha_{A_2}(p) + 2L_2^{\mathrm{eff}}\Big| , \\
+    \eta_{\text{tail}} &= \sum_{j,\,a}
+        \log\!\Big(1+\tfrac{\text{omitted mass}^{(a)}_j}{S^{(a)}_j}\Big).
+\end{align}
+\end{proposition}
+
+\begin{proof}
+Apply the triangle inequality to the sum of
+\eqref{eq:per-read-discrepancy} over recruited reads, of
+\eqref{eq:unrecruited-discrepancy} over unrecruited reads, and of the exposure
+and truncation discrepancies term by term; all remaining terms cancel by the
+agreement of the candidates outside the unit.
+\end{proof}
+
+\begin{remark}[The bound must be taken on the difference]
+\label{rem:tight-bound}
+It is tempting to bound each candidate's term separately, giving
+$\sum_j[\log(1+C^{(1)}_j/S^{(1)}_j) + \log(1+C^{(2)}_j/S^{(2)}_j)]$ and
+similarly for $\eta_{\text{out}}$.  That bound is valid but vacuous.  The
+dominant population of unrecruited reads with inside mass is not the
+weakly-aligning one --- those carry little mass by construction --- but the
+reads excluded by the containment rule of Section~\ref{sec:exposure}, which
+have excellent alignments and are discarded on a purely geometric criterion.
+At a $45$\,kb unit with $15$\,kb reads they are a third of all origins.  For
+such a read $T_j$ is large and $U_j$ negligible, so the separated form reports
+of order $10^4$ nats each and would declare every locus unsealed.  Yet its true
+contribution is near zero, because a boundary-crossing read lies mostly in
+shared flank sequence and is explained identically by both candidates:
+$T^{(1)}_j \approx T^{(2)}_j$ and the difference cancels.  The reads that
+genuinely contribute are those whose alignment reaches from the boundary into
+\emph{disputed} sequence, and the form above counts exactly those.
+\end{remark}
+
+The last two components deserve naming.  The term $\eta_{\text{exposure}}$
+measures the gap between the exact selected exposure $\lambda\sum_p\alpha_A(p)$
+of \eqref{eq:alpha} and the closed form $2\lambda L_A^{\mathrm{eff}}$ used in
+practice, which is exact only when the retention rule reduces to containment
+alone.  The term $\eta_{\text{tail}}$ covers origins discarded below the
+qualifying-placement threshold and probability mass leaving the dynamic
+programming band; both are bounded by the retention threshold itself, so both
+shrink as it is relaxed.
+
+\begin{remark}[The tolerance does not cover $\Delta S$]
+\label{rem:eta-scope}
+Proposition~\ref{prop:locality} bounds the uncapped ratio.  It says nothing
+about the capped term $C(m_1-m_2)$ of \eqref{eq:final}, which is not an
+approximation error to be bounded but a deliberate departure from the
+likelihood (Remark~\ref{rem:not-lr}).  A verdict is therefore local to
+tolerance $\eta$ \emph{as a likelihood ratio}; as a reported score it inherits
+in addition whatever the cap contributes, which is why $m_1$ and $m_2$ are
+reported separately rather than folded into a single number.
+\end{remark}
+
+We say a locus is \emph{sealed to tolerance $\eta$}.  Both sums are computable
+from an alignment index that stores every qualifying placement genome-wide, and
+$\eta$ should be reported alongside every verdict: a difference of $10^3$ nats
+at $\eta = 5$ is decisive, whereas the same difference at $\eta = 10^3$ is not
+a local statement at all.  The corresponding additivity claim is likewise
+approximate: over disjoint units,
+\begin{equation}
+    \Big|\Delta\mathrm{LLR}_{\text{genome}}
+      - \sum_{\text{loci}} \Delta\mathrm{LLR}_{\text{local}}\Big|
+    \;\le\; \sum_{\text{loci}} \eta .
+\end{equation}
+
+\subsection{Failure to close}
+
+Recursive recruitment need not terminate at a local unit.  A repeat-connected
+component can expand through every homologous copy in the genome, and imposing
+a boundary at an arbitrary iteration produces a unit for which
+Proposition~\ref{prop:locality} gives no useful tolerance.  The method must
+therefore admit a third outcome besides a verdict for either candidate:
+\emph{non-localisable}, declared when recruitment exceeds a stated iteration or
+size limit.  Such loci are reported, not scored.
+
+\section{Where reads come from}
+\label{sec:origin}
+
+Consider the assembly as a line of positions.  Sequencing scatters read-start
+points along it.  Let
+\begin{equation}
+    \lambda = \text{expected number of read starts per base, per strand.}
+\end{equation}
+An assembly of length $L_A$ offers $2L_A$ slots, so the expected number of reads
+it produces is $\mu = 2\lambda L_A$, and the observed number is Poisson:
+\begin{equation}
+    \Prob(N = n) = e^{-\mu}\frac{\mu^n}{n!}, \qquad \mu = 2\lambda L_A .
+\end{equation}
+Given that $n$ starts occurred, each is equally likely to sit in any slot:
+\begin{equation}
+    \Prob(\text{read } j \text{ originates at slot } p) = \frac{1}{2L_A}.
+\end{equation}
+
+Two features of this construction deserve emphasis, because the rest of the
+document turns on them.  First, $L_A$ is a \emph{claim made by the assembly},
+not an estimate of the truth: if the candidate asserts more sequence than
+exists, it predicts more reads than were seen, and the likelihood falls
+accordingly.  Second, $\lambda$ must be measured \emph{without reference to
+either candidate} (Section~\ref{sec:lambda}); estimating it from the assembly
+under test would make the comparison vacuous, as Proposition~\ref{prop:profile}
+makes precise.
+
+\section{The mark likelihood}
+\label{sec:emission}
+
+The quantity $e_{jp}$ used in Section~\ref{sec:likelihood} must be a
+\emph{probability distribution over observable reads}, not merely an alignment
+score.  This section constructs it.  Three things that a bare forward score
+leaves undetermined are settled here: how much template an origin exposes, how
+the process stops, and how read length is accounted for.
+
+\subsection{The mark and its factorisation}
+
+An observed read is a mark $Y = (r, Q)$ consisting of a base sequence
+$r = r_1\cdots r_\ell$ and its per-base qualities $Q = Q_1\cdots Q_\ell$, with
+$\ell = |r|$.  We factorise
+\begin{equation}
+    e(Y \mid p, A)
+    \;=\; \underbrace{f(\ell)}_{\text{fragment length}}
+    \;\cdot\; \underbrace{g(Q \mid \ell)}_{\text{quality profile}}
+    \;\cdot\; \underbrace{\Prob(r \mid Q, \ell, p, A)}_{\text{sequence}} .
+\label{eq:mark-factorisation}
+\end{equation}
+The first two factors describe the library and the instrument.  Neither depends
+on the candidate, so both cancel from the observed-read terms of
+$\Delta\mathrm{LLR}$ --- but not from the recruitment exposure, which is taken
+as an integral against them (Remark~\ref{rem:library-factors}), so $f$ at least
+must be estimated.  Read length is therefore \emph{modelled} rather than
+ignored: it appears in $f$, and it is $f$ that supplies the mean $\bar\ell$ in
+Proposition~\ref{prop:exposure}.  Qualities enter as conditioning covariates,
+which is why the sequence term is written $\Prob(r\mid Q,\ell,p,A)$ and not
+$\Prob(r\mid p,A)$; the model does not attempt to predict $Q$.
+
+Only the third factor is candidate-dependent, and the remainder of this section
+defines it.
+
+\subsection{States and the template window}
+
+Let the origin be $p = (s,o)$ and write $t = t_1 t_2 \cdots$ for the assembly
+sequence read from position $s$ on strand $o$.  Walk along read and template
+together.  At each step exactly one of three things happens, distinguished by
+\emph{what is consumed}:
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+state & consumes & interpretation \\
+\midrule
+$M$ & one read base and one template base & aligned column \\
+$I$ & one read base only & insertion in the read \\
+$D$ & one template base only & deletion from the read \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The number of template bases consumed, $m$, is \emph{not} a parameter supplied
+with the origin: a start position does not determine how much template is
+exposed once indels are permitted.  It is a latent variable, determined by the
+path, and marginalised over.  This is the first thing that distinguishes a mark
+likelihood from an alignment score.
+
+There is no separate mismatch state.  A match and a mismatch consume exactly
+the same thing and differ only in the probability of the letter emitted;
+folding them into $M$ is exact unless substitution errors cluster, which they
+do not appreciably do in HiFi data.  Indel errors \emph{do} cluster, and are
+handled in Section~\ref{sec:context}.
+
+\subsection{Transitions and termination}
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+from $\to$ to & probability & meaning \\
+\midrule
+$B \to M$ & $1-\delta_I$ & begin aligned \\
+$B \to I$ & $\delta_I$ & begin with an insertion \\
+$M \to M$ & $1-\delta_I-\delta_D-\tau$ & keep matching \\
+$M \to I$ & $\delta_I$ & open an insertion \\
+$M \to D$ & $\delta_D$ & open a deletion \\
+$M \to E$ & $\tau$ & terminate \\
+$I \to I$ & $\gamma_I$ & extend insertion \\
+$I \to M$ & $1-\gamma_I-\tau$ & close it \\
+$I \to E$ & $\tau$ & terminate \\
+$D \to D$ & $\gamma_D$ & extend deletion \\
+$D \to M$ & $1-\gamma_D$ & close it \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The termination probability $\tau$ is what makes the model a distribution over
+reads of \emph{variable} length; without an explicit $E$ state the forward sum
+is a global-alignment score and nothing more.  Two transitions are absent by design, for the same reason.  Termination is
+permitted from $M$ and $I$ but not from $D$: a deletion at the very end would
+consume template beyond the last emitted read base, which no observation can
+distinguish from terminating earlier.  Symmetrically, the begin state may enter
+$M$ or $I$ but not $D$: a path beginning $B \to D$ consumes $t_1$ without
+emitting, and is therefore identical to the path from origin $s+1$ beginning
+$B \to M$.  Since the likelihood of Section~\ref{sec:likelihood} marginalises
+over origins, admitting $B \to D$ would count the same alignment once at origin
+$s$ and again at $s+1$.  Both exclusions remove unidentifiable redundancy
+rather than real possibilities.
+
+\begin{remark}
+The standard pair HMM does admit $B \to D$, because it aligns two given
+sequences from a fixed start and no redundancy arises.  The degeneracy here is
+created by the marginalisation over origins, and is a consequence of embedding
+the alignment model inside a point process rather than of the alignment model
+itself.
+\end{remark}
+
+Separating gap opening ($\delta$) from gap extension ($\gamma$) makes indel
+lengths geometric, which approximates the observed distribution far better than
+a single per-base indel rate.  Note that $\gamma$ is used for extension here;
+the symbol $\varepsilon$ is reserved throughout for per-base error
+probabilities, and the two must not be conflated, since several claims in this
+document turn on error calibration.
+
+\subsection{Emissions}
+
+With $\varepsilon_u = 10^{-Q_u/10}$ the error probability of read base $u$, the
+aligned-state emission is
+\begin{equation}
+    \epsilon_M(u,v) =
+    \begin{cases}
+        1-\varepsilon_u & r_u = t_v,\\[2pt]
+        \varepsilon_u/3 & r_u \neq t_v .
+    \end{cases}
+\end{equation}
+State $D$ emits nothing and contributes a factor of one.  The cost of a single
+mismatch follows:
+\begin{equation}
+    s = \log\frac{1-\varepsilon_u}{\varepsilon_u/3}
+      = \log\frac{3(1-\varepsilon_u)}{\varepsilon_u} ,
+\label{eq:mismatch-cost}
+\end{equation}
+which is $5.7$ nats at $Q20$, $8.0$ at $Q30$ and $10.3$ at $Q40$.  Using the
+read's own qualities rather than a flat rate is not a refinement: in a repeat
+array where a handful of variant columns separate the candidates, it is the
+difference between a decisive and an ambiguous read.
+
+The insertion emission requires a choice.  Taking $\epsilon_I(u) = 1/4$ treats
+an inserted base as uniformly random and ignores both its reported quality and
+its context.  For HiFi this is demonstrably crude: inserted bases occur
+overwhelmingly within homopolymer runs and short tandem repeats, where the
+inserted base is very nearly determined by the surrounding template.  We
+therefore allow a context-conditioned insertion emission
+$\epsilon_I(u \mid \kappa_v)$, estimated empirically alongside the gap
+parameters, and reduce to $1/4$ only outside repetitive context.  Whichever is
+used must be stated and calibrated on held-out data, since it enters every
+read that crosses a homopolymer.
+
+\subsection{The forward recursion}
+
+A particular walk through the states is an alignment path $\pi$, whose
+probability is the product of the transitions and emissions along it.  Many
+paths produce the same read from the same template, and which one occurred is
+unobserved, so the paths must be summed.  Define
+\begin{equation}
+    f_X(u,v) = \Prob\big(r_1..r_u \text{ emitted},\ t_1..t_v \text{ consumed},\
+    \text{currently in state } X\big),
+    \qquad X \in \{M,I,D\},
+\end{equation}
+each already a sum over all paths reaching that configuration.  Then
+\begin{align}
+    f_M(u,v) &= \epsilon_M(u,v)\Big[
+        f_M(u{-}1,v{-}1)(1-\delta_I-\delta_D-\tau) \notag \\
+      &\qquad\qquad
+      + f_I(u{-}1,v{-}1)(1-\gamma_I-\tau)
+      + f_D(u{-}1,v{-}1)(1-\gamma_D)\Big], \\
+    f_I(u,v) &= \epsilon_I(u)\Big[f_M(u{-}1,v)\,\delta_I + f_I(u{-}1,v)\,\gamma_I\Big], \\
+    f_D(u,v) &= f_M(u,v{-}1)\,\delta_D + f_D(u,v{-}1)\,\gamma_D,
+\end{align}
+initialised from the begin state at $(0,0)$ with the $B$ transitions above, so
+that $f_D(0,v) = 0$ for all $v$.
+Terminating and marginalising over the template window gives
+\begin{equation}
+    \Prob(r,\ell \mid Q, p, A)
+    = \tau \sum_{m} \big[f_M(\ell,m) + f_I(\ell,m)\big].
+\label{eq:joint-r-ell}
+\end{equation}
+The sum over $m$ is the marginalisation the fixed-window formulation omits.
+
+\subsection{The normaliser}
+\label{sec:normaliser}
+
+Equation~\eqref{eq:joint-r-ell} is a joint distribution over sequence and
+length, whose implied length distribution is approximately geometric with mean
+$1/\tau$ --- not the length distribution of a size-selected HiFi library.  We
+therefore condition on the observed length and let the empirical $f(\ell)$ of
+\eqref{eq:mark-factorisation} carry it:
+\begin{equation}
+    \Prob(r \mid Q,\ell,p,A) = \frac{\Prob(r,\ell\mid Q,p,A)}{Z(\ell,p,A)},
+    \qquad
+    Z(\ell,p,A) = \sum_{r'} \Prob(r',\ell\mid Q,p,A).
+\end{equation}
+The normaliser is not an extra approximation and needs no separate machinery:
+for any fixed path the emissions sum to one over $r'$, so $Z$ is the total
+transition mass of paths emitting exactly $\ell$ bases, obtained by running the
+same recursion with every emission probability set to one.
+
+If the gap parameters are context-independent, $Z(\ell,p,A)$ does not depend on
+$p$ or $A$ and cancels in $\Delta\mathrm{LLR}$; it may then be omitted
+entirely.  With the context-dependent parameters of Section~\ref{sec:context}
+it does not cancel, and the origin sum
+\begin{equation}
+    \sum_p e_{jp}
+    = \sum_p \frac{\Prob(r_j,\ell_j\mid Q_j,p,A)}{Z(\ell_j,p,A)}
+\label{eq:origin-sum-normalised}
+\end{equation}
+is a sum of \emph{ratios}, with a different denominator at each origin.  This
+has an algorithmic consequence, taken up in Section~\ref{sec:computation}.
+
+\begin{remark}[Where the template ends]
+The construction above lets the walk consume template indefinitely.  Within a
+recruited segment the template is finite, and paths reaching a segment boundary
+carry mass that leaves the unit.  This is not a separate defect: it is exactly
+the containment thinning of Section~\ref{sec:exposure}, whose exposure
+consequences are given by Proposition~\ref{prop:exposure} and whose residual
+placement mass is accounted in the tolerance $\eta$ of
+Proposition~\ref{prop:locality}.
+\end{remark}
+
+\begin{remark}[Why the sum, not the best path]
+\label{rem:viterbi}
+Take template \texttt{AAAAAAA} and read \texttt{AAAAAA}.  One base was deleted,
+but seven distinct paths place that deletion, all with identical probability
+$q$.  Viterbi reports $q$; the forward sum reports $7q$, a difference of
+$\log 7 = 1.95$ nats --- and the forward value is the correct one, because the
+read really is seven times more likely than any single path suggests.  In
+homopolymer-rich sequence this discrepancy is large, systematic, and
+\emph{different between the two candidates}, since they have different run
+lengths.  Viterbi therefore injects a bias directly into the quantity being
+measured.  This is the reason the aligner's CIGAR must not be reused: alignment
+is used to \emph{locate} candidate origins, never to score them.
+\end{remark}
+
+\subsection{Context-dependent gap parameters}
+\label{sec:context}
+
+A single set $(\delta_I,\delta_D,\gamma_I,\gamma_D)$ is misspecified exactly
+where HiFi errors concentrate.  We therefore let the gap parameters depend on
+the local template context $\kappa_v$ --- minimally the homopolymer run length
+and its base, optionally the period of a short tandem repeat:
+\begin{equation}
+    \delta_I(\kappa_v),\quad \delta_D(\kappa_v),\quad
+    \gamma_I(\kappa_v),\quad \gamma_D(\kappa_v).
+\end{equation}
+For run lengths $1$--$10$ over four bases this is roughly forty parameters,
+estimated once from reads aligned to a validated reference, from undisputed
+sequence, and then held fixed across both candidates.  Fitting them per
+candidate would let a poorer assembly compensate with looser error rates.  The
+motivation is empirical: homopolymer richness is the strongest predictor of
+anomalous HiFi behaviour in the loci this method targets, so a
+context-independent model is calibrated everywhere except where it is needed.
+
+\subsection{Computation}
+\label{sec:computation}
+
+Probabilities underflow double precision within a few hundred bases, so all
+recursions are carried in logarithms with
+$\LSE(a,b) = \max(a,b) + \log(1+e^{-|a-b|})$.
+
+Origins must not be enumerated one at a time.  Running a banded forward pass at
+every candidate origin costs $O(L\ell w)$ per read for a unit of length $L$,
+roughly $6\times10^{11}$ cells for a $15$\,kb read against a $100$\,kb unit,
+which is not affordable.  A single dynamic program over the whole segment with
+a free start state sums over origins internally at $O(L\ell)$, two orders of
+magnitude cheaper.
+
+That free-start pass computes $\sum_p \Prob(r_j,\ell_j\mid Q_j,p,A)$: the sum
+of the \emph{numerators} of \eqref{eq:origin-sum-normalised}.  When $Z$ is
+origin-dependent this is not the quantity required, and no single pass over the
+segment produces a sum of origin-specific ratios.  We therefore use a two-tier
+scheme:
+
+\begin{enumerate}
+    \item a free-start pass over the segment, at $O(L\ell)$, to \emph{locate}
+          the origins carrying non-negligible numerator mass;
+    \item per-origin normalisation on that retained set only, at
+          $O(k\ell w)$ for $k$ retained origins, evaluating both
+          $\Prob(r_j,\ell_j\mid Q_j,p,A)$ and $Z(\ell_j,p,A)$ by the recursion
+          of Section~\ref{sec:normaliser}.
+\end{enumerate}
+
+Because $Z$ varies far more slowly across origins than the numerator does,
+tier one is a safe locator even though it uses unnormalised mass; the residual
+is bounded by the retention threshold and enters $\eta_{\text{tail}}$.  With
+context-independent gaps the scheme collapses to tier one alone.  In neither
+case is the origin set capped by an aligner's secondary-alignment limits, which
+matters because that sum carries the copy-number signal.
+
+Banding remains necessary in the read direction.  A fixed diagonal band is not
+automatically safe in indel-rich repeats, so the band should be adaptive and
+the probability mass reaching its edge should be reported as a diagnostic,
+in the same spirit as the tolerance $\eta$.
+
+\section{The likelihood}
+\label{sec:likelihood}
+
+Combining the count, the origin prior and the emission model, the probability of
+observing read set $R$ of size $n$ is
+\begin{equation}
+    \Prob(R,n \mid A)
+    = \underbrace{e^{-2\lambda L_A}\frac{(2\lambda L_A)^n}{n!}}_{\text{how many reads}}
+      \times
+      \underbrace{\prod_{j=1}^{n}\Big[\frac{1}{2L_A}\sum_{p} e_{jp}\Big]}_{\text{what they look like}} .
+\end{equation}
+Taking logarithms, the factors $(2L_A)^n$ and $(2L_A)^{-n}$ cancel and all
+length dependence collapses into a single term:
+\begin{equation}
+    \boxed{\;
+    \log\Prob(R,n\mid A)
+    = -2\lambda L_A \;+\; n\log\lambda \;-\; \log n!
+      \;+\; \sum_{j=1}^{n}\log\sum_{p}e_{jp} \; }
+\label{eq:loglik}
+\end{equation}
+
+The three groups of terms read as follows.  The term $-2\lambda L_A$ is a rent
+paid on every base the assembly claims: more sequence means more reads should
+have been seen.  The middle terms contain no reference to $A$ and are constants
+of the comparison.  The final sum measures how well the reads are explained.
+
+Comparing two candidates, the constants vanish and the origin slot sets are of
+course different sizes:
+\begin{equation}
+    \Delta\mathrm{LLR}
+    = \sum_{j=1}^{n}\Bigg[
+        \log\!\!\sum_{p\in\mathrm{slots}(A_1)}\!\! e^{(1)}_{jp}
+      - \log\!\!\sum_{p\in\mathrm{slots}(A_2)}\!\! e^{(2)}_{jp}
+      \Bigg]
+      \;-\; 2\lambda\,(L_1-L_2).
+\label{eq:dllr}
+\end{equation}
+Positive values favour $A_1$.  The inner sums are \emph{totals}, not
+distributions --- the normalisation was already extracted into the length term
+--- so a read with several plausible origins genuinely scores higher than one
+with a single origin.  That multiplicity is the model's copy-number signal.
+
+\begin{remark}[Units of the penalty]
+Writing $\lambda = c/(2\bar\ell)$ gives
+$2\lambda\,\Delta L = c\,\Delta L/\bar\ell$, which is exactly the number of
+reads expected to start within $\Delta L$ extra bases.  The length penalty is
+denominated in \emph{missing reads}.  At $30\times$ with $15$\,kb reads, ten
+kilobases of unsupported sequence costs twenty nats, being the twenty reads that
+should have been there.
+\end{remark}
+
+\section{Exposure under recruitment}
+\label{sec:exposure}
+
+Equation~\eqref{eq:loglik} treats $R$ as the complete set of reads originating
+in the candidate, with exposure $2\lambda L_A$.  The recruited set is not that:
+it is produced by a rule applied to alignments, and that rule discards reads.
+Since the rule is applied to each candidate, the discarding is in principle
+candidate-dependent and cannot be assumed ignorable.  This section states the
+exposure exactly, and shows which part of it cancels.
+
+\subsection{The selected process}
+
+Let $Y = (r,Q)$ denote a read mark, with $\ell = |r|$.  Recruitment is a
+\emph{deterministic} rule applied to the frozen pair of candidates: write
+\begin{equation}
+    h_{12}(p,Y) \in \{0,1\}
+\end{equation}
+for the indicator that a read with mark $Y$ arising at origin $p$ is retained.
+Two features of this definition are deliberate.  It is an indicator, not a
+probability: given the frozen segments and a fixed threshold, retention is a
+function of the data, and randomness enters only through $Y$.  And it is
+indexed by the \emph{pair} $(A_1,A_2)$, not by a single candidate: under union
+recruitment a read may be retained through its alignment to the other
+candidate, which a per-candidate rule cannot express.  The same $h_{12}$ is
+therefore applied when scoring against either candidate, which is what makes
+the comparison symmetric.
+
+Retained reads form a thinned marked Poisson process with intensity
+$\lambda\,h_{12}(p,Y)\,e(Y\mid p,A)$, whose log-likelihood under candidate $A$
+is
+\begin{equation}
+    \ell_A
+    = -\lambda\!\!\sum_{p\in\mathrm{slots}(A)}\!\! \alpha_A(p)
+      \;-\;\log n!
+      \;+\; \sum_{j=1}^{n}\log\Big[\lambda\!\!\sum_{p\in\mathrm{slots}(A)}\!\!
+              h_{12}(p,Y_j)\,e(Y_j\mid p,A)\Big],
+\label{eq:selected-loglik}
+\end{equation}
+\begin{equation}
+    \alpha_A(p) = \int h_{12}(p,Y)\,e(Y\mid p,A)\,dY .
+\label{eq:alpha}
+\end{equation}
+Two changes relative to \eqref{eq:loglik} are visible.  The exposure is
+$\lambda\sum_p \alpha_A(p)$ rather than $2\lambda L_A$; and the origin sum is
+weighted by $h_{12}$, so it runs only over origins at which the observed read
+would have been retained.  The second is automatic in any implementation that
+scores only admitted origins.  The first requires evaluation, and is the
+subject of Proposition~\ref{prop:exposure}.
+
+\begin{remark}[Which library factors are needed]
+\label{rem:library-factors}
+The factors $f(\ell)$ and $g(Q\mid\ell)$ of \eqref{eq:mark-factorisation}
+cancel from the observed-read terms of \eqref{eq:selected-loglik}, since they
+do not depend on the candidate.  They do \emph{not} cancel from
+\eqref{eq:alpha}: retention depends on read length through containment, and on
+quality through the placeability threshold, so the integral defining
+$\alpha_A(p)$ is taken against them.  An empirical fragment-length
+distribution is therefore required, and the quality profile is required
+whenever the phase-two rule is quality-dependent.  This is the sense in which
+the length distribution is part of the model rather than a nuisance.
+\end{remark}
+
+\begin{remark}[Phase one is still post-selection]
+\label{rem:phase-one-selection}
+Freezing the segments before scoring removes the dependence of $h_{12}$ on the
+expansion path, but not the dependence of the \emph{unit itself} on the reads
+that later score it.  The rule is symmetric in the candidates by construction,
+so it does not obviously favour either; what it can bias is the unit
+definition, hence $L_1 - L_2$.  Ignorability is not established, and the clean
+remedy is the cross-fitting of Section~\ref{sec:validation}: recruit and freeze
+on one fold of molecules, score on another.
+\end{remark}
+
+\subsection{Two-phase recruitment}
+\label{sec:two-phase}
+
+We separate the rule into two phases, because they play different roles and
+carry different risks.
+
+\emph{Phase one} determines the comparison unit.  Reads and segments are
+expanded recursively under a strict identity and coverage-fraction criterion,
+and iteration continues to convergence.  The criterion must be strict: a
+permissive rule admits paralogous sequence, which recruits its own reads, and
+the unit fails to close.  The output is a frozen set of $k_1$ and $k_2$ disjoint
+segments with total lengths $L_1$ and $L_2$.
+
+\emph{Phase two} determines which reads are scored.  Over the frozen segments,
+and without any further segment expansion, reads are collected under a second,
+permissive rule and each is scored against both candidates.  Because no
+expansion occurs, a permissive rule here cannot enlarge the unit; a read that
+in truth belongs elsewhere simply scores poorly against both candidates and
+contributes negligibly to the difference.
+
+The separation matters for the model as well as for the implementation: after
+phase one the segments are fixed, so $a_A(p,Y)$ depends only on the frozen
+segments and the phase-two rule, and not on the order in which recruitment
+proceeded.
+
+\subsection{Exposure under containment}
+
+The phase-two rule retains a read only if its alignment falls entirely within
+one segment.  Reads originating near a segment end therefore cannot be
+retained, and the loss is substantial at the scale of a locus: for a segment of
+$45$\,kb and a mean read length of $15$\,kb, a third of all origins are
+excluded.  Nevertheless:
+
+\begin{proposition}[Containment exposure]
+\label{prop:exposure}
+Let candidate $A$ consist of $k_A$ disjoint segments of lengths
+$L_A^{(1)},\dots,L_A^{(k_A)}$ summing to $L_A$, and let read reference spans be
+drawn from a distribution $f$ with mean $\bar\ell$, independent of the
+candidate.  Under the containment rule,
+\begin{equation}
+    \sum_{p}\alpha_A(p)
+    = 2\sum_{i=1}^{k_A}\sum_{\ell} f(\ell)\,\max\!\big(0,\;L_A^{(i)}-\ell+1\big)
+    \;\equiv\; 2 L_A^{\mathrm{eff}} .
+\end{equation}
+If every segment is longer than the longest read, this reduces to
+\begin{equation}
+    L_A^{\mathrm{eff}} = L_A - k_A(\bar\ell - 1),
+\label{eq:leff}
+\end{equation}
+and the exposure difference between candidates is
+\begin{equation}
+    -2\lambda\big(L_1^{\mathrm{eff}} - L_2^{\mathrm{eff}}\big)
+    = -2\lambda\Big[(L_1-L_2) - (k_1-k_2)(\bar\ell-1)\Big].
+\label{eq:exposure-diff}
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+A read of reference span $\ell$ is contained in segment $i$ precisely when its
+start lies in $[\,\text{start}_i,\ \text{end}_i-\ell\,]$, giving
+$\max(0, L_A^{(i)}-\ell+1)$ admissible starts per strand.  Averaging over $f$
+and summing over segments and strands gives the first display.  When
+$L_A^{(i)} > \ell$ for all $i$ and $\ell$ in the support of $f$, the maximum is
+inactive and the inner sum is $L_A^{(i)} - \bar\ell + 1$; summing over $i$ gives
+\eqref{eq:leff}.  Subtracting the two candidates gives
+\eqref{eq:exposure-diff}.
+\end{proof}
+
+Two consequences.
+
+\paragraph{The boundary loss is common mode.}  The term $\bar\ell$ appears with
+the same coefficient in both candidates and cancels, because both are scored
+against the same reads and hence the same length distribution.  The
+containment rule therefore discards a third of the data at a $45$\,kb locus
+without perturbing the length penalty at all, provided the segment counts agree.
+This is what licenses the use of $-2\lambda(L_1-L_2)$ in
+\eqref{eq:dllr}, which would otherwise be an unexamined assumption.
+
+\paragraph{Fragmentation does not cancel.}  When $k_1 \neq k_2$ the residual
+term $2\lambda(k_1-k_2)(\bar\ell-1)$ survives, favouring the candidate split
+into more segments.  At $30\times$ coverage with $15$\,kb reads this is
+approximately $30$ nats per additional segment, which is comparable to the
+signal from a genuine event and points in a systematic direction, since
+differing fragmentation is a common form of disagreement at difficult loci.
+The correction in \eqref{eq:exposure-diff} removes it and costs nothing to
+compute.
+
+\begin{remark}
+Equation~\eqref{eq:leff} requires every segment to exceed the longest read.
+Implementations should verify this and otherwise evaluate the exact form,
+$\sum_{\ell\le L}f(\ell)(L-\ell+1) = (L+1)F(L) - \sum_{\ell\le L}\ell f(\ell)$,
+which remains a difference of candidate-specific constants and preserves the
+argument.  Containment is a condition on reference coordinates, so $\ell$ must be the
+\emph{reference span}, not the query length.  Using the observed read-length
+distribution in its place is an approximation: the two differ by the net indel
+count, which is context-dependent and, in indel-rich sequence, mildly
+candidate-dependent.  The residual belongs to $\eta_{\text{exposure}}$ and
+should be estimated from the span distribution directly rather than assumed
+negligible.
+\end{remark}
+
+\begin{remark}[What is not claimed]
+Proposition~\ref{prop:exposure} addresses only the containment component of
+$a_A(p,Y)$.  The phase-two identity criterion also thins, and does so in a
+candidate-dependent way: reads spanning a structural difference fail against one
+candidate and not the other.  That thinning is not a nuisance to be cancelled
+--- it is the definition of the classes $m_1$ and $m_2$ of
+Section~\ref{sec:truncation}, and it must be pre-registered and swept rather
+than tuned.
+\end{remark}
+
+\section{Why local coverage must not be profiled away}
+\label{sec:conditioning}
+
+A widespread alternative treats $n$ as fixed and scores only the placement of
+reads, giving a penalty $-n\log(2L_A)$.  The objection is narrower than a
+prohibition on conditioning, and worth stating precisely:
+
+\begin{quote}
+Do not estimate a separate coverage rate \emph{within each candidate locus},
+because doing so profiles away the exposure contrast that identifies copy
+number.
+\end{quote}
+
+Conditioning as such is not the problem.  Conditioning on a shared global
+yield, and modelling the allocation of read starts between the locus and
+external control sequence as multinomial with probabilities proportional to
+candidate exposures, preserves the contrast perfectly well.  What is required
+is that the locus be compared against an exposure it does not itself set.  The
+formulation below achieves that by fixing $\lambda$ externally; the multinomial
+route achieves it by comparison to a control region.  The failure mode is
+specific and is what the following establishes.
+
+\begin{proposition}[The conditional model is the profiled Poisson model]
+\label{prop:profile}
+Maximising \eqref{eq:loglik} over $\lambda$ within the unit gives
+$\hat\lambda = n/(2L_A)$; substituting back yields
+\begin{equation}
+    -2\hat\lambda L_A + n\log\hat\lambda
+    = -n + n\log n - n\log(2L_A),
+\end{equation}
+whose only assembly-dependent term is $-n\log(2L_A)$.  The conditional
+likelihood is therefore the profile likelihood of the Poisson model with the
+rate estimated locally.
+\end{proposition}
+
+The consequence is that if $\lambda$ is free to adapt to the disputed region, a
+collapsed assembly simply reports higher coverage and nothing is learned.  All
+information about copy number lies in the statement \emph{more reads landed here
+than this much sequence should attract}, and that statement is empty unless
+$\lambda$ is fixed externally.  Two concrete failures follow.
+
+The two propositions that follow are stated in an \emph{ideal regime}: no
+selection, no containment, and no locality error, so that exposure is $2\lambda
+L_A$ with the raw length rather than $2\lambda L_A^{\mathrm{eff}}$.  This
+isolates the effect of conditioning from the corrections of
+Section~\ref{sec:exposure}; substituting $L^{\mathrm{eff}}$ throughout changes
+the constants but not the conclusions, since the correction is common to both
+formulations.
+
+\begin{proposition}[Blindness to tandem copy number]
+\label{prop:array}
+Let a comparison unit consist of unique flank of length $U$ plus an array of
+identical copies of a unit of length $\rho$.  Let $A_1$ carry $k_1$ copies and
+$A_2$ carry $k_2 < k_1$, both with well-formed junctions, so that every read is
+placeable in both candidates.  Reads inside the array then have $k_1$ plausible
+origins in $A_1$ and $k_2$ in $A_2$, and
+\begin{align}
+    \Delta\mathrm{LLR}_{\text{conditional}}
+      &= n\,\frac{k_1\rho}{L_1}\log\frac{k_1}{k_2}
+       - n\log\frac{L_1}{L_2},\\
+    \mathbb{E}\big[\Delta\mathrm{LLR}_{\text{Poisson}}\big]
+      &= 2\lambda\rho\Big(k_1\log\frac{k_1}{k_2} - (k_1-k_2)\Big).
+\end{align}
+When the unit is the array alone ($U=0$) the conditional expression is
+identically zero for every $k_1, k_2, \rho$ and every coverage, whereas the
+Poisson expression is strictly positive and independent of $U$.
+\end{proposition}
+
+\begin{proof}
+At $U=0$ we have $L_1 = k_1\rho$, $L_2 = k_2\rho$ and $k_1\rho/L_1 = 1$, so the
+conditional expression is $n\log(k_1/k_2) - n\log(k_1/k_2) = 0$.  For the
+Poisson form, the expected number of reads originating in the array is
+$2\lambda k_1\rho$, each gaining $\log(k_1/k_2)$, against a length penalty
+$2\lambda(k_1-k_2)\rho$.  Positivity follows from
+$k_1\log(k_1/k_2) > k_1-k_2$, which is the strict concavity of the logarithm
+applied to $\log(k_2/k_1) < k_2/k_1 - 1$.
+\end{proof}
+
+The conditional model is thus not merely biased toward collapses: it is exactly
+blind to them, because the multiplicity gain $\log(k_1/k_2)$ and the parsimony
+penalty $-\log(L_1/L_2)$ are the same quantity with opposite signs.  Note the
+perverse interaction with recruitment: tighter closure means smaller $U$, hence
+less surviving signal, whereas under the Poisson formulation the verdict does
+not depend on how much flank the unit happens to contain.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{lrrrr}
+\toprule
+$k_1 \to k_2$ & explanation & penalty & Poisson & conditional \\
+\midrule
+$5 \to 3$  & 229.9 & 180.0 & \textbf{49.9}  & 0 \\
+$5 \to 4$  & 100.4 &  90.0 & \textbf{10.4}  & 0 \\
+$10 \to 5$ & 623.8 & 450.0 & \textbf{173.8} & 0 \\
+$2 \to 1$  & 124.8 &  90.0 & \textbf{34.8}  & 0 \\
+\bottomrule
+\end{tabular}
+\caption{Expected $\Delta\mathrm{LLR}$ in nats for partial collapse of a
+tandem array, at $\rho = 45$\,kb, $\bar\ell = 15$\,kb, $30\times$, $U=0$.}
+\label{tab:collapse}
+\end{table}
+
+\begin{remark}[Junction reads, and why the proposition assumes them away]
+\label{rem:junction}
+Proposition~\ref{prop:array} assumes both candidates carry well-formed
+junctions.  That assumption is doing real work, and dropping it changes the
+picture.
+
+Consider instead a \emph{total} collapse, $k_2 = 1$, in which $A_2$ retains one
+copy followed directly by flank.  The $k_1-1$ internal junctions
+$\ldots\rho_{\mathrm{end}}\mid\rho_{\mathrm{start}}\ldots$ of $A_1$ then exist
+nowhere in $A_2$: a read straddling one is a circular permutation of $\rho$ and
+matches no linear substring of the collapsed candidate.  Such reads are not
+multiplicity reads at all but members of the one-sided class $m_1$, and their
+expected number is $2\lambda(k_1-1)(\bar\ell-1)$.  At $k_1=2$,
+$\rho=45$\,kb and $30\times$ that is $30$ reads against $150$ interior ones,
+contributing $C m_1 = 3000$ nats at $C=100$ --- two orders of magnitude above
+the $34.8$ nats of the multiplicity channel.  The conditional model sees this
+signal too, since it does not pass through the multiplicity term at all.
+
+The proposition is therefore not a claim that collapsed arrays are undetectable
+under conditioning.  It is the narrower and more useful claim that the
+\emph{copy-number channel} is dead under conditioning, and that channel is all
+that remains when an assembler produces a structurally plausible partial
+collapse --- which is the common case, and the one this method exists to
+adjudicate.
+
+The same example gives a closed form for the detection probability $q$ of
+Proposition~\ref{prop:count}.  Reads originating in the missing $(k_1-1)\rho$
+of sequence are not all detectable: interior ones are explained perfectly by
+the surviving copy.  Only junction readers are one-sided, so
+\begin{equation}
+    q = \frac{\bar\ell-1}{\rho},
+\end{equation}
+which is $1/3$ in this example.  Accordingly $m_1/(2\lambda) = 15$\,kb
+recovers $(k_1-1)\bar\ell$ and understates the missing length, whereas
+$m_1/(2\lambda q) = 45$\,kb recovers $(k_1-1)\rho$ exactly.  When reads exceed
+the unit length every array read spans a junction and $q \to 1$.
+\end{remark}
+
+The Poisson expression in Proposition~\ref{prop:array} is an expectation.  The
+realised score is random, because the number of reads originating in the array
+is $N \sim \text{Poisson}(2\lambda k_1\rho)$ while the length penalty is fixed:
+\begin{equation}
+    \Delta = N\log\frac{k_1}{k_2} - 2\lambda(k_1-k_2)\rho,
+    \quad
+    \operatorname{Var}[\Delta] = 2\lambda k_1\rho\Big(\log\frac{k_1}{k_2}\Big)^2 .
+\label{eq:array-moments}
+\end{equation}
+The verdict is wrong whenever $N \le 2\lambda(k_1-k_2)\rho/\log(k_1/k_2)$,
+which at low depth is not a remote event.  Table~\ref{tab:power} gives the
+failure probabilities for the $2\to1$ case.
+
+\begin{proposition}[Blindness to false duplication]
+\label{prop:dup}
+Let a region of true length $\ell_{\mathrm{loc}}$ be correctly represented by
+$A_1$ ($L_1 = \ell_{\mathrm{loc}}$) and falsely duplicated in $A_2$
+($L_2 = 2\ell_{\mathrm{loc}}$), with all $n = 2\lambda\ell_{\mathrm{loc}}$
+observed reads originating from the region.  Every read acquires a second
+identical origin in $A_2$, contributing $-n\log 2$ to the emission difference,
+while the length term contributes
+$-2\lambda(L_1-L_2) = 2\lambda\ell_{\mathrm{loc}} = n$.  Then
+\begin{equation}
+    \Delta\mathrm{LLR}_{\text{Poisson}} = n\big(1-\log 2\big) \approx 0.307\,n > 0,
+\end{equation}
+whereas the conditional version replaces the length term by
+$-n\log(L_1/L_2) = n\log 2$ and gives $n\log 2 - n\log 2 = 0$.
+\end{proposition}
+
+Again this is an expectation.  With $N \sim \text{Poisson}(2\lambda
+\ell_{\mathrm{loc}})$ the realised score is
+$\Delta = 2\lambda\ell_{\mathrm{loc}} - N\log 2$, with mean
+$2\lambda\ell_{\mathrm{loc}}(1-\log 2)$ and variance
+$2\lambda\ell_{\mathrm{loc}}(\log 2)^2$; an unusually well-covered false
+duplicate can invert the sign.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{lrrrr}
+\toprule
+coverage & $1\times$ & $3\times$ & $10\times$ & $30\times$ \\
+\midrule
+collapsed array ($k=2$, $\rho=45$\,kb) & 0.29 & 0.092 & 0.013 & $3.9\times10^{-5}$ \\
+false duplication ($\ell_{\mathrm{loc}}=45$\,kb) & 0.19 & 0.124 & 0.010 & $4.4\times10^{-5}$ \\
+haplotype loss, $d=0$ ($\ell_{\mathrm{loc}}=45$\,kb) & 0.29 & 0.092 & 0.013 & $3.9\times10^{-5}$ \\
+\bottomrule
+\end{tabular}
+\caption{Probability that the realised verdict has the wrong sign, at
+$\bar\ell=15$\,kb, under the ideal assumptions of the corresponding
+proposition.  These are floors: they exclude misspecification, selection, and
+locality error.  The propositions establish the sign of
+$\mathbb{E}[\Delta]$, not of every realisation.}
+\label{tab:power}
+\end{table}
+
+Table~\ref{tab:power} is a power calculation rather than a caveat: it states
+the depth required for a verdict at a given event size, and it is the right
+form in which to report the method's resolution.
+
+\section{The coverage rate}
+\label{sec:lambda}
+
+By Proposition~\ref{prop:profile}, $\lambda$ must come from outside the
+assemblies.  The k-mer spectrum of the reads provides it, using no assembly at
+any stage.
+
+\paragraph{Step 1: read the peak.}  In a diploid spectrum, heterozygous k-mers
+(present on one haplotype) peak at multiplicity $c_k$ and homozygous k-mers at
+$2c_k$.  Because the assembly represents both haplotypes as separate sequence,
+$L_A$ counts both, so $\lambda$ must be the \emph{per-haplotype} rate: the
+first peak.  Where heterozygosity is too low for a resolved het peak, halve the
+homozygous peak.  Fitting should be done with a spectrum model
+(e.g.\ GenomeScope2) rather than by eye.
+
+\paragraph{Step 2: correct for k-mers destroyed by errors.}  A k-mer is counted
+only if all $k$ bases are correct, so
+\begin{equation}
+    c_k^{\text{true}} = \frac{c_k}{(1-\varepsilon)^k},
+\end{equation}
+a $2\%$ correction at $k=21$, $\varepsilon = 10^{-3}$.
+
+\paragraph{Step 3: k-mer coverage to base coverage.}  A read of length $\ell$
+carries $\ell-k+1$ k-mers but $\ell$ bases:
+\begin{equation}
+    c = c_k^{\text{true}}\cdot\frac{\bar\ell}{\bar\ell-k+1},
+\end{equation}
+a factor of $1.0013$ for HiFi at $k=21$.
+
+\paragraph{Step 4: base coverage to read-start rate.}  Total sequenced bases are
+$n\bar\ell$ over a haplotype of length $G$, so $c = n\bar\ell/G$, while
+$n = 2\lambda G$ by definition.  Hence
+\begin{equation}
+    \boxed{\;\lambda = \frac{c}{2\bar\ell}\;}
+\end{equation}
+At $c=30\times$ and $\bar\ell=15$\,kb this gives $\lambda = 10^{-3}$: one read
+start per kilobase per strand.
+
+\subsection{Required accuracy}
+\label{sec:required-accuracy}
+
+$\lambda$ enters only through $-2\lambda(L_1-L_2)$.  Where sequence evidence is
+strong the verdict is far from a tie and a few percent of error in $\lambda$
+changes confidence, not direction.  The exception is the low-divergence regime.
+Taking the haplotype comparison of Section~\ref{sec:diploid} at zero divergence,
+$\Delta\mathrm{LLR} = n\log 2 - 2\hat\lambda\ell_{\mathrm{loc}}$ with
+$n = 4\lambda\ell_{\mathrm{loc}}$, so the verdict inverts when
+\begin{equation}
+    \frac{\hat\lambda}{\lambda} > 2\log 2 \approx 1.386 .
+\end{equation}
+Roughly forty percent of headroom: ordinary estimation error is safe, but
+choosing the wrong spectrum peak is a factor of two and lands squarely on the
+wrong side.  That single choice matters more than every other approximation in
+this document.
+
+\subsection{Assumptions behind the spectrum estimate}
+
+The translation above is first-order and rests on conditions that should be
+stated rather than assumed: that k-mers are counted canonically; that the
+ploidy peaks are resolved well enough for the heterozygous component to be
+identified rather than inferred; that copy-number structure in the genome does
+not distort the fitted peak, which it does when a large fraction of the
+sequence is high-copy repeat; and that the error correction of Step~2 uses a
+per-base error rate representative of the library rather than a nominal one.
+Each is checkable, and each fails in a direction that biases $\lambda$.
+
+\subsection{\texorpdfstring{Propagating uncertainty in $\lambda$}{Propagating uncertainty in lambda}}
+
+The spectrum supplies an \emph{estimate}, not a constant, and
+Section~\ref{sec:required-accuracy} shows the verdict is sensitive to it in the
+low-divergence regime.  Treating $\hat\lambda$ as known therefore understates
+the uncertainty of marginal calls.  A conjugate treatment is available at
+negligible cost: with a Gamma prior $\lambda \sim \Gamma(a,b)$ (shape $a$, rate
+$b$) fitted to a disjoint control region or to leave-one-locus-out global data,
+$\lambda$ is integrated out rather than plugged in.  The integration must
+include the observed-count factor $\lambda^n$ as well as the exposure, since
+both carry $\lambda$:
+\begin{equation}
+    \log \int \lambda^{n}\exp\!\big(-2\lambda L_A^{\mathrm{eff}}\big)\,
+      \pi(\lambda)\,d\lambda
+    = \text{const} - (a+n)\log\!\big(b + 2L_A^{\mathrm{eff}}\big),
+\end{equation}
+so that the candidate-dependent comparison term is
+\begin{equation}
+    -(a+n)\,\log\frac{b+2L_1^{\mathrm{eff}}}{b+2L_2^{\mathrm{eff}}} .
+\label{eq:gamma-term}
+\end{equation}
+This reduces to the plug-in $-2\bar\lambda(L_1^{\mathrm{eff}}-L_2^{\mathrm{eff}})$
+with $\bar\lambda = a/b$ when the prior is tight relative to the exposure, and
+widens as it loosens.  Omitting $\lambda^n$ --- integrating the exposure alone
+--- is correct only when no reads were observed, and understates the term
+substantially at realistic depth.  The shared flanks of the
+recruited unit then serve as a genuine control contributing to $\pi(\lambda)$,
+rather than as the informal cross-check described next.
+
+\subsection{Cross-check on the flank}
+
+The recruited unit contains sealed flanking sequence that both candidates share.
+The observed read-start density there provides an independent estimate of
+$\lambda$ that shares the local sequence context.  Agreement with the global
+estimate is a validity check; disagreement is itself informative, indicating
+locally depressed sampling.  Both values should be reported per locus, since a
+marginal verdict cannot be interpreted without knowing which rate produced it.
+
+\section{Reads explained by only one candidate}
+\label{sec:truncation}
+
+Because recruitment admits only reads matching recruited segments, reads
+explicable by neither candidate never enter, and contamination requires no
+model.  The delicate class is the opposite one: reads that place well in one
+candidate and nowhere in the other.  These carry the most information, and they
+are precisely the class recruitment \emph{selects for}.
+
+For such a read, \eqref{eq:dllr} requires $\log\sum_p e_{jp}$ under the
+candidate that cannot place it.  Evaluated literally this is the log-probability
+of the best essentially random placement --- of order $10^4$ nats for a $15$\,kb
+read, and scaling with read length.  A locus verdict would then be governed by
+which reads happened to be long rather than by how much sequence is missing, and
+the magnitude would rest on extrapolating a per-base error model tens of
+thousands of bases into a range where it was never calibrated.
+
+We therefore bound the contribution of each such read at a stated constant $C$.
+Doing so changes the object being computed, and we distinguish the two
+explicitly.  Write the uncapped ratio, over reads both candidates can place, as
+\begin{equation}
+    \Delta\mathrm{LLR}
+    = \sum_{j\,\in\,\text{common}}\Bigg[
+        \log\!\sum_{p\in\mathrm{slots}(A_1)}\! e^{(1)}_{jp}
+      - \log\!\sum_{p\in\mathrm{slots}(A_2)}\! e^{(2)}_{jp}\Bigg]
+      \;-\; 2\lambda\,\big(L_1^{\mathrm{eff}}-L_2^{\mathrm{eff}}\big),
+\label{eq:llr-common}
+\end{equation}
+with $L_A^{\mathrm{eff}}$ from Proposition~\ref{prop:exposure}, and define the
+reported statistic as
+\begin{equation}
+    \boxed{\;\Delta S \;=\; \Delta\mathrm{LLR} \;+\; C\,(m_1-m_2)\;}
+\label{eq:final}
+\end{equation}
+where $m_1$ counts reads placeable only in $A_1$ and $m_2$ only in $A_2$.  Each
+such read contributes through the count, not through the log-sum; the log-sums
+run only over reads both candidates can place, which is the range in which the
+error model was fitted.  This is Huberisation: bounding the influence of
+observations lying where the model is least trustworthy.
+
+\begin{remark}[$\Delta S$ is not a likelihood ratio]
+\label{rem:not-lr}
+Once the cap is imposed,
+$\Delta S \neq \log\{\Prob(R\mid A_1)/\Prob(R\mid A_2)\}$.  It must not be
+reported as a Bayes factor, converted to posterior odds, or described as
+calibrated evidence.  It is a robust comparison score whose mapping to error
+rates has to be established empirically, against simulated or held-out truth.
+The placeability threshold and the value of $C$ are parameters of the
+statistic: they are fixed in advance and swept as a sensitivity analysis, never
+tuned per locus.  Under the ideal conditions of Section~\ref{sec:conditioning}
+--- complete origin accounting, $\eta \to 0$, and no one-sided reads ---
+$\Delta S$ reduces to $\Delta\mathrm{LLR}$, which is a likelihood ratio.
+\end{remark}
+
+\begin{proposition}[Extra sequence pays for itself, or does not]
+\label{prop:count}
+Let $A_1$ claim $\Delta$ bases that $A_2$ lacks, and let $q$ denote the
+probability that a read originating in those bases is retained and uniquely
+placeable.  If the sequence is real, $\mathbb{E}[m_1] = 2\lambda\Delta q$ and
+\begin{equation}
+    \mathbb{E}[\Delta S] = 2\lambda\Delta\,(Cq-1),
+\end{equation}
+positive whenever $C > 1/q$.  If the sequence is fabricated, no reads originate
+from it, $m_1 = 0$, and $\Delta S = -2\lambda\Delta$.
+\end{proposition}
+
+The verdict direction is therefore stable over orders of magnitude in $C$
+provided $C$ exceeds $1/q$; $C$ scales confidence only.  The detection
+probability $q$ is bounded away from $1$ by the containment rule and the
+placeability threshold, and must be estimated by simulation rather than
+assumed.  Two readings of $m_1$ follow, and they should not be conflated.  If $q$ is
+known and the Poisson model holds,
+\begin{equation}
+    \hat\Delta_1 = \frac{m_1}{2\lambda \hat q}
+\end{equation}
+is an unbiased estimator of the missing length $\Delta$.  If $q$ has not been
+calibrated, then since $q \le 1$ and absent false positives,
+$m_1/(2\lambda)$ has expectation $\Delta q \le \Delta$ and serves as a
+conservative lower bound.  The first is the quantity to report once simulation
+has supplied $\hat q$; the second is what may be claimed before that.  We recommend
+reporting the triple $(m_1, m_2, L_1-L_2)$ alongside the score, since the counts
+are robust to $C$, to $s$, and to the error model's tail behaviour entirely.
+
+\section{The diploid case}
+\label{sec:diploid}
+
+Let a locus have haplotypes H1 and H2, each of length $\ell_{\mathrm{loc}}$,
+differing at a fraction $d$ of sites.  Let $A_1$ carry both
+($L_1 = 2\ell_{\mathrm{loc}}$) and $A_2$ carry only H1
+($L_2 = \ell_{\mathrm{loc}}$).  Define the wrong-haplotype placement factor
+\begin{equation}
+    u = e^{-d\,\ell\,s} \in (0,1],
+\end{equation}
+the relative probability retained when a read is forced onto the other
+haplotype.  Reads from H1 fit at both haplotypes in $A_1$ ($\propto 1+u$) and at
+one in $A_2$ ($\propto 1$); reads from H2 fit at both in $A_1$ but must place on
+H1 in $A_2$ ($\propto u$).  With $2\lambda\ell_{\mathrm{loc}} = n/2$,
+\begin{equation}
+    \Delta\mathrm{LLR}
+    = \frac{n}{2}\Big[2\log(1+u) - \log u\Big] - \frac{n}{2}.
+\end{equation}
+The bracket has derivative $(u-1)/\big(u(1+u)\big) \le 0$ on $(0,1]$, so it is
+minimised at $u=1$ with value $2\log 2 = 1.386 > 1$.  Hence
+\begin{equation}
+    \Delta\mathrm{LLR} \ge \left(\log 2 - \tfrac12\right) n \approx 0.193\,n > 0
+\end{equation}
+for all divergences, including zero --- but as an expectation, with $n$
+replaced by its mean.  The realised score is random through the read counts of
+each haplotype: at $d=0$ it reduces to
+$N\log 2 - 2\lambda\ell_{\mathrm{loc}}$ with
+$N \sim \text{Poisson}(4\lambda\ell_{\mathrm{loc}})$, whose failure
+probabilities appear in Table~\ref{tab:power}.  At human-average
+heterozygosity ($d=10^{-3}$, $\ell = 15$\,kb, $s=8$) and $n=400$ the expected
+margin is of order $2\times10^4$ nats and the realised sign is never in
+question; the finite-depth caveat binds only in the near-identical regime.  Haplotype loss is among the easiest events this method
+detects, because the reads from the lost haplotype have nowhere to go.
+
+A merged consensus haplotype rather than an absent one yields the same total
+signal to leading order, $\approx n\,d\ell s/2$, since both read sets then
+mismatch at half the heterozygous sites instead of one set mismatching at all of
+them.  The two failure shapes need not be modelled separately.
+
+\begin{remark}[Which term carries the haplotype signal]
+\label{rem:diploid-class}
+It is tempting to identify the H2 reads with the one-sided class $m_1$, but
+that is wrong at realistic divergence.  Whether a read is placeable on the
+surviving haplotype is decided by the pre-registered threshold, and a read of
+length $\ell$ forced onto the wrong haplotype accrues about $d\ell$ extra
+mismatches.  With an identity threshold $\theta$, it remains placeable while
+$d \lesssim 1-\theta$: at $\theta = 0.99$ that is $d \lesssim 10^{-2}$, an
+order of magnitude above human heterozygosity.  At $d = 10^{-3}$ and
+$\ell = 15$\,kb the wrong-haplotype alignment retains an identity of about
+$0.998$ and is comfortably retained.
+
+The consequence is that at ordinary heterozygosity the H2 reads sit in the
+\emph{common} class and the signal is carried by the emission ratio, each such
+read contributing $\log\!\big((1+u)/u\big) \approx d\ell s \approx 120$ nats.
+The one-sided classes carry haplotype signal only above the threshold's
+divergence budget, and otherwise carry structural differences: with
+$\theta = 0.99$ and $\ell = 15$\,kb, indels beyond roughly $135$\,bp.
+Reporting $m_1$, $m_2$ and the emission term separately is therefore not
+merely a diagnostic convenience --- the two record different kinds of event.
+\end{remark}
+
+\section{Assumptions and limits}
+
+\begin{enumerate}
+    \item \textbf{Uniform sampling within the unit.}  $\lambda$ is taken
+          constant across the locus.  Where sequencing coverage is
+          context-dependent --- notably in homopolymer-rich regions --- this is
+          violated, and a correct assembly may be penalised for sequence that
+          genuinely attracted few reads.  The flank cross-check of
+          Section~\ref{sec:lambda} detects this; a context-modulated
+          $\lambda(s)$ would mitigate it.
+    \item \textbf{Haplotype-balanced coverage.}  Section~\ref{sec:diploid}
+          assumes both haplotypes are sampled at rate $\lambda$.  Allele-specific
+          depletion shades the verdict toward the collapsed candidate.
+    \item \textbf{Read independence.}  Overlapping reads share genome, and HiFi
+          errors are correlated within homopolymers and short tandem repeats.
+          $\Delta\mathrm{LLR}$ therefore behaves as a Bayes factor scaled by
+          an unknown factor and must not be read as calibrated odds, a
+          restriction that applies a fortiori to $\Delta S$
+          (Remark~\ref{rem:not-lr}).  Uncertainty
+          should be obtained by a block bootstrap over genomic intervals rather
+          than from the likelihood curvature.  The bootstrap addresses sampling
+          variability only; the selection effect of
+          Section~\ref{sec:validation} is separate and is not cured by it.
+    \item \textbf{Origin enumeration.}  The sum over $p$ must not be truncated by
+          an aligner's secondary-alignment limits, since that sum carries the
+          copy-number signal.  Within a bounded unit, offsets should be
+          enumerated exhaustively and scored by the forward algorithm.
+    \item \textbf{Fixed error parameters.}  $\theta$ must be estimated once, from
+          undisputed sequence, and held fixed across both candidates; fitting it
+          per candidate lets a poorer assembly compensate with looser error
+          rates.
+\end{enumerate}
+
+\section{Calibration and validation}
+\label{sec:validation}
+
+\subsection{The candidates were selected using these reads}
+
+Both assemblies were built from the reads used to score them.  Treating them as
+fixed hypotheses ignores the search that produced them: an assembler explores a
+large space of alternatives and can encode sequencing error into consensus, so
+a candidate's fit to its own input reads is optimistic in a way that no amount
+of care in the likelihood repairs.  This is distinct from the dependence
+between reads discussed below, and is not addressed by resampling: a block
+bootstrap over a locus quantifies sampling variability, not selection.
+
+Three responses, in decreasing order of strength.  A \emph{held-out library} ---
+scoring on reads never supplied to either assembler --- removes the problem
+outright.  \emph{Cross-fitting} approximates it: partition molecules into
+folds, rebuild each candidate without one fold, and score it only on that fold.
+Where neither is available, the honest description of $\Delta S$ is an internal
+ranking statistic, useful for prioritising loci for curation, and not a
+measure of evidence.
+
+Two distinct forms of independence are easily conflated, and the validation
+design turns on keeping them apart.
+
+\emph{Independent truth} means an external standard against which a verdict can
+be judged right or wrong.  A Q100 reference supplies this: it tells us whether
+the method reached the correct conclusion, and it is what makes error rates
+measurable at all.  Simulation supplies it by construction.
+
+\emph{Independent reads} means scoring on data that did not participate in
+building the candidates.  A Q100 reference does \emph{not} supply this: the
+assemblies under comparison were still built from the same reads used to score
+them, so $\Delta S$ remains optimistic even when the benchmark says the verdict
+was right.  What an external truth set buys is an unbiased estimate of the
+\emph{decision} accuracy; what it does not buy is an unbiased \emph{score}.
+
+The practical consequence: HG002-against-Q100 is a sound basis for calibrating
+the mapping from $\Delta S$ to error rates, provided the calibration is
+reported as accuracy of the decision rather than as evidence carried by the
+score, and provided the same reads were used to build both candidates so the
+optimism is at least symmetric.  A survey ranking production assemblies against
+one another with neither external truth nor held-out reads has neither
+property, and its output is a prioritisation for curation and nothing more.
+
+\subsection{What must be calibrated}
+
+Three quantities in this document are not determined by the model and must be
+established empirically, all by simulation against known truth:
+
+\begin{enumerate}
+    \item the mapping from $\Delta S$ to error rates, which
+          Remark~\ref{rem:not-lr} defers and which is the only thing that makes
+          the score interpretable;
+    \item the detection probability $q$ of Proposition~\ref{prop:count},
+          without which $m_1$ bounds missing length but does not estimate it;
+    \item the gap and insertion parameters of Section~\ref{sec:context}, fitted
+          on undisputed sequence and held fixed.
+\end{enumerate}
+
+Sensitivity should be reported over the placeability threshold, the cap $C$,
+and $\lambda$, since each is a choice rather than a measurement.  Because the
+propositions of Sections~\ref{sec:conditioning} and~\ref{sec:diploid} concern
+expectations, calibration must report realised error rates at finite depth ---
+Table~\ref{tab:power} gives the floor those rates cannot beat.
+
+\section{Summary}
+
+The verdict for a locus is $\Delta S$ of \eqref{eq:final}, comprising three
+terms: a
+likelihood difference over reads both candidates explain, computed by a
+free-start forward pass with quality-conditioned and context-dependent
+parameters; a
+bounded count difference over reads only one candidate explains; and a linear
+exposure penalty $2\lambda(L_1^{\mathrm{eff}}-L_2^{\mathrm{eff}})$ with
+$\lambda$ estimated from the k-mer spectrum of the reads.  The exposure penalty
+and the count are two halves of one question --- whether claimed sequence pays
+for itself in reads --- expressed in the same units.
+
+Three qualifications travel with every verdict.  Its likelihood-ratio component
+is local only to the tolerance $\eta$ of Proposition~\ref{prop:locality}, which
+is computed rather than assumed and reported alongside the score; the capped
+term is outside that guarantee, which is why $m_1$ and $m_2$ are reported
+separately (Remark~\ref{rem:eta-scope}).  It is a robust statistic rather
+than calibrated evidence, reducing to a likelihood ratio only under the ideal
+conditions of Remark~\ref{rem:not-lr}.  And the propositions establish the sign
+of an expectation, not of every realisation: at low depth the realised verdict
+can invert, with the floor given in Table~\ref{tab:power}.
+
+Stated at the width the derivations support: for fixed candidates and an
+explicitly modelled read-selection process, the method supplies an
+exposure-calibrated comparison score, which under ideal closure, complete origin
+accounting and a calibrated mark likelihood reduces to a likelihood ratio whose
+copy-number signal survives because local coverage is never profiled away.
+
+\end{document}
