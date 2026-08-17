@@ -92,7 +92,7 @@ src/qatool/phmm/
 
 Stages A–E need no project data at all. Real-data plumbing is stage H.
 
-### Stage A — Parameters and scalars (S)
+### Stage A — Parameters and scalars (S) — DONE
 
 `PhmmParams` dataclass, defaults, quality-to-`ε` conversion, `s = log(3(1-ε)/ε)`.
 
@@ -101,7 +101,7 @@ The current `exp(-NM)` uses `s = 1`.
 
 *Accepts when:* `s` matches the doc's table (5.7 @ Q20, 8.0 @ Q30, 10.3 @ Q40).
 
-### Stage B — `forward_window` and Viterbi (M)
+### Stage B — `forward_window` and Viterbi (M) — DONE
 
 numpy, log space with LSE, no banding, small inputs. Implements §5.5 exactly,
 including the two forbidden transitions (`B→D`, `D→E`). Reverse-strand reads
@@ -129,10 +129,15 @@ handled by reverse-complementing the read, once, at the adapter boundary.
   termination edges are never consulted; at `τ > 0` the score shifts by exactly
   `ℓ`-independent `log τ` relative to `τ = 0`, confirming eq. (9) carries it out
   front and that no path terminates twice.
-- **No origin double-counting.** Scoring a read against a template padded by an
-  extra `k` bases on either side must leave the score unchanged once edge mass is
-  negligible. This is the observable consequence of excluding `B→D` and `D→E`;
-  reintroducing either makes the score grow with pad.
+- **No origin double-counting.** With gaps disabled, padding a template by `k`
+  bases on either side must leave the score unchanged to machine precision: each
+  origin is counted once, and the added origins explain a random read only
+  through ~L mismatches. With gaps enabled the score *does* rise, and should —
+  a pad that extends a homopolymer across the boundary lets the read's last base
+  match further right after deletions, worth `(1 − γ_D^k)·δ_D`, which is
+  Remark 6's degeneracy in a second guise. The increment is data-dependent but
+  non-negative and bounded by the total gap-open mass
+  `δ_D/(1−γ_D) + δ_I/(1−γ_I)`.
 
 ### Stage C — Normaliser Z (S)
 
