@@ -86,22 +86,55 @@ copy-number signal lives. Remark 3 attributes the degeneracy correctly — it co
 from marginalising over origins — so a wider window makes the exclusions more
 necessary, not less.
 
-**The reference implementation is permanent.** `reference.py` is the oracle every
-later stage is tested against, not scaffolding.
+**The full-table engine is permanent.** `_dp_full_table` in `dp.py` is the oracle
+every faster path is tested against, not scaffolding. It keeps the scalar
+deletion loop for exactly that reason.
 
 ## Module layout
 
 ```
-src/qatool/phmm/
-  params.py      PhmmParams; defaults; estimation from CIGARs
-  reference.py   numpy oracle: forward_window, viterbi_window, normaliser
-  sample.py      generative sampler: draw reads from the model
-  window.py      FASTA adapter: (contig, pos, pad) -> template
-  kernel.py      numba banded kernels
-  origins.py     candidate-origin enumeration per locus
-  reads.py       ReadStore: read_name -> (seq, qual)
-  score.py       per-read log Σ_p e_jp and the log-ratio
+src/qamodel/
+  exposure.py      lambda from genome-wide depth; L_eff; exposure term   [I, done]
+  score.py         per-read ratio, clamp at +/-C, Delta S; score_locus   [I, done]
+  phmm/
+    params.py      PhmmParams; transitions; quality table                [A, done]
+    dp.py          the recursion: full-table oracle + two-row engine     [B, F1]
+    band.py        which cells to compute; diagonal or CIGAR-anchored    [F2]
+    kernel.py      compiled engine, linear space with rescaling          [F4]
+    sample.py      the model run forwards                                [D]
+    reads.py       read sequence and qualities from primary records      [H]
+    windows.py     placements -> strand-oriented windows, disjoint origins [F3]
 ```
+
+`qamodel` imports nothing from `qatool`; the dependency runs one way only
+(`qatool.plotters.likelihood → qamodel`), which is what keeps stages A–E usable
+on simulated sequence with no database, recruiter or BAM in play.
+
+## Definitions
+
+Stated strictly, because the difference between them is where the errors are.
+
+**Unit** `U_A` — a finite set of disjoint intervals of assembly `A` (the
+recruited segments), possibly on different contigs. Total length `L_A`.
+
+**Origin** `p = (c, s, o)` — contig, 0-based position, strand `o ∈ {+,−}`, with
+`s` inside a segment of `U_A`. The slot set has exactly `2·L_A` members, which is
+the `2L_A` of §7's uniform prior and of the exposure `−2λL_A`.
+
+**Template at `p`** — a function of `p` alone, with `[b, e)` the segment holding
+`s`: `A[c][s:e]` when `o = +`, `revcomp(A[c][b:s+1])` when `o = −`. Truncated at
+the segment boundary, so origins near an edge get a short template — which *is*
+Proposition 8's containment problem, not a separate concern.
+
+**Mark** `Y = (r, Q)` — the read as sequenced, qualities in sequencing order,
+never reverse-complemented.
+
+**`e(Y | p, A)`** — one `forward(r, Q, template_at_p, origin=0)` call.
+
+An alignment is **not** part of any of these. Alignments are a device for finding
+origins with non-negligible `e`; an origin the aligner never reported is still a
+term in `Σ_p`, and since Proposition 4's signal is the *count* of origins,
+truncating the sum at `-N` attacks the quantity being measured (§12.4).
 
 ## Stages
 
@@ -119,8 +152,17 @@ The current `exp(-NM)` uses `s = 1`.
 ### Stage B — `forward_window` and Viterbi (M) — DONE
 
 numpy, log space with LSE, no banding, small inputs. Implements §5.5 exactly,
-including the two forbidden transitions (`B→D`, `D→E`). Reverse-strand reads
-handled by reverse-complementing the read, once, at the adapter boundary.
+including the two forbidden transitions (`B→D`, `D→E`).
+
+**Strand lives in the template, not the read.** §5.2 defines `t` as the assembly
+sequence read from `s` on strand `o`, so a reverse-strand origin takes
+`revcomp(A[c][b : s+1])` as its template while the read stays as sequenced with
+its qualities in sequencing order. Reverse-complementing the read instead is
+*not* equivalent: measured, it agrees to 1e-6 on an ordinary read but differs by
+0.25 nats when the read begins with an insertion, because `B→I = δ_I` and
+`B→M = 1−δ_I` are asymmetric and reversing a path swaps which end pays which.
+Nothing in `dp.py` reverse-complements anything; the caller supplies the
+strand-oriented template, and stage H's adapter is where that happens.
 
 *Accepts when:*
 - **Exact path enumeration.** For ℓ ≤ 4, m ≤ 6, brute-force every state path and
@@ -170,16 +212,31 @@ Same recursion, all emissions set to 1.
   confirming it cancels and can be skipped in production until context
   dependence lands.
 
-### Stage D — Generative sampler (S)
+### Stage D — Generative sampler (S) — DONE
 
 `sample_read(template, params, rng) -> (read, qual, true_path, true_origin)`.
 Walk the chain, emit, record the path. Small, and it unlocks every stage below.
 
 *Accepts when:*
-- **Empirical/analytic agreement.** Over many samples from a short template, the
-  observed frequency of each read matches `exp(forward_window)` — the sampler and
-  the scorer are then provably the same model.
-- Observed indel-length distribution is geometric with the specified `γ`.
+- **Empirical/analytic agreement. Met.** With `τ > 0` the chain terminates on its
+  own and a read's frequency is exactly `τ·exp(forward)`. Over 200k draws the
+  worst of the top 20 reads is 2.4 standard errors out, and summed over all 84
+  reads of length ≤ 3 the observed mass is 0.5787 against 0.5781 predicted.
+- **Length-conditioned agreement. Met.** With `τ = 0` and a fixed length the
+  sampler draws from `forward / Z(ℓ)`; normalising both sides removes the unknown
+  constant, and the worst gap is 0.0012. Inverting it estimates `Z(6) ≈ 1.003`,
+  which stage C should reproduce directly.
+- **Indel lengths geometric. Met.** Insertion runs mean 2.228 against 2.222;
+  deletion runs 1.538 against 1.538.
+
+Two test premises were wrong and are recorded because both recur. Selecting reads
+by observed count biases a global mass check upward — it keeps exactly the reads
+that came up more often than expected — so the check enumerates every read of
+length ≤ 3 independently of the sample instead. And discarding truncated walks
+censors deletion runs, because a D run still going when the template runs out is
+what causes truncation; on a 40 bp template that pulled the deletion mean 4
+standard errors low while leaving insertions untouched, since they consume no
+template. The test now uses a 400 bp template, where nothing truncates.
 
 ### Stage E — Propositions on simulated data (M)
 
@@ -202,7 +259,7 @@ Realistic simulation (pbsim3 HiFi profiles) belongs after this, to probe
 misspecification. Sampling from the model itself comes first because only there
 is the truth exact.
 
-### Stage F — Banded numba kernel and origin enumeration (L)
+### Stage F — Fast engines and origin enumeration (L) — F1, F2, F4 DONE
 
 The risky stage. Origin candidates from a per-locus minimap2 run against the
 extracted unit (`-N 200 -p 0.05`). Banded DP anchored on each candidate's
@@ -218,15 +275,43 @@ copy-number signal. That only bites genome-wide: re-aligning recruited reads
 against the extracted ~100 kb unit with generous settings costs seconds and
 sidesteps the global `-N 20` entirely.
 
-Consider row-rescaled linear space over LSE — avoids an `exp` and a `log` per
-cell, typically 3–5× faster — but only if the stage B/C tests still pass to 1e-9.
+**F1 (done)** row recycling and a vectorised deletion row, in `dp.py`. Memory
+went from 5.1 GB to 9 KB for a 15 kb read, which is what made real reads possible
+at all.
+
+**F2 (done)** banding, in `band.py`. Diagonal or CIGAR-anchored, with `band_edge`
+reporting mass pressed against a band boundary. 8.8× over unbanded.
+
+**F4 (done)** the compiled engine, in `kernel.py`. **28.5× over banded numpy**,
+so about 13 s per locus for 500 reads against two assemblies rather than 6 min.
+
+The linear-space question was settled by measurement, and the answer reverses
+what this document said before. At band width 200 `np.logaddexp` costs 3.66 µs
+per call against 0.41 µs for `np.maximum`, and ~89% of that is the `exp`/`log1p`
+pair; across a row those two operations are ~85% of the time. In linear space
+with per-row rescaling they vanish — every cell is multiply-add, ~13 flops. That
+is where the 28× comes from, not from compilation as such. Log space remains
+right for the numpy engine, where the deletion scan must go through
+`logaddexp.accumulate` because a Python loop is unaffordable; inside numba a
+sequential loop is exactly what is wanted.
+
+**F3 (done)** `phmm/windows.py`. Containment on the aligned span, the recruiter's
+own rule; a read crossing a segment edge in either candidate is dropped from both.
+Clips are in reference orientation, so a reverse-strand read starts at
+`end + clip_right - 1`, with the template reverse-complemented and the CIGAR
+reversed. Placements whose origin ranges would overlap merge into one window
+owning the hull; the band is the union of members' CIGAR bands. Checked on
+synthetic sequence for both strands and both clip sides, and three tandem copies
+give `log 3` through the full placement-to-window path.
 
 *Accepts when:*
-- Matches `reference.py` to 1e-9 on every stage B–D case.
+- Matches `dp.py` to 1e-9 on every stage B–D case. **Met**: 142 configurations
+  for the kernel, worst 8.5e-14; terminal rows agree to 6.3e-13.
 - **The budget experiment.** On a real repeat locus, anchored `Σ_p` matches the
-  free-start oracle within 0.1 nats. This gate sets the compute budget for
-  everything downstream and must be settled here, not after wiring in.
-- Band-edge mass below a stated threshold; throughput recorded in cells/s.
+  free-start oracle within 0.1 nats. Half met — disjoint windows already
+  reproduce the whole-unit pass to 2e-16 on synthetic sequence; the real-locus
+  half belongs to F3, with real aligner placements.
+- Band-edge mass below a stated threshold; throughput recorded. **Met.**
 
 ### Stage G — Parameter estimation (M)
 
@@ -244,7 +329,7 @@ fixed across both candidates (§12.5). `τ` cancels under context-independence.
 Baum–Welch is the better estimator but waits until context dependence makes `Z`
 matter.
 
-### Stage H — Real-data adapters (M)
+### Stage H — Real-data adapters (M) — DONE
 
 `ReadStore` and locus-level origin enumeration.
 
@@ -260,13 +345,33 @@ needs ~500 such lookups — seconds, and cacheable.
 `aln_type` values; a read whose only local placement is secondary still resolves;
 a missing primary raises rather than returning silently.
 
-### Stage I — Wire into the score (S)
+### Stage I — The full locus score (M) — DONE
 
-Replace `exp(-NM)` in `plotters/likelihood.py` with `log Σ_p e_jp`. Emission term
-only — leave `-n log L_A` alone so the two changes stay attributable.
+Built as the whole score rather than the emission term alone, because an
+emission-only number prefers a false duplication by exactly `log 2` per read
+(Proposition 6, reproduced in `tests/test_score.py`).
 
-*Accepts when:* on the HG002 seed locus, per-read log-ratios are finite, read
-ranking is stable under a 2× change in band width, and wall time is recorded.
+    Delta S = sum_j clamp(log sum_A1 e_jp - log sum_A2 e_jp, -C, +C) - 2 lambda (L_eff1 - L_eff2)
+
+`qamodel/exposure.py`: `lambda = N / (2 L_dip)` from primary reads genome-wide —
+1.05e-3 on HG002, 32x per haplotype — and `L_eff` in the exact form over the
+empirical read-length histogram. `qamodel/score.py`: every read clamped at `±C`
+(default 200), so the score is continuous and a one-sided read simply lands on
+the clamp. `LocusScore.at(C)` re-evaluates for another C from stored ratios.
+Entry point `qatool.plotters.phmm_likelihood_report`.
+
+**HG002 seed locus:** Delta S = −271.95 nats for `curated` over `hifiasm_hic`,
+106 reads, none dropped, 28 s. The two candidates are identical here except for
+one event — an (AT)n microsatellite three units shorter in `hifiasm_hic`, against
+an Alu poly-T tail at `h2tg000020l:61,904,626`. All 18 reads that favour
+`curated` span it; no read favours `hifiasm_hic` by more than 0.69 nats.
+Regression test: `tests/test_score_hg002.py`.
+
+**Caveat on magnitude.** The event is a microsatellite length difference — the
+context where HiFi indel error concentrates and where context-independent gap
+parameters are least right. The *direction* rests on 18 spanning reads against
+none; the *size* depends on uncalibrated placeholders. Stage G, and then the
+deferred context-dependent gaps, are what make the magnitude interpretable.
 
 ## Deferred
 

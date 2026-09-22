@@ -17,6 +17,9 @@ dependencies = [
 
 [project.optional-dependencies]
 view = ["bokeh", "panel"]
+# The compiled pair-HMM engine. Without it qamodel still works;
+# forward_window is the same recursion in numpy, about 28x slower.
+model = ["numba"]
 
 [[project.authors]]
 name = "Anton Zamyatin"

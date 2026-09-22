@@ -1,4 +1,4 @@
-"""Tests for the reference forward and Viterbi (Stage B of docs/phmm.md).
+"""Tests for the full-table forward and Viterbi (Stage B of docs/phmm.md).
 
 The anchor test is `test_exact_path_enumeration`: for tiny inputs it walks the
 transition graph of model.tex §5.3 exhaustively and sums whole paths, then
@@ -6,7 +6,7 @@ demands the DP match to 1e-12. Everything else in the pair HMM is that
 recursion applied at scale, so ground truth here is worth more than any number
 of plausibility checks.
 
-Run: venv/bin/python tests/test_phmm_reference.py
+Run: venv/bin/python tests/test_phmm_dp.py
 """
 
 import math
@@ -17,7 +17,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from qamodel.phmm import PhmmParams, quality_table
-from qamodel.phmm.reference import forward, forward_window, viterbi
+from qamodel.phmm.dp import forward, forward_window, viterbi
 
 NEG_INF = -math.inf
 QT = quality_table()
@@ -40,7 +40,7 @@ def enumerate_paths(read, qual, template, params, qt, origin=None,
                     full_template=False):
     """Log-sum over every legal state path, by brute force.
 
-    Independent of reference.py by construction: it walks the §5.3 edge list
+    Independent of dp.py by construction: it walks the §5.3 edge list
     directly rather than reusing any recursion.
     """
     tr = params.log_trans()

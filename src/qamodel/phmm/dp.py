@@ -1,8 +1,22 @@
-"""Reference forward and Viterbi for the pair HMM (model.tex §5.5).
+"""The pair HMM dynamic program (model.tex §5.5).
 
-Stage B of docs/phmm.md.  Pure numpy, log space, unbanded, no optimisation.
-This is the permanent oracle every later stage is checked against, so it is
-written to be obviously the recursion of §5.5 rather than to be fast.
+Two engines compute the same recursion and must return the same number:
+
+  _dp_full_table   every cell of (L+1) x (T+1), both semirings, back-pointers.
+                   Written to be obviously the recursion rather than to be fast,
+                   and it keeps the scalar deletion loop for that reason. It is
+                   the oracle, and it is what `forward` and `viterbi` use.
+
+  _dp_two_rows     two rows instead of the whole table, a vectorised deletion
+                   row, and an optional band. Forward only -- traceback needs
+                   every row's pointers. It is what `forward_window` uses, and
+                   it is the only one that can run on a real read.
+
+Public surface, three functions:
+
+  forward(...)         oracle; carries `full_template` for the tests
+  viterbi(...)         best single path, with traceback; never used to score
+  forward_window(...)  production scoring, row-recycled and bandable
 
 Coordinates.  The read is `r[0..L-1]` and the template `t[0..T-1]`.  The DP runs
 over `(u, v)` with `u` read bases emitted and `v` the *absolute* template index
@@ -71,7 +85,7 @@ def encode(seq: str) -> np.ndarray:
     return np.frombuffer(seq.upper().encode("ascii"), dtype=np.uint8)
 
 
-def _as_qual(qual, length: int) -> np.ndarray:
+def _qual_array(qual, length: int) -> np.ndarray:
     """Accept a per-base quality array or one value broadcast over the read."""
     arr = np.full(length, int(qual), dtype=np.int64) if np.isscalar(qual) \
         else np.asarray(qual, dtype=np.int64)
@@ -96,7 +110,7 @@ def _origin_range(origin, T: int) -> tuple[int, int]:
     return lo, hi
 
 
-def _la(a: float, b: float) -> float:
+def _log_add(a: float, b: float) -> float:
     """Scalar log-add-exp; `np.logaddexp` is correct here but ~5x slower."""
     if b > a:
         a, b = b, a
@@ -117,6 +131,7 @@ class WindowScore:
 
     logp: float
     terminal: np.ndarray
+    band_edge: float = 0.0
 
     def edge_mass(self, margin: int = 1) -> float:
         """Fraction of terminal mass ending within `margin` of the right edge.
@@ -153,10 +168,9 @@ class ViterbiResult:
     path: str
 
 
-def _dp(read: np.ndarray, qual: np.ndarray, tmpl: np.ndarray,
+def _dp_full_table(read: np.ndarray, qual: np.ndarray, tmpl: np.ndarray,
         params: PhmmParams, qt: QualityTable,
-        origin: int | None, full_template: bool,
-        use_max: bool, want_ptr: bool):
+        origin, use_max: bool, want_ptr: bool):
     """Shared recursion. `use_max` switches the semiring from sum to max.
 
     Forward and Viterbi share one body deliberately: the homopolymer test
@@ -167,9 +181,9 @@ def _dp(read: np.ndarray, qual: np.ndarray, tmpl: np.ndarray,
     L, T = read.shape[0], tmpl.shape[0]
     lo, hi = _origin_range(origin, T)
 
-    combine = max if use_max else _la
+    combine = max if use_max else _log_add
 
-    def vcombine(*arrays):
+    def combine_vec(*arrays):
         out = arrays[0]
         for a in arrays[1:]:
             out = np.maximum(out, a) if use_max else np.logaddexp(out, a)
@@ -203,15 +217,15 @@ def _dp(read: np.ndarray, qual: np.ndarray, tmpl: np.ndarray,
 
         # M and I depend only on row u-1, so both vectorise over v.
         cand_m = (fM[u - 1, :T] + tr.m_m, fI[u - 1, :T] + tr.i_m, fD[u - 1, :T] + tr.d_m)
-        inc_m = vcombine(*cand_m)
+        inc_m = combine_vec(*cand_m)
         if u == 1:
-            inc_m = vcombine(inc_m, start_m[1:])
+            inc_m = combine_vec(inc_m, start_m[1:])
         fM[u, 1:] = emit_m + inc_m
 
         cand_i = (fM[u - 1] + tr.m_i, fI[u - 1] + tr.i_i)
-        inc_i = vcombine(*cand_i)
+        inc_i = combine_vec(*cand_i)
         if u == 1:
-            inc_i = vcombine(inc_i, start_i)
+            inc_i = combine_vec(inc_i, start_i)
         fI[u] = qt.log_insert + inc_i
 
         if want_ptr:
@@ -249,14 +263,182 @@ def _dp(read: np.ndarray, qual: np.ndarray, tmpl: np.ndarray,
     return fM, fI, fD, (pM, pI, pD)
 
 
-def _terminal(fM, fI, L: int, use_max: bool) -> np.ndarray:
+def _deletion_row(cur_m: np.ndarray, m_d: float, d_d: float) -> np.ndarray:
+    """One D row, without the left-to-right scalar scan.
+
+    The recurrence is `D[v] = LSE( M[v-1] + m_d, D[v-1] + d_d )`. Unrolled, it
+    says a deletion reaching `v` opened at some `k < v` and was extended `v-1-k`
+    times:
+
+        D[v] = LSE over k < v of ( M[k] + m_d + (v-1-k)*d_d )
+
+    The `(v-1)*d_d` part depends only on `v`, so pull it out; what is left is a
+    running total over `k`, which is one `logaddexp.accumulate` instead of `T`
+    scalar steps. The intermediate terms reach `T*|d_d|` in magnitude -- about
+    18000 at `T = 15000`, `gamma_D = 0.3` -- so the reconstruction loses roughly
+    `T*|d_d|*2^-52` of absolute accuracy, around 4e-12 at that size. Fine for the
+    1e-9 tolerances used here, but it is why `_dp_full_table` keeps the scalar loop
+    and why this is tested against it rather than trusted.
+    """
+    n = cur_m.shape[0]
+    out = np.full(n, NEG_INF)
+    if m_d == NEG_INF or n < 2:
+        return out
+    if d_d == NEG_INF:
+        out[1:] = cur_m[:-1] + m_d          # gaps cannot extend: length 1 only
+        return out
+    k = np.arange(n, dtype=np.float64)
+    c = np.logaddexp.accumulate(cur_m - k * d_d)
+    out[1:] = m_d + (k[1:] - 1.0) * d_d + c[:-1]
+    return out
+
+
+def _logsumexp(*arrays) -> float:
+    """log-sum-exp over several small arrays, ignoring -inf."""
+    vals = np.concatenate([a[np.isfinite(a)] for a in arrays]) if arrays else None
+    if vals is None or vals.size == 0:
+        return NEG_INF
+    m = vals.max()
+    return float(m + np.log(np.exp(vals - m).sum()))
+
+
+def _gather(src, src_lo, src_hi, want_lo, n, out):
+    """`out[j] = src[want_lo + j]`, or -inf where that is outside the source band.
+
+    Rows are held in absolute template coordinates, so cells outside a row's own
+    band hold stale values from two rows ago. Clamping reads to the source band
+    is what keeps that staleness unreachable, and it is cheaper than clearing.
+    """
+    out[:] = NEG_INF
+    a = max(want_lo, src_lo)
+    b = min(want_lo + n, src_hi)
+    if b > a:
+        out[a - want_lo:b - want_lo] = src[a:b]
+    return out
+
+
+def _dp_two_rows(read: np.ndarray, qual: np.ndarray, tmpl: np.ndarray,
+                  params: PhmmParams, qt: QualityTable,
+                  origin, band=None):
+    """Forward pass keeping two rows, optionally restricted to a band.
+
+    Row `u` reads only row `u-1`, so once row `u` exists row `u-2` is dead. Two
+    buffers therefore suffice, swapped each step: memory drops from `O(L*T)` to
+    `O(T)`, which is 9 KB rather than 5.1 GB for a 15 kb read against a 15.1 kb
+    template. Scoring needs only the final row, so nothing is lost.
+
+    Viterbi cannot do this: traceback walks backwards and needs every row's
+    pointers, which is why `_dp_full_table` still allocates the whole thing.
+
+    With a band, only `lo[u] <= v < hi[u]` is evaluated. Paths leaving the band
+    are lost rather than approximated, which is why the second return value
+    reports the largest share of any row's mass found sitting on a band edge.
+    Edges that coincide with the template's own ends do not count: mass there is
+    the read genuinely reaching the boundary, not the band cutting it off.
+
+    Returns `(terminal_row, band_edge_fraction)`.
+    """
+    tr = params.log_trans()
+    L, T = read.shape[0], tmpl.shape[0]
+    lo_o, hi_o = _origin_range(origin, T)
+
+    if band is None:
+        band_lo = np.zeros(L + 1, dtype=np.int64)
+        band_hi = np.full(L + 1, T + 1, dtype=np.int64)
+    else:
+        if band.rows != L + 1:
+            raise ValueError(
+                f"band has {band.rows} rows, read of length {L} needs {L + 1}")
+        band_lo, band_hi = band.lo, band.hi
+
+    start_m = np.full(T + 1, NEG_INF)
+    start_i = np.full(T + 1, NEG_INF)
+    start_m[lo_o + 1:hi_o + 1] = tr.b_m
+    start_i[lo_o:hi_o] = tr.b_i
+
+    prev_m = np.full(T + 1, NEG_INF)
+    prev_i = np.full(T + 1, NEG_INF)
+    prev_d = np.full(T + 1, NEG_INF)
+    cur_m = np.full(T + 1, NEG_INF)
+    cur_i = np.full(T + 1, NEG_INF)
+    cur_d = np.full(T + 1, NEG_INF)
+
+    w = int((band_hi - band_lo).max())
+    buf = [np.empty(w) for _ in range(5)]
+
+    p_lo, p_hi = int(band_lo[0]), int(band_hi[0])
+    band_edge = 0.0
+
+    for u in range(1, L + 1):
+        a, b = int(band_lo[u]), int(band_hi[u])
+        n = b - a
+        am = max(a, 1)                      # M has no cell at v = 0
+        nm = b - am
+
+        q = int(qual[u - 1])
+        base = read[u - 1]
+
+        gm = _gather(prev_m, p_lo, p_hi, am - 1, nm, buf[0][:nm])
+        gi = _gather(prev_i, p_lo, p_hi, am - 1, nm, buf[1][:nm])
+        gd = _gather(prev_d, p_lo, p_hi, am - 1, nm, buf[2][:nm])
+        inc_m = np.logaddexp(np.logaddexp(gm + tr.m_m, gi + tr.i_m), gd + tr.d_m)
+
+        hm = _gather(prev_m, p_lo, p_hi, a, n, buf[3][:n])
+        hi_ = _gather(prev_i, p_lo, p_hi, a, n, buf[4][:n])
+        inc_i = np.logaddexp(hm + tr.m_i, hi_ + tr.i_i)
+
+        if u == 1:
+            inc_m = np.logaddexp(inc_m, start_m[am:b])
+            inc_i = np.logaddexp(inc_i, start_i[a:b])
+
+        tsl = tmpl[am - 1:b - 1]
+        hit = (tsl == base) & (base != _N_CODE) & (tsl != _N_CODE)
+        cur_m[a:am] = NEG_INF
+        cur_m[am:b] = np.where(hit, qt.log_match[q], qt.log_mismatch[q]) + inc_m
+        cur_i[a:b] = qt.log_insert + inc_i
+        cur_d[a:b] = _deletion_row(cur_m[a:b], tr.m_d, tr.d_d)
+
+        if band is not None and n > 2:
+            total = _logsumexp(cur_m[a:b], cur_i[a:b], cur_d[a:b])
+            if math.isfinite(total):
+                sides = []
+                if a > 0:
+                    sides += [cur_m[a:a + 1], cur_i[a:a + 1], cur_d[a:a + 1]]
+                if b < T + 1:
+                    sides += [cur_m[b - 1:b], cur_i[b - 1:b], cur_d[b - 1:b]]
+                if sides:
+                    band_edge = max(band_edge,
+                                    float(np.exp(_logsumexp(*sides) - total)))
+
+        prev_m, cur_m = cur_m, prev_m
+        prev_i, cur_i = cur_i, prev_i
+        prev_d, cur_d = cur_d, prev_d
+        p_lo, p_hi = a, b
+
+    terminal = np.full(T + 1, NEG_INF)
+    terminal[p_lo:p_hi] = np.logaddexp(prev_m[p_lo:p_hi], prev_i[p_lo:p_hi])
+    return terminal, band_edge
+
+
+def _terminal_row(fM, fI, L: int, use_max: bool) -> np.ndarray:
     """Per-end-position mass, excluding f_D: that exclusion is `D -> E` forbidden."""
     return np.maximum(fM[L], fI[L]) if use_max else np.logaddexp(fM[L], fI[L])
 
 
-def _total(terminal: np.ndarray, full_template: bool, T: int, use_max: bool) -> float:
-    if full_template:
-        return float(terminal[T])
+def _restrict_to_end(terminal: np.ndarray, T: int) -> np.ndarray:
+    """Keep only paths that finished at the template's right edge.
+
+    This is `full_template`: classical global alignment when combined with
+    `origin=0`. It belongs to the caller, not to the recursion -- the engines
+    never needed to know about it.
+    """
+    out = np.full_like(terminal, NEG_INF)
+    out[T] = terminal[T]
+    return out
+
+
+def _score_from_terminal(terminal: np.ndarray, use_max: bool) -> float:
+    """Collapse the per-end-position row to one number."""
     finite = terminal[np.isfinite(terminal)]
     if finite.size == 0:
         return NEG_INF
@@ -269,7 +451,7 @@ def _total(terminal: np.ndarray, full_template: bool, T: int, use_max: bool) -> 
 def _prepare(read, qual, template, params, qt):
     r = encode(read) if isinstance(read, str) else np.asarray(read, dtype=np.uint8)
     t = encode(template) if isinstance(template, str) else np.asarray(template, dtype=np.uint8)
-    return r, _as_qual(qual, r.shape[0]), t, params or PhmmParams(), qt or quality_table()
+    return r, _qual_array(qual, r.shape[0]), t, params or PhmmParams(), qt or quality_table()
 
 
 def forward(read, qual, template, params: PhmmParams | None = None,
@@ -287,13 +469,11 @@ def forward(read, qual, template, params: PhmmParams | None = None,
     combination is for the oracle tests; scoring never uses it.
     """
     r, q, t, p, table = _prepare(read, qual, template, params, qt)
-    fM, fI, _, _ = _dp(r, q, t, p, table, origin, full_template, False, False)
-    terminal = _terminal(fM, fI, r.shape[0], False)
+    fM, fI, _, _ = _dp_full_table(r, q, t, p, table, origin, False, False)
+    terminal = _terminal_row(fM, fI, r.shape[0], False)
     if full_template:
-        masked = np.full_like(terminal, NEG_INF)
-        masked[t.shape[0]] = terminal[t.shape[0]]
-        terminal = masked
-    return WindowScore(logp=_total(terminal, full_template, t.shape[0], False),
+        terminal = _restrict_to_end(terminal, t.shape[0])
+    return WindowScore(logp=_score_from_terminal(terminal, False),
                        terminal=terminal)
 
 
@@ -303,9 +483,9 @@ def viterbi(read, qual, template, params: PhmmParams | None = None,
     """Best single path, with traceback. Never used for scoring (Remark 6)."""
     r, q, t, p, table = _prepare(read, qual, template, params, qt)
     L, T = r.shape[0], t.shape[0]
-    fM, fI, fD, (pM, pI, pD) = _dp(r, q, t, p, table, origin, full_template, True, True)
+    fM, fI, fD, (pM, pI, pD) = _dp_full_table(r, q, t, p, table, origin, True, True)
 
-    terminal = _terminal(fM, fI, L, True)
+    terminal = _terminal_row(fM, fI, L, True)
     if full_template:
         best_v, best = T, float(terminal[T])
     else:
@@ -337,13 +517,25 @@ def viterbi(read, qual, template, params: PhmmParams | None = None,
 
 
 def forward_window(read, qual, template, params: PhmmParams | None = None,
-                   qt: QualityTable | None = None, *, origin=None) -> WindowScore:
-    """Free start over `origin`, free end, no termination factor.
+                   qt: QualityTable | None = None, *, origin=None,
+                   band=None) -> WindowScore:
+    """Score a read against one window. This is the entry point for real work.
 
-    With `origin=None` over a whole recruited unit this is the model's full
-    origin sum.  Over a padded window around one alignment it is a single term
-    of that sum, and the caller must combine terms by log-sum-exp over disjoint
-    origin ranges.
+    Free start over `origin`, free end, no termination factor -- so with
+    `origin=None` over a whole recruited unit it is the model's full origin sum,
+    and over a padded window around one alignment it is a single term of that
+    sum, to be combined with others by log-sum-exp over *disjoint* origin ranges.
+
+    Same answer as `forward`, but in `O(T)` memory rather than `O(L*T)`, and
+    optionally banded. `forward` allocates 5.1 GB for a 15 kb read against a
+    15.1 kb template and simply cannot run; this needs about 9 KB.
+
+    There is deliberately no `full_template` here. It forces paths to end at the
+    template's right edge, which is right for the oracle tests and silently wrong
+    for scoring -- it would discard every path that finishes before the template
+    does, which is most of them. `forward` keeps it; real work does not want it.
     """
-    return forward(read, qual, template, params, qt, origin=origin,
-                   full_template=False)
+    r, q, t, p, table = _prepare(read, qual, template, params, qt)
+    terminal, band_edge = _dp_two_rows(r, q, t, p, table, origin, band)
+    return WindowScore(logp=_score_from_terminal(terminal, False),
+                       terminal=terminal, band_edge=band_edge)
