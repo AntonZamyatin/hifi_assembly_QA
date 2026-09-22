@@ -114,3 +114,30 @@ def likelihood_report(db_path: str, read_classes: dict,
     else:
         print(f"  ΔLLR  ({asm2} − {asm1}) = N/A")
     print()
+
+
+def phmm_likelihood_report(segments, read_names, asm1: str, asm2: str, *,
+                           db_path: str, bams: dict, fastas: dict,
+                           genome_fasta: str, library_assembly: str,
+                           C: float = 200.0, **kwargs):
+    """Pair-HMM locus score: emission, exposure and Delta S, printed and returned.
+
+    The replacement for `likelihood_report` above, which scores reads by
+    exp(-NM) and keeps -n log L_A -- the conditional form that Proposition 3 of
+    model.tex shows is blind to copy number. This one sums the pair HMM over
+    every window a read has in each candidate, clamps each read at +/-C, and adds
+    the exposure term -2 lambda (L_eff_1 - L_eff_2).
+
+    `genome_fasta` and `library_assembly` fix lambda: read starts per base per
+    strand, from the primary reads aligned to `library_assembly` over the diploid
+    length of `genome_fasta`. Use the same pair for every locus you compare --
+    lambda must not depend on the locus under test.
+    """
+    from qamodel.exposure import fasta_length, library_stats
+    from qamodel.score import score_locus
+
+    lib = library_stats(db_path, library_assembly, fasta_length(genome_fasta))
+    result = score_locus(read_names, segments, asm1, asm2, db_path=db_path,
+                         bams=bams, fastas=fastas, library=lib, C=C, **kwargs)
+    print(result.summary())
+    return result

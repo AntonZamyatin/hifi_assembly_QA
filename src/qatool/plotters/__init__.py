@@ -15,7 +15,7 @@ from qatool.plotters.colors import (
 from qatool.plotters.kmer import dotplot_kmer, dotplot_kmer_mosaic
 from qatool.plotters.coverage import alignment_plot
 from qatool.plotters.reads_overlay import reads_alignment_dotplot
-from qatool.plotters.likelihood import likelihood_report
+from qatool.plotters.likelihood import likelihood_report, phmm_likelihood_report
 from qatool.plotters.report import report_plot
 
 __all__ = [
@@ -25,6 +25,7 @@ __all__ = [
     "dotplot_kmer",
     "dotplot_kmer_mosaic",
     "likelihood_report",
+    "phmm_likelihood_report",
     "SUPPORT_COLORS",
     "OCCURRENCE_COLORS",
     "PID_TIE_EPS_DEFAULT",
