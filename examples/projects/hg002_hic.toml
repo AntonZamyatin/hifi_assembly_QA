@@ -1,0 +1,41 @@
+# qaview project: HG002 hifiasm_hic against the curated assembly (docs/qaview.md §13.2).
+# Open with:  venv/bin/python -m qaview examples/projects/hg002_hic.toml
+# Paths are relative to this file.
+
+name = "hg002_hic"
+
+[asm1]                                    # Delta S > 0 favours asm1
+name  = "hifiasm_hic"
+fasta = "../bgz/hg002.hifiasm_hic.fasta.bgz"
+bam   = "../alignments/hg002.hifiasm_hic.sorted.bam"
+
+[asm2]
+name  = "curated"
+fasta = "../bgz/hg002.curated.fasta.bgz"
+bam   = "../alignments/hg002.curated.sorted.bam"
+
+[data]
+db = "../dbs/hg002.aln.sqlite"
+library_assembly = "curated"              # lambda reference; keep fixed across loci
+
+[[seeds]]
+format   = "quast"
+path     = "../quast/hg002_hic/misassemblies.tsv"
+assembly = "hifiasm_hic"
+
+[recruitment]                             # the batch notebooks' values
+pid_threshold    = 0.997
+plen_threshold   = 0.999
+best_pid_delta   = 0.001
+merge_gap        = 50000
+extension_window = 100
+ext_max          = 300000
+ext_rounds       = 100
+max_rounds       = 100
+
+[resources]
+recruit_workers = 32
+score_workers   = 32
+
+[output]
+dir = "../analysis/hg002_hic"             # shares loci/ (the score cache) with the notebooks

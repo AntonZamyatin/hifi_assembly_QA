@@ -13,6 +13,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import to_hex
 
+import math
+from dataclasses import dataclass
+
 from bokeh.layouts import column, gridplot
 from bokeh.models import (
     ColumnDataSource, CrosshairTool, CustomJS, Div, HoverTool, Quad, Range1d,
@@ -61,8 +64,121 @@ LAYER_STYLE = {
 }
 
 
+def _hex_rgb(h: str) -> tuple:
+    h = h.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+# Diverging log-ratio scale on the palette's own hues: asm1 in the red of
+# `asm1_only`, asm2 in the green of `asm2_only`, through a neutral grey.
+RATIO_POS = _hex_rgb(SUPPORT_COLORS["asm1_only"])
+RATIO_NEG = _hex_rgb(SUPPORT_COLORS["asm2_only"])
+RATIO_MID = (0xd2, 0xd2, 0xca)
+UNSCORED_COLOR = "#e6e6e1"
+
+
+def ratio_strength(ratio: float, C: float) -> float:
+    """Map a read's log-ratio into [-1, 1] on a symmetric log scale, saturating at C.
+
+    Linear would wash the verdict out: at the HG002 seed most reads sit within
+    +/-1 nat while the reads that decide it reach -27, so on a 0..200 linear scale
+    the decisive ones would look almost neutral. log1p keeps both legible.
+    A read that fits only one candidate (+/-inf) saturates.
+    """
+    if ratio != ratio:                                   # NaN
+        return 0.0
+    mag = min(abs(ratio), C)
+    t = math.log1p(mag) / math.log1p(C)
+    return t if ratio > 0 else -t
+
+
+def ratio_color(t: float) -> str:
+    end = RATIO_POS if t > 0 else RATIO_NEG
+    a = min(abs(t), 1.0)
+    rgb = (round(m + (e - m) * a) for m, e in zip(RATIO_MID, end))
+    return "#%02x%02x%02x" % tuple(rgb)
+
+
+def _ratio_text(name, ratios, dropped) -> str:
+    if ratios is None:
+        return "not scored yet"
+    if name in ratios:
+        r = ratios[name]
+        if r == math.inf:
+            return "+inf (placeable only in asm1)"
+        if r == -math.inf:
+            return "-inf (placeable only in asm2)"
+        return f"{r:+.2f} nats"
+    if dropped and name in dropped:
+        return "dropped: crosses a segment edge"
+    return "not scored"
+
+
+# Log-ratio bands for the marginals, in nats. Fixed rather than scaled by C: the
+# clamp decides how much a read may say, not which way it leans. 10 nats is about
+# one substitution at Q40, the natural unit for "this read decides something".
+RATIO_WEAK, RATIO_STRONG = 1.0, 10.0
+
+
+@dataclass(frozen=True)
+class Stacking:
+    """What a coverage marginal stacks, bottom to top.
+
+    `series[asm]` has one row per band and one column per bin; `read_band[g]` is
+    the band of global read g. The hover callback uses both, so whichever stacking
+    is drawn, hovering a band isolates exactly the reads counted in it.
+    """
+
+    keys: list
+    colors: list
+    series: dict
+    read_band: list
+
+
+def class_stacking(rd) -> Stacking:
+    """Support classes, then the unassigned remainder -- the original marginals."""
+    keys = list(rd.bucket_keys) + ["unassigned"]
+    colors = [SUPPORT_COLORS[k] for k in rd.bucket_keys] + ["#6e6e6e"]
+    series = {rd.asm1: list(rd.cov1.bucket_bins or []) + [rd.cov1.bins],
+              rd.asm2: list(rd.cov2.bucket_bins or []) + [rd.cov2.bins]}
+    return Stacking(keys, colors, series, _read_bucket_index(rd))
+
+
+def ratio_band(ratio) -> int:
+    """0 indifferent, 1-2 asm2 weak/strong, 3-4 asm1 weak/strong, 5 unscored."""
+    if ratio is None or ratio != ratio:
+        return 5
+    mag = abs(ratio)
+    if mag < RATIO_WEAK:
+        return 0
+    strong = mag >= RATIO_STRONG
+    return (2 if strong else 1) if ratio < 0 else (4 if strong else 3)
+
+
+def ratio_stacking(rd, ratios: dict) -> Stacking:
+    """Coverage split by which candidate each read favours, and how strongly.
+
+    Recomputed from the stored per-bin read weights, so it is exact -- the bands
+    sum to the same total as the class stacking -- and needs no BAM access.
+    """
+    w, s = f"{RATIO_WEAK:g}", f"{RATIO_STRONG:g}"
+    keys = [f"indifferent (|r| < {w})",
+            f"{rd.asm2} ({w}-{s} nats)", f"{rd.asm2} (>= {s} nats)",
+            f"{rd.asm1} ({w}-{s} nats)", f"{rd.asm1} (>= {s} nats)",
+            "not scored"]
+    colors = [ratio_color(0.0), ratio_color(-0.5), ratio_color(-1.0),
+              ratio_color(0.5), ratio_color(1.0), UNSCORED_COLOR]
+    series = {}
+    for asm, cov in ((rd.asm1, rd.cov1), (rd.asm2, rd.cov2)):
+        bands = [ratio_band(ratios.get(n)) for n in cov.read_names]
+        series[asm] = list(cov.rebucket(bands, len(keys)))
+    read_band = [ratio_band(ratios.get(n)) for n in rd.read_names]
+    return Stacking(keys, colors, series, read_band)
+
+
 def _line_source(rd, color_by: str, visible_layers=None,
-                 line_alpha: float = 0.55) -> ColumnDataSource:
+                 line_alpha: float = 0.55, ratios=None, dropped=None,
+                 C: float = 200.0) -> ColumnDataSource:
     """One row per read-correspondence line segment.
 
     `rd.lines` holds single segments (x0,y0)-(x1,y1), so the `segment` glyph fits
@@ -83,12 +199,29 @@ def _line_source(rd, color_by: str, visible_layers=None,
         # Convention inherited from reads_dotplot.py: black backbone, supplementary red.
         colors = [SUPPLEMENTARY_COLOR if s else "black" for s in rd.lines.supplementary]
         widths = [LAYER_STYLE[int(lay)][1] for lay in layers]
+    elif color_by == "log-ratio":
+        # Rows cannot be re-sorted to put decisive reads on top: the hover and
+        # selection callbacks index rows by position. Width and opacity carry the
+        # emphasis instead, so indifferent reads recede and decisive ones stand out.
+        colors, widths = [], []
+        for n in names:
+            if ratios is None or n not in ratios:
+                colors.append(UNSCORED_COLOR)
+                widths.append(1.0)
+            else:
+                t = ratio_strength(ratios[n], C)
+                colors.append(ratio_color(t))
+                widths.append(1.0 + 2.5 * abs(t))
     else:
-        raise ValueError("color_by must be 'class' or 'block'")
+        raise ValueError("color_by must be 'class', 'block' or 'log-ratio'")
     # Hidden layers are drawn at alpha 0 rather than removed: the hover/selection CSR
     # indexes address rows by position, so dropping rows would silently misalign them.
     alphas = [line_alpha if (visible_layers is None or int(lay) in visible_layers) else 0.0
               for lay in layers]
+    if color_by == "log-ratio":
+        alphas = [a * (0.3 + 0.7 * abs(ratio_strength(ratios[n], C)))
+                  if (ratios is not None and n in ratios) else a * 0.3
+                  for a, n in zip(alphas, names)]
 
     return ColumnDataSource(dict(
         x0=rd.lines.x0, y0=rd.lines.y0, x1=rd.lines.x1, y1=rd.lines.y1,
@@ -98,6 +231,7 @@ def _line_source(rd, color_by: str, visible_layers=None,
         ref1_0=rd.lines.ref1_0, ref1_1=rd.lines.ref1_1,
         ref2_0=rd.lines.ref2_0, ref2_1=rd.lines.ref2_1,
         pid1=rd.lines.pid1, pid2=rd.lines.pid2,
+        ratio_txt=[_ratio_text(n, ratios, dropped) for n in names],
     ))
 
 
@@ -113,18 +247,26 @@ def hit_renderer(fig):
 
 def dotplot_figure(rd, color_by: str = "class", line_alpha: float = 0.55,
                    width: int = MAIN_WIDTH, height: int | None = None,
-                   visible_layers=None):
+                   visible_layers=None, ratios=None, dropped=None, C: float = 200.0):
     """Read-correspondence dotplot: asm2 on X, asm1 on Y.
 
     Depth is conveyed by alpha overplotting rather than merged line width — merging
     is resolution-dependent and would have to be redone on every zoom.
     """
+    # bounds: zoom and pan stop at the locus edges -- there is nothing outside it.
+    # The marginals and contig bars share these ranges, so they are bounded too.
     p = figure(width=width, height=height or main_height(rd, width),
-               x_range=Range1d(0, rd.plot_w), y_range=Range1d(0, rd.plot_h),
+               x_range=Range1d(0, rd.plot_w, bounds=(0, rd.plot_w)),
+               y_range=Range1d(0, rd.plot_h, bounds=(0, rd.plot_h)),
                tools="pan,box_zoom,reset,save,tap", active_drag="pan",
                background_fill_color="white")
+    # Bokeh's level-of-detail mode draws every 10th glyph while zooming or panning
+    # once there are more than 2000, so reads vanished mid-zoom and came back only
+    # after 0.5 s of stillness. Every line is always drawn instead.
+    p.lod_threshold = None
     r = p.segment(x0="x0", y0="y0", x1="x1", y1="y1",
-                  source=_line_source(rd, color_by, visible_layers, line_alpha),
+                  source=_line_source(rd, color_by, visible_layers, line_alpha,
+                                      ratios=ratios, dropped=dropped, C=C),
                   color="color", line_width="width", alpha="alpha")
     # Selecting reads (by tap, or from a coverage bin) hides every other read outright,
     # so a hovered bin shows only the reads that pass through it.  The selected glyph
@@ -143,6 +285,7 @@ def dotplot_figure(rd, color_by: str = "class", line_alpha: float = 0.55,
             (rd.asm1, "@contig1 @ref1_0{0,0}-@ref1_1{0,0}  pid @pid1{0.0000}"),
             (rd.asm2, "@contig2 @ref2_0{0,0}-@ref2_1{0,0}  pid @pid2{0.0000}"),
             ("supplementary", "@supplementary"),
+            ("log-ratio", "@ratio_txt"),
         ]))
 
     # Segment boundaries: pale for same-contig, full strength across contigs.
@@ -160,7 +303,8 @@ def dotplot_figure(rd, color_by: str = "class", line_alpha: float = 0.55,
 
 
 def coverage_figure(rd, assembly: str, orientation: str,
-                    width: int = MAIN_WIDTH, height: int | None = None):
+                    width: int = MAIN_WIDTH, height: int | None = None,
+                    stacking: "Stacking | None" = None, size: int = MARGIN_SIZE):
     """Stacked marginal coverage for one assembly.
 
     Drawn as explicit quads rather than a stacked area: exact-bp bins have a short
@@ -168,14 +312,14 @@ def coverage_figure(rd, assembly: str, orientation: str,
     """
     cov = rd.cov1 if assembly == rd.asm1 else rd.cov2
     left, right = rd.bin_edges(assembly)
-    series = list(cov.bucket_bins or []) + [cov.bins]
-    colors = [SUPPORT_COLORS[k] for k in rd.bucket_keys] + ["#6e6e6e"]
+    stacking = stacking or class_stacking(rd)
+    series, colors = stacking.series[assembly], stacking.colors
 
     if orientation == "x":
-        p = figure(width=width, height=MARGIN_SIZE, x_range=Range1d(0, rd.plot_w),
+        p = figure(width=width, height=size, x_range=Range1d(0, rd.plot_w),
                    tools="pan,box_zoom,reset")
     else:
-        p = figure(width=MARGIN_SIZE, height=height or main_height(rd, width),
+        p = figure(width=size, height=height or main_height(rd, width),
                    y_range=Range1d(0, rd.plot_h), tools="pan,box_zoom,reset")
 
     # Each bin becomes two points (its left and right edge) so one filled area per
@@ -205,10 +349,10 @@ def coverage_figure(rd, assembly: str, orientation: str,
 
     m = max(base) if base else 1.0
     if orientation == "x":
-        p.y_range = Range1d(0, m)
+        p.y_range = Range1d(0, m, bounds=(0, m))
         p.xaxis.visible = False
     else:
-        p.x_range = Range1d(0, m)
+        p.x_range = Range1d(0, m, bounds=(0, m))
         p.yaxis.visible = False
     p.grid.visible = False
 
@@ -302,7 +446,8 @@ def _read_bucket_index(rd) -> list:
     return [pos.get(rd.read_class.get(n, ""), unassigned) for n in rd.read_names]
 
 
-def _link_bins_to_reads(rd, cov_fig, cov, other_fig, other_cov, main, status, orientation):
+def _link_bins_to_reads(rd, cov_fig, cov, other_fig, other_cov, main, status, orientation,
+                        stacking: "Stacking | None" = None):
     """Hover a coverage bin: stripe that bin, light the matching bins on the other
     assembly, and show only the reads passing through it.
 
@@ -318,7 +463,8 @@ def _link_bins_to_reads(rd, cov_fig, cov, other_fig, other_cov, main, status, or
     l2g, _ = _global_index(rd, cov)
     _, other_g2l = _global_index(rd, other_cov)
     other_off, other_bins = other_cov.by_read()
-    n_series = len(rd.bucket_keys) + 1
+    stacking = stacking or class_stacking(rd)
+    n_series = len(stacking.keys)
 
     cb = CustomJS(
         args=dict(
@@ -330,8 +476,8 @@ def _link_bins_to_reads(rd, cov_fig, cov, other_fig, other_cov, main, status, or
             l2g=l2g, other_g2l=other_g2l,
             other_off=other_off.tolist(), other_bins=other_bins.tolist(),
             read_off=rl_off.tolist(), read_lines=rl_idx.tolist(),
-            read_band=_read_bucket_index(rd), n_series=n_series,
-            band_names=list(rd.bucket_keys) + ["unassigned"],
+            read_band=stacking.read_band, n_series=n_series,
+            band_names=list(stacking.keys),
             vertical=(orientation == "x"), label=cov_fig.name or "",
         ),
         code="""
@@ -442,19 +588,50 @@ def _coordinate_readout(rd, main):
     return div
 
 
-def report_layout(rd, color_by: str = "class", visible_layers=None):
+def fit_main(rd, max_width: int = MAIN_WIDTH, max_height: int | None = None) -> tuple:
+    """(width, height) of the dotplot: square pixels, inside the given box.
+
+    Width is tried first; if the resulting height overflows `max_height` the plot is
+    shrunk to that height instead, so the whole report fits a browser window.
+    """
+    ratio = rd.plot_h / max(rd.plot_w, 1)
+    w = max(200, int(max_width))
+    h = main_height(rd, w)
+    if max_height is not None and h > max_height:
+        h = max(200, int(max_height))
+        w = max(200, int(round(h / max(ratio, 1e-9))))
+    return w, h
+
+
+def report_layout(rd, color_by: str = "class", visible_layers=None,
+                  ratios=None, dropped=None, C: float = 200.0,
+                  max_width: int = MAIN_WIDTH, max_height: int | None = None,
+                  margin_size: int = MARGIN_SIZE):
     """Assemble the full interactive report.
 
     Layout mirrors report_plot: coverage above (asm2) and right (asm1), contig bars
-    hugging the dotplot on the bottom (asm2) and left (asm1).
+    hugging the dotplot on the bottom (asm2) and left (asm1). `max_width` and
+    `max_height` bound the dotplot alone; the marginals add `margin_size` + BAR_SIZE.
     """
     colors = contig_colors(rd)
-    h = main_height(rd, MAIN_WIDTH)
-    main = dotplot_figure(rd, color_by=color_by, height=h, visible_layers=visible_layers)
-    cov_top = coverage_figure(rd, rd.asm2, "x")
-    cov_right = coverage_figure(rd, rd.asm1, "y", height=h)
-    xbar = contig_bar_figure(rd, rd.asm2, "x", colors)
-    ybar = contig_bar_figure(rd, rd.asm1, "y", colors, height=h)
+    # Until a score arrives, log-ratio mode draws the support classes rather than an
+    # all-grey plot, matching what the marginals show in the same state.
+    line_mode = "class" if color_by == "log-ratio" and ratios is None else color_by
+    w, h = fit_main(rd, max_width, max_height)
+    main = dotplot_figure(rd, color_by=line_mode, width=w, height=h,
+                          visible_layers=visible_layers,
+                          ratios=ratios, dropped=dropped, C=C)
+    # The marginals follow the reads: log-ratio bands once a score exists, support
+    # classes otherwise (including before scoring finishes, where every band would
+    # otherwise read "not scored").
+    stacking = (ratio_stacking(rd, ratios) if color_by == "log-ratio" and ratios is not None
+                else class_stacking(rd))
+    cov_top = coverage_figure(rd, rd.asm2, "x", width=w, stacking=stacking,
+                              size=margin_size)
+    cov_right = coverage_figure(rd, rd.asm1, "y", width=w, height=h, stacking=stacking,
+                                size=margin_size)
+    xbar = contig_bar_figure(rd, rd.asm2, "x", colors, width=w)
+    ybar = contig_bar_figure(rd, rd.asm1, "y", colors, width=w, height=h)
 
     # Linked ranges: every panel follows the dotplot's viewport.
     cov_top.x_range = main.x_range
@@ -473,7 +650,10 @@ def report_layout(rd, color_by: str = "class", visible_layers=None):
         p.add_tools(crosshair)
 
     # Wheel zoom on the dotplot only, so scrolling a marginal cannot desync the axes.
-    wheel = WheelZoomTool()
+    # maintain_focus=False: once one edge reaches its bound, zooming out keeps
+    # widening the other side instead of stopping, so the full locus is always
+    # reachable again. With the default the view stuck wherever the first edge hit.
+    wheel = WheelZoomTool(maintain_focus=False)
     main.add_tools(wheel)
     main.toolbar.active_scroll = wheel
 
@@ -488,13 +668,13 @@ def report_layout(rd, color_by: str = "class", visible_layers=None):
     cov_right.name = rd.asm1
     status = Div(text="", styles={"font-family": "monospace", "font-size": "12px",
                                   "padding": "0 0 4px 0"})
-    _link_bins_to_reads(rd, cov_top, rd.cov2, cov_right, rd.cov1, main, status, "x")
-    _link_bins_to_reads(rd, cov_right, rd.cov1, cov_top, rd.cov2, main, status, "y")
+    _link_bins_to_reads(rd, cov_top, rd.cov2, cov_right, rd.cov1, main, status, "x", stacking)
+    _link_bins_to_reads(rd, cov_right, rd.cov1, cov_top, rd.cov2, main, status, "y", stacking)
     _link_reads_to_bins(rd, main, [(cov_top, rd.cov2), (cov_right, rd.cov1)])
     readout = _coordinate_readout(rd, main)
 
     grid = gridplot(
-        [[Spacer(width=BAR_SIZE, height=MARGIN_SIZE), cov_top, None],
+        [[Spacer(width=BAR_SIZE, height=margin_size), cov_top, None],
          [ybar,                                       main,    cov_right],
          [None,                                       xbar,    None]],
         toolbar_location=None, merge_tools=False,

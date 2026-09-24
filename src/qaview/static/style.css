@@ -1,0 +1,191 @@
+:root {
+  --bg: #fafaf8;
+  --panel: #ffffff;
+  --ink: #1d1d1b;
+  --muted: #6b6b66;
+  --line: #e2e2dc;
+  --hover: #f1f1ec;
+  --select: #e4ecf7;
+  --accent: #2a78d6;
+  --star: #c98a00;
+  --warn: #b2182b;
+  --left-w: 360px;
+  --right-w: 260px;
+  --collapsed: 22px;
+  font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  color: var(--ink);
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
+
+#app {
+  display: grid;
+  grid-template-columns: var(--left-w) minmax(0, 1fr) var(--right-w);
+  height: 100vh;
+}
+#app.left-collapsed  { grid-template-columns: var(--collapsed) minmax(0, 1fr) var(--right-w); }
+#app.right-collapsed { grid-template-columns: var(--left-w) minmax(0, 1fr) var(--collapsed); }
+#app.left-collapsed.right-collapsed { grid-template-columns: var(--collapsed) minmax(0, 1fr) var(--collapsed); }
+
+/* ---- sidebars -------------------------------------------------------------- */
+
+.sidebar {
+  position: relative;
+  z-index: 2;               /* above the plot, so the resize handle can overhang it */
+  background: var(--panel);
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: visible;        /* .side-body scrolls; the aside must not clip its handle */
+}
+#left  { border-right: 1px solid var(--line); }
+#right { border-left: 1px solid var(--line); }
+.side-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 10px 12px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.collapse {
+  position: absolute; top: 6px; z-index: 2;
+  width: 18px; height: 22px; padding: 0;
+  border: 1px solid var(--line); border-radius: 3px;
+  background: var(--panel); color: var(--muted); cursor: pointer; line-height: 1;
+}
+#left .collapse  { right: 2px; }
+#right .collapse { left: 2px; }
+#app.left-collapsed  #left .side-body,
+#app.right-collapsed #right .side-body { display: none; }
+#app.left-collapsed  #left .collapse  { transform: scaleX(-1); }
+#app.right-collapsed #right .collapse { transform: scaleX(-1); }
+
+.title { font-size: 15px; font-weight: 600; padding-right: 20px; }
+.muted { color: var(--muted); }
+.small { font-size: 12px; }
+.warn { color: var(--warn); }
+
+.progress .bar { height: 5px; background: var(--line); border-radius: 3px; margin: 6px 0 3px; overflow: hidden; }
+.progress .bar span { display: block; height: 100%; width: 0; background: var(--accent); transition: width .3s; }
+
+.section-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  font-weight: 600;
+}
+#right .section-head { padding-left: 18px; }
+.head-tools { display: flex; gap: 4px; align-items: center; flex: 0 1 180px; min-width: 0; }
+.section-head input { flex: 1 1 auto; min-width: 0; font: inherit; font-weight: 400;
+  padding: 2px 6px; border: 1px solid var(--line); border-radius: 3px; }
+.toggle {
+  flex: none; width: 24px; height: 22px; padding: 0; font: inherit; line-height: 1;
+  border: 1px solid var(--line); border-radius: 3px; background: var(--panel);
+  color: var(--muted); cursor: pointer;
+}
+.toggle.on { background: var(--select); color: var(--star); border-color: var(--star); }
+
+/* ---- resizable sidebars ------------------------------------------------------ */
+
+.resizer {
+  position: absolute; top: 0; bottom: 0; width: 10px; z-index: 10;
+  cursor: col-resize; touch-action: none;
+}
+#left  .resizer { right: -5px; }
+#right .resizer { left: -5px; }
+.resizer:hover, .resizer.active { background: color-mix(in srgb, var(--accent) 35%, transparent); }
+#app.left-collapsed #left .resizer, #app.right-collapsed #right .resizer { display: none; }
+body.resizing { cursor: col-resize; user-select: none; }
+body.resizing #plot { pointer-events: none; }
+
+/* ---- loci table ------------------------------------------------------------- */
+
+.loci { display: flex; flex-direction: column; gap: 6px; }
+.table-wrap {
+  max-height: 42vh; overflow: auto;
+  border: 1px solid var(--line); border-radius: 3px;
+}
+#loci { width: 100%; border-collapse: collapse; font-size: 12px; table-layout: fixed; }
+#loci th, #loci td { padding: 3px 5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#loci th {
+  position: sticky; top: 0; background: var(--panel); z-index: 1;
+  text-align: left; font-weight: 600; color: var(--muted);
+  border-bottom: 1px solid var(--line); cursor: pointer; user-select: none;
+}
+#loci th.num, #loci td.num { text-align: right; font-variant-numeric: tabular-nums; }
+#loci th:nth-child(1) { width: 22px; }
+#loci th:nth-child(2) { width: 74px; }
+#loci th:nth-child(3) { width: 54px; }
+#loci th:nth-child(4) { width: 84px; }
+#loci th:nth-child(6) { width: 50px; }
+#loci th:not(.sorted):hover::after { content: " \2195"; opacity: .5; }
+#loci th.star, #loci td.star { text-align: center; padding-left: 0; padding-right: 0; }
+#loci th.star.sorted::after, #loci th.star:hover::after { content: none; }
+#loci th.star.sorted { color: var(--star); }
+td.star button {
+  border: 0; background: none; padding: 0 2px; cursor: pointer; font-size: 13px; line-height: 1;
+  color: #b4b4ac;
+}
+td.star button:hover { color: var(--muted); }
+td.star button.on { color: var(--star); }
+#loci th.sorted::after { content: " \2193"; }
+#loci th.sorted.asc::after { content: " \2191"; }
+#loci tbody tr { cursor: pointer; border-bottom: 1px solid var(--hover); }
+#loci tbody tr:hover { background: var(--hover); }
+#loci tbody tr.selected { background: var(--select); }
+.dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 4px; vertical-align: 1px; }
+.status-scored { color: var(--muted); }
+.status-failed { color: var(--warn); }
+
+/* ---- panels and forms ------------------------------------------------------- */
+
+details.panel { border-top: 1px solid var(--line); padding-top: 8px; }
+details.panel > summary { cursor: pointer; font-weight: 600; margin-bottom: 6px; }
+.form { display: grid; gap: 6px; }
+.form label, .form .field {
+  display: grid; grid-template-columns: 110px minmax(0, 1fr); align-items: center; gap: 8px;
+  color: var(--muted);
+}
+.form input, .form select {
+  font: inherit; color: var(--ink); min-width: 0; width: 100%;
+  padding: 2px 6px; border: 1px solid var(--line); border-radius: 3px; background: var(--panel);
+}
+.segmented { display: flex; border: 1px solid var(--line); border-radius: 3px; overflow: hidden; }
+.segmented button {
+  flex: 1; font: inherit; font-size: 12px; padding: 2px 4px; border: 0; background: var(--panel);
+  color: var(--muted); cursor: pointer; border-right: 1px solid var(--line);
+}
+.segmented button:last-child { border-right: 0; }
+.segmented button.on { background: var(--select); color: var(--ink); }
+.checks { display: flex; flex-wrap: wrap; gap: 2px 10px; }
+.checks label { display: flex; gap: 4px; align-items: center; color: var(--ink); }
+.checks input { width: auto; }
+
+dl.kv { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 10px; margin: 0; font-size: 12px; }
+dl.kv dt { color: var(--muted); }
+dl.kv dd { margin: 0; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+dl.files dd { font-family: ui-monospace, monospace; font-size: 11px; }
+
+/* ---- centre ----------------------------------------------------------------- */
+
+/* isolation: Bokeh gives some of its elements high z-indices; keep them inside the
+   centre column so they can never cover the sidebars' resize handles. */
+#center { display: flex; flex-direction: column; min-width: 0; min-height: 0; isolation: isolate; }
+#topbar {
+  display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap;
+  padding: 8px 14px; border-bottom: 1px solid var(--line); background: var(--panel); min-height: 44px;
+}
+#locus-title { font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#score-card { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
+#score-card .ds { font-size: 16px; font-weight: 600; font-variant-numeric: tabular-nums; }
+#score-card .parts { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.legend-ramp { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
+.legend-ramp i { display: inline-block; width: 120px; height: 8px; border-radius: 2px; }
+
+#plot-cell { position: relative; flex: 1; min-height: 0; overflow: hidden; padding: 8px 12px; }
+#plot { width: 100%; height: 100%; }
+#plot-status {
+  position: absolute; left: 50%; top: 45%; transform: translate(-50%, -50%);
+  pointer-events: none; text-align: center;
+}

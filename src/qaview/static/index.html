@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>qaview</title>
+<link rel="stylesheet" href="/static/style.css">
+<script src="/bokeh/bokeh.min.js"></script>
+<script src="/bokeh/bokeh-gl.min.js"></script>
+<script src="/bokeh/bokeh-widgets.min.js"></script>
+<script src="/bokeh/bokeh-tables.min.js"></script>
+</head>
+<body>
+<div id="app">
+
+  <aside id="left" class="sidebar">
+    <div class="resizer" data-side="left" title="drag to resize"></div>
+    <button class="collapse" data-side="left" title="collapse sidebar">&lsaquo;</button>
+    <div class="side-body">
+      <header class="project">
+        <div id="project-name" class="title">qaview</div>
+        <div id="project-pair" class="muted"></div>
+        <div class="progress" title="seeds recruited / loci scored">
+          <div class="bar"><span id="bar-recruit"></span></div>
+          <div id="progress-text" class="muted small"></div>
+          <div id="failed-seeds" class="warn small"></div>
+        </div>
+      </header>
+
+      <section class="loci">
+        <div class="section-head">
+          <span>Loci</span>
+          <span class="head-tools">
+            <button id="star-only" class="toggle" title="show starred loci only">&#9733;</button>
+            <input id="filter" type="search" placeholder="filter seeds" autocomplete="off">
+          </span>
+        </div>
+        <div class="table-wrap">
+          <table id="loci">
+            <thead><tr>
+              <th data-key="star" class="star" title="starred first">&#9733;</th>
+              <th data-key="delta_s" class="num">&Delta;S</th>
+              <th data-key="reads" class="num">reads</th>
+              <th data-key="span" class="num" title="span on asm1 / asm2">span</th>
+              <th data-key="seeds">seeds</th>
+              <th data-key="status">state</th>
+            </tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+
+      <details class="panel" open>
+        <summary>Plotting</summary>
+        <div class="form">
+          <label>display pid <input id="pid" type="number" step="0.0005" min="0.9" max="1" value="0.997"></label>
+          <label>plen <input id="plen" type="number" step="0.0005" min="0.9" max="1" value="0.999"></label>
+          <label>best_pid_delta <input id="best_pid_delta" type="number" step="0.0001" min="0" value="0.001"></label>
+          <label>pid_tie_eps <input id="pid_tie_eps" type="number" step="0.0001" min="0" value="0.0001"></label>
+          <div id="tie-warning" class="warn small" hidden>pid_tie_eps &ge; best_pid_delta: no read can be called asm1_best or asm2_best.</div>
+          <label>binsize <input id="binsize" type="number" step="100" min="0" value="0" title="0 = auto"></label>
+          <div class="field">
+            <span>colour by</span>
+            <div class="segmented" id="color_by">
+              <button data-v="class">class</button><button data-v="block">block</button><button data-v="log-ratio" class="on">log-ratio</button>
+            </div>
+          </div>
+          <label>clamp C
+            <select id="C"><option>10</option><option>20</option><option>50</option><option>100</option><option selected>200</option><option>500</option><option>1000</option></select>
+          </label>
+          <div class="field">
+            <span>layers</span>
+            <div id="layers" class="checks"></div>
+          </div>
+        </div>
+      </details>
+
+      <details class="panel">
+        <summary>Recruitment (from the project file)</summary>
+        <dl id="recruitment" class="kv"></dl>
+      </details>
+
+      <details class="panel">
+        <summary>Files</summary>
+        <dl id="files" class="kv files"></dl>
+      </details>
+    </div>
+  </aside>
+
+  <main id="center">
+    <div id="topbar">
+      <div id="locus-title" class="muted">Pick a locus from the table.</div>
+      <div id="score-card"></div>
+    </div>
+    <div id="plot-cell">
+      <div id="plot"></div>
+      <div id="plot-status" class="muted"></div>
+    </div>
+  </main>
+
+  <aside id="right" class="sidebar">
+    <div class="resizer" data-side="right" title="drag to resize"></div>
+    <button class="collapse" data-side="right" title="collapse sidebar">&rsaquo;</button>
+    <div class="side-body">
+      <div class="section-head"><span>Details</span></div>
+      <div id="details" class="muted small">Reserved.</div>
+    </div>
+  </aside>
+
+</div>
+<script type="module" src="/static/app.js"></script>
+</body>
+</html>

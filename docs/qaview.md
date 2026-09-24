@@ -1,6 +1,8 @@
 # qaview — interactive design document
 
-Status: **design, not implemented**. Written 2026-07-27.
+Status: Panel app implemented (§3–§11). **Being rebuilt** on a project file, a
+FastAPI server and a CSS-grid page — see §13, written 2026-09-24, which supersedes
+§3's choice of Panel and §7.5b's seed picker. Written 2026-07-27.
 
 `qaview` is an interactive exploration frontend for the assembly-QA report figure.
 It is a new package (`src/qaview/`) that reuses `qatool`'s data layer and adds a
@@ -341,6 +343,99 @@ not directly comparable.
 
 ---
 
+### 7.5b Seeds from QUAST
+
+The sidebar's first section lists QUAST misassemblies as seeds
+(`qaview/seeds.py`), read from `<base>/quast/<run>/misassemblies.tsv` -- the table
+the hg002_hic notebooks are generated from. Each row is named as the notebooks
+name it, `<contig>_<type>_<i:03d>` with `i` counting rows of one (contig, type) in
+file order, so a seed matches its notebook figure; the table shows a short form
+(`h1tg000005l reloc1`) with a filter box.
+
+- **breakpoint** -- `bp_start`; the full range is in the status line on picking.
+- **ΔS nb** -- the notebook's pair-HMM score from
+  `<base>/analysis/<run>/phmm_scores/<region>.json`, when present. It used the
+  notebooks' recruitment parameters, which need not match the sidebar's. `reload`
+  picks up scores written since the page opened.
+- **✓** -- a recruitment for this seed with the current parameters is cached.
+
+Picking a row fills contig/start/end (the +/-20 kb QUAST window). A cached seed
+loads at once; otherwise press Recruit.
+
+### 7.6 Pair-HMM score: log-ratio colouring and Delta S
+
+**Layout.** The colour mode and the C slider sit above the plot, beside the status
+line, so the colouring is never hidden in a collapsed section. The page is fitted
+to the browser window: a small `Viewport` component reports the window size (and
+debounced resizes), and `report_layout(max_width, max_height, margin_size)` fits
+the dotplot into what is left, keeping square pixels. Marginals shrink from 200 to
+120 px on windows under 1100 px tall. The sidebar and the main pane scroll on
+their own; the page never does.
+
+Each read's pair-HMM log-ratio between the two candidates (`qamodel.score`) is
+drawn on the read itself, and the locus score sits above the plot.
+
+**Scoring is its own tier.** About 30 s for the HG002 seed locus's 106 reads on
+the compiled engine, so it runs like recruitment: a subprocess
+(`qaview.score_worker`), cached as `score_<hash>.pkl`, started automatically when
+a recruitment result arrives. The key is the recruitment key plus everything that
+changes a ratio -- lambda's reference (asm2's primary reads over asm2's diploid
+length), window sizing, band width, pair-HMM parameters.
+
+**The clamp C is display-only.** `LocusScore.at(C)` re-evaluates Delta S from the
+stored per-read ratios, so the C slider above the plot updates the panel and the
+colour saturation instantly and never rescores.
+
+**Colour: `log-ratio`.** A diverging scale on the palette's own hues -- asm1 in the
+red of `asm1_only`, asm2 in the green of `asm2_only` -- through a neutral grey.
+Symmetric-log rather than linear, `t = sign(r) log1p(min(|r|, C)) / log1p(C)`,
+because at the seed most reads sit within +/-1 nat while the decisive ones reach
+-27, and a linear 0..200 scale would render those almost neutral. Reads placeable
+in only one candidate saturate. Unscored reads are a pale grey; dropped reads say
+so in the hover. It is the default mode: until the score arrives the lines and
+marginals draw the support classes, then switch once scoring finishes.
+
+**Rows are never reordered.** The hover and selection callbacks address rows by
+position, so decisive reads cannot simply be drawn last. Width (`1 + 2.5|t|`)
+and opacity (`0.3 + 0.7|t|` of the base) carry the emphasis instead, which lets
+indifferent reads recede. Hidden layers stay at alpha 0.
+
+**Hover** gains a `log-ratio` line: the unclamped value in nats, `+/-inf` with
+which candidate for one-sided reads, or why a read was not scored.
+
+**Marginals follow the reads.** With colour set to `log-ratio` and a score in
+hand, the coverage marginals stack by log-ratio band instead of support class:
+indifferent (|r| < 1), weak (1-10 nats) and strong (>= 10 nats, about one Q40
+substitution) for each candidate, and not scored. The bands are fixed in nats, not
+scaled by C -- the clamp limits how much a read says, not which way it leans.
+Before scoring finishes the marginals keep their class stacking.
+
+The regrouping is exact and needs no BAM access. `CoverageBins` now stores each
+read's weight in each bin (`read_w`, parallel to `read_idx`), and
+`CoverageBins.rebucket` sums it under any grouping. Membership alone would not
+do: a read with n tied alignments weighs 1/n per placement, and 2/n where two of
+them fall in one bin -- which happens precisely in repeats. The log-ratio bands
+sum to the same coverage as the class bands on both assemblies.
+
+The stacking -- keys, colours, per-bin series, and the band of every read -- is
+one `Stacking` object with two constructors, so the hover narrowing works for
+either: hovering the "curated >= 10 nats" band isolates exactly the reads counted
+in it.
+
+Two readings to keep straight on the HG002 seed locus:
+
+- *A strong band marks decisive reads, not the difference itself.* Bands are per
+  read, and a read's coverage runs its whole ~15 kb, so the 7 bp microsatellite
+  difference shows as a ~28 kb band around it. It also appears on the other
+  haplotype, because the coverage track splits a read across every placement
+  within `best_pid_delta` of its best, and 7 bp in 15 kb moves identity by only
+  ~0.0005. At identity resolution the placements tie; the pair HMM separates them
+  by 27 nats.
+- *The pale "not scored" band is the containment rule.* Coverage counts every
+  read overlapping a segment; scoring uses only reads inside one. Unscored
+  coverage falls from 81% within 5 kb of a segment end to 7.5% in the middle --
+  Proposition 8's "a third of the data at a 45 kb locus", made visible.
+
 ## 8. The k-mer layer
 
 Off by default. Read lines are the interactive background because they are vector
@@ -455,3 +550,175 @@ region whose two assemblies differ in length.  Two findings worth recording:
   `pid_tie_eps = best_pid_delta = 0.001` this produced **zero** discriminating reads;
   at 0.0001 it gives 18, at 0.00001 it gives 30 (all the signal lives in
   `0 < |d| <= 0.001`). Worth a guard/warning in the classifier — not yet added.
+
+---
+
+## 13. Rebuild: project file, FastAPI server, CSS-grid page
+
+Written 2026-09-24. Replaces Panel as the page framework; Bokeh stays as the plot
+engine and `glyphs.py`, `region.py`, `score.py`, `seeds.py`, `jobs.py` are reused.
+
+### 13.1 Why
+
+Every layout problem in the Panel app came from Panel, not Bokeh: the window had
+to be measured through a custom JS component, chrome and margins were guessed pixel
+constants (`CHROME_HEIGHT = 280 + BAR_SIZE`), forms overflowed the sidebar, controls
+hid in collapsed accordion sections, and Panel's shadow DOM defeats headless
+screenshots and clicks. All plot interaction (hover, cross-highlighting, crosshair,
+readout) is already client-side `CustomJS`, so it needs no Bokeh server and moves
+unchanged. The workflow also changed: the batch showed that one QUAST run is ~250
+seeds collapsing to ~100 loci, so the app should work through a whole comparison,
+not one hand-typed seed at a time.
+
+### 13.2 The project file
+
+One TOML file describes one comparison of two candidates. Paths are relative to the
+file. Opening it is the only thing the user does; everything else is derived.
+
+```toml
+name = "hg002_hic"
+
+[asm1]                                    # Delta S > 0 favours asm1
+name  = "hifiasm_hic"
+fasta = "../bgz/hg002.hifiasm_hic.fasta.bgz"
+bam   = "../alignments/hg002.hifiasm_hic.sorted.bam"
+
+[asm2]
+name  = "curated"
+fasta = "../bgz/hg002.curated.fasta.bgz"
+bam   = "../alignments/hg002.curated.sorted.bam"
+
+[data]
+db = "../dbs/hg002.aln.sqlite"
+library_assembly = "curated"              # lambda reference; fixed across loci
+
+[[seeds]]                                 # any number of sources
+format   = "quast"                        # misassemblies.tsv from extract_misassemblies.py
+path     = "../quast/hg002_hic/misassemblies.tsv"
+assembly = "hifiasm_hic"                  # the candidate the coordinates are on
+
+[[seeds]]
+format   = "bed"                          # contig, start, end[, name]; 0-based half-open
+path     = "extra_seeds.bed"
+assembly = "hifiasm_hic"
+
+[recruitment]                             # optional; defaults are the notebooks' values
+pid_threshold = 0.997
+plen_threshold = 0.999
+best_pid_delta = 0.001
+merge_gap = 50000
+extension_window = 100
+ext_max = 300000
+ext_rounds = 100
+max_rounds = 100
+
+[resources]
+recruit_workers = 32                      # seeds recruited at once
+score_workers = 32                        # processes scoring one locus
+
+[output]
+dir = "../analysis/hg002_hic"             # recruit/, loci/ (score cache), state
+```
+
+**Seeds are a source-neutral list.** Each `[[seeds]]` entry is read by a loader for
+its `format` into `Seed(name, source, assembly, contig, start, end, meta)`. QUAST
+names keep the notebooks' `<contig>_<type>_<i:03d>` so rows match figures and
+batch scores; BED names come from column 4 or `<contig>_<start>_<end>`. `meta`
+carries source-specific fields (type, breakpoint, inconsistency) for display only.
+New sources are a new loader, nothing else.
+
+**Recruitment parameters belong to the project.** Every seed is recruited in the
+background with them, so they are shown read-only in the page; changing them means
+editing the file and reopening. `prepare_data.sh` will later write this file,
+since it knows everything except the seeds.
+
+### 13.3 Opening a project
+
+1. Validate: every file exists, both assembly names occur in the database.
+2. Load all seed sources; seeds with identical (assembly, contig, start, end) from
+   different sources are one seed with several names.
+3. **Recruitment queue.** Each seed not already cached is recruited in a worker
+   process (`recruit_workers` at a time; seeds are independent). Results go to
+   `output/recruit/recruit_<key>.pkl`, keyed by the seed, the data files and the
+   recruitment parameters, so reopening reuses them.
+4. **Loci.** A finished seed gets `locus_id(segments, reads)`; seeds with the same
+   id are one locus, one table row, listing its seeds. Rows appear as seeds finish.
+5. **Scoring queue.** Each distinct locus is scored once, automatically, through
+   `phmm_likelihood_report(cache_dir=output/loci)` -- the cache the notebooks use,
+   so loci the batch already scored arrive with Delta S at once. Scoring runs in a
+   subprocess (it forks `score_workers` of its own; forking from the threaded
+   server process is avoided). A locus the user opens moves to the front.
+6. State is only ever derived from these files, so a crash or restart loses at
+   most the jobs in flight.
+
+### 13.4 Page
+
+```
++----------------+-------------------------------------------+---------------+
+| project        |  locus . Delta S . status                 |  (right       |
+|  name, queue   +-------------------------------------------+   sidebar,    |
+|  progress      |                                           |   reserved)   |
+|                |                                           |               |
+| loci table     |    dotplot + marginals + contig bars      |               |
+|  Delta S,      |    (fills the remaining space)            |               |
+|  reads, span,  |                                           |               |
+|  seeds, status |                                           |               |
+|                |                                           |               |
+| plotting       |                                           |               |
+|  display pid,  |                                           |               |
+|  plen, deltas, |                                           |               |
+|  binsize,      |                                           |               |
+|  colour-by,    |                                           |               |
+|  clamp C,      |                                           |               |
+|  layers        |                                           |               |
+|                |                                           |               |
+| recruitment    |                                           |               |
+|  (read-only)   |                                           |               |
++----------------+-------------------------------------------+---------------+
+```
+
+- CSS grid, three columns. Both sidebars scroll on their own and can be collapsed;
+  the plot column takes what is left. One locus at a time.
+- The **right sidebar** is reserved for per-locus and per-read information; its
+  contents are to be designed. It ships as an empty, collapsible panel.
+- **Sizing:** the page measures the plot cell (ResizeObserver) and asks the server
+  for figures at that size; `fit_main` keeps square pixels server-side as now.
+  Resizing re-requests after a 300 ms pause.
+- **Plotting controls** are the Panel app's tiers 2 and 3: display pid, plen,
+  best_pid_delta, pid_tie_eps (with the tie warning), binsize, colour-by, clamp C,
+  layers. Tier 2 rebuilds `RegionData` server-side (~1 s, cached per locus and
+  settings); tier 3 re-renders only.
+
+### 13.5 Server
+
+FastAPI + uvicorn, one process, reached by ssh port-forwarding.
+
+| endpoint | returns |
+|---|---|
+| `GET /` | the page (static HTML, JS module, CSS) |
+| `GET /bokeh/...` | BokehJS from the installed `bokeh` package -- no internet needed |
+| `GET /api/project` | names, files, seed sources, recruitment parameters, resources |
+| `GET /api/loci` | the table: id, seeds, segments, span per candidate, reads, status, Delta S |
+| `GET /api/events` | server-sent events: queue progress and row updates |
+| `GET /api/loci/{id}/view?w=&h=&...` | Bokeh `json_item` of the report layout for that size and those settings, plus the score summary |
+
+Launch: `venv/bin/python -m qaview <project.toml> [--port 5006]`.
+
+### 13.6 Reuse and removal
+
+| module | fate |
+|---|---|
+| `glyphs.py` | reused; `report_layout` already takes a size box |
+| `region.py`, `state.py` | reused |
+| `recruit.py` | `run_recruitment` reused by the queue; cache key reused |
+| `score.py`, `score_worker.py` | replaced by `phmm_likelihood_report(cache_dir=...)` in a subprocess |
+| `seeds.py` | becomes the QUAST loader behind the seed interface |
+| `app.py` | replaced by `project.py`, `pipeline.py`, `server.py` and `static/` |
+
+### 13.7 Open
+
+- Right-sidebar contents.
+- Whether the read inspector (clicked read: per-read log-ratio, windows in both
+  candidates, placements) goes there.
+- Loci larger than ~5 Mb overplot at full view: aggregate reads at full zoom and draw
+  individual reads only when zoomed in.

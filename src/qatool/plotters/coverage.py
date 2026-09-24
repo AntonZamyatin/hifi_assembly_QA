@@ -31,6 +31,10 @@ class CoverageBins:
       the segment end, so the last bin of a segment may be shorter than binsize)
     - bin_offsets / read_idx : CSR index of bin -> reads.  The reads in bin i are
       read_idx[bin_offsets[i]:bin_offsets[i + 1]], as indices into read_names.
+    - read_w : parallel to read_idx, each read's coverage contribution to that bin.
+      Usually 1/n for a read with n tied alignments, but 2/n where two of them cover
+      the same bin -- which is exactly what happens in repeats. Keeping it makes any
+      regrouping of reads exact, via `rebucket`, without re-reading the BAM.
     """
     bins: list
     bucket_bins: list | None
@@ -40,12 +44,28 @@ class CoverageBins:
     bin_offsets: np.ndarray
     read_idx: np.ndarray
     read_names: list
+    read_w: np.ndarray | None = None
 
     def total(self) -> np.ndarray:
         """Summed coverage across every bucket plus the unbucketed remainder."""
         out = np.array(self.bins, dtype=float)
         for series in (self.bucket_bins or []):
             out += np.array(series, dtype=float)
+        return out
+
+    def rebucket(self, band_of_read, n_bands: int) -> np.ndarray:
+        """Coverage per band, shape (n_bands, n_bins), for any grouping of reads.
+
+        `band_of_read[j]` is the band of read_names[j]. Exact because it sums the
+        stored per-bin weights; the bands together reproduce `total()`.
+        """
+        if self.read_w is None:
+            raise ValueError("these bins were built without per-read weights")
+        n_bins = len(self.bins)
+        out = np.zeros((n_bands, n_bins))
+        bin_of_entry = np.repeat(np.arange(n_bins), np.diff(self.bin_offsets))
+        band = np.asarray(band_of_read, dtype=np.int64)[self.read_idx]
+        np.add.at(out, (band, bin_of_entry), self.read_w)
         return out
 
     def reads_in_bin(self, i: int) -> list:
@@ -77,14 +97,22 @@ class CoverageBins:
 def compute_coverage_bins(bamfile: str, segments: list,
                           pid_threshold: float = 0.99, plen_threshold: float | None = None,
                           binsize: int = 1000, read_buckets=None,
-                          best_pid_delta: float = BEST_PID_DELTA_DEFAULT) -> CoverageBins:
+                          best_pid_delta: float = BEST_PID_DELTA_DEFAULT,
+                          best_only=None, best_tol: float = 0.0) -> CoverageBins:
     """
     Bin read coverage over `segments`, tracking which reads contribute to each bin.
 
     A read's qualifying alignments are those within best_pid_delta of its own best
     pid; each contributes weight 1/n so a multi-mapping read still counts once in
     total.  Reads not in any bucket accumulate into `bins`.
+
+    `best_only` names reads counted only at their best placements (within
+    `best_tol` of their best pid, plus supplementary pieces of them), the read's
+    weight of 1 split evenly across those placements -- a supplementary piece
+    belongs to a placement and does not take a share of its own. qaview uses it
+    for reads that vote for one assembly; off by default.
     """
+    best_only = best_only or set()
     if not segments:
         raise ValueError("segments must be a non-empty list")
     segments = sorted(segments, key=lambda s: (s.contig, s.start, s.end))
@@ -126,49 +154,61 @@ def compute_coverage_bins(bamfile: str, segments: list,
                 startbin = math.floor((max(aln.reference_start, seg.start) - seg.start + offset) / binsize)
                 endbin = math.ceil((min(aln.reference_end, seg.end) - seg.start + offset) / binsize)
                 if startbin < endbin:
-                    valid_alns.append((aln.query_name, float(pid), startbin, endbin))
+                    valid_alns.append((aln.query_name, float(pid), startbin, endbin,
+                                       aln.is_supplementary))
             offset += math.ceil((seg.end - seg.start) / binsize) * binsize
     finally:
         bam.close()
 
     # Pass 1: find best pid per read.
     best_pid_by_read = {}
-    for read_name, pid, startbin, endbin in valid_alns:
+    for read_name, pid, startbin, endbin, _supp in valid_alns:
         if read_name not in best_pid_by_read or pid > best_pid_by_read[read_name]:
             best_pid_by_read[read_name] = pid
 
     # Pass 2: collect qualifying alignments (within best_pid_delta of best) per read,
     # then fill bins with weight 1 / number of tied alignments.
     qualifying: dict = {}
-    for read_name, pid, startbin, endbin in valid_alns:
-        if pid + best_pid_delta >= best_pid_by_read.get(read_name, float("-inf")):
-            qualifying.setdefault(read_name, []).append((startbin, endbin))
+    for read_name, pid, startbin, endbin, supp in valid_alns:
+        best = best_pid_by_read.get(read_name, float("-inf"))
+        if read_name in best_only:
+            keep = supp or pid + best_tol >= best
+        else:
+            keep = pid + best_pid_delta >= best
+        if keep:
+            qualifying.setdefault(read_name, []).append((startbin, endbin, supp))
 
     read_names = list(qualifying)
     read_pos = {name: i for i, name in enumerate(read_names)}
-    bin_reads: list = [set() for _ in range(n_bins)]
+    bin_reads: list = [dict() for _ in range(n_bins)]      # read index -> weight
 
     for read_name, ranges in qualifying.items():
-        w = 1.0 / len(ranges)
+        if read_name in best_only:
+            w = 1.0 / max(1, sum(not supp for _, _, supp in ranges))
+        else:
+            w = 1.0 / len(ranges)
         if bucket_bins is None:
             target = bins
         else:
             bucket_idx = name_to_bucket.get(read_name)
             target = bucket_bins[bucket_idx] if bucket_idx is not None else bins
         ri = read_pos[read_name]
-        for startbin, endbin in ranges:
+        for startbin, endbin, _supp in ranges:
             for i in range(startbin, endbin):
                 target[i] += w
-                bin_reads[i].add(ri)
+                bin_reads[i][ri] = bin_reads[i].get(ri, 0.0) + w
 
     bin_offsets = np.zeros(n_bins + 1, dtype=np.int64)
     np.cumsum([len(s) for s in bin_reads], out=bin_offsets[1:])
     read_idx = np.fromiter((ri for s in bin_reads for ri in sorted(s)),
                            dtype=np.int32, count=int(bin_offsets[-1]))
+    read_w = np.fromiter((s[ri] for s in bin_reads for ri in sorted(s)),
+                         dtype=np.float64, count=int(bin_offsets[-1]))
 
     return CoverageBins(bins=bins, bucket_bins=bucket_bins,
                         bin_contig=bin_contig, bin_start=bin_start, bin_end=bin_end,
-                        bin_offsets=bin_offsets, read_idx=read_idx, read_names=read_names)
+                        bin_offsets=bin_offsets, read_idx=read_idx, read_names=read_names,
+                        read_w=read_w)
 
 
 def alignment_plot(bamfile: str, segments: list,

@@ -197,15 +197,24 @@ class RegionData:
         read_pos = {n: i for i, n in enumerate(read_names_l)}
         read_class = {n: k for k in SUPPORT_BUCKET_KEYS for n in read_classes[k]}
 
+        # A read that votes for one assembly is drawn only at its best placements,
+        # in both assemblies: in each marginal its weight of 1 is split evenly
+        # across its tied best placements there, and in the dotplot it runs only
+        # between them -- not at every copy it also aligns to.
+        voters = (read_classes["asm1_only"] | read_classes["asm1_best"]
+                  | read_classes["asm2_only"] | read_classes["asm2_best"])
         lines = _compute_lines(aln_blocks, read_names_l, read_pos,
-                               asm1_segs_info, asm2_segs_info, asm1, asm2)
+                               asm1_segs_info, asm2_segs_info, asm1, asm2,
+                               best_only=voters, best_tol=pid_tie_eps)
         lines = _order_for_drawing(lines, read_names_l, read_class)
 
         buckets = [read_classes[k] for k in SUPPORT_BUCKET_KEYS]
         cov1 = compute_coverage_bins(asm1_bam, asm1_segs, pid_threshold, plen_threshold,
-                                     binsize, buckets, best_pid_delta)
+                                     binsize, buckets, best_pid_delta,
+                                     best_only=voters, best_tol=pid_tie_eps)
         cov2 = compute_coverage_bins(asm2_bam, asm2_segs, pid_threshold, plen_threshold,
-                                     binsize, buckets, best_pid_delta)
+                                     binsize, buckets, best_pid_delta,
+                                     best_only=voters, best_tol=pid_tie_eps)
 
         return cls(asm1=asm1, asm2=asm2, binsize=binsize, segments=sc_sorted,
                    asm1_segs_info=asm1_segs_info, asm2_segs_info=asm2_segs_info,
@@ -235,13 +244,26 @@ def _classify_support(db_path, all_reads, pid_threshold, plen_threshold,
             fa2.close()
 
 
+def _best_blocks(blocks: list, tol: float) -> list:
+    """A read's blocks at its best placement: pid within `tol` of its best, plus
+    supplementary pieces (they belong to the primary chain, at lower pid)."""
+    main = [b for b in blocks if b[10] != "supplementary"]
+    if not main:
+        return blocks
+    best = max(b[11] for b in main)
+    return [b for b in blocks if b[10] == "supplementary" or b[11] + tol >= best]
+
+
 def _compute_lines(aln_blocks, read_names, read_pos,
-                   asm1_segs_info, asm2_segs_info, asm1, asm2) -> ReadLines:
+                   asm1_segs_info, asm2_segs_info, asm1, asm2,
+                   best_only=None, best_tol: float = 0.0) -> ReadLines:
     """Thread each read through its asm1 and asm2 blocks into plot-space line segments.
 
     Geometry helpers are reused verbatim from `qatool.plotters.reads_dotplot`; only
-    the merging and matplotlib drawing are left behind.
+    the merging and matplotlib drawing are left behind. Reads in `best_only` are
+    threaded through their best placement in each assembly only.
     """
+    best_only = best_only or set()
     y_lookup = _build_lookup(asm1_segs_info)   # asm1 -> Y
     x_lookup = _build_lookup(asm2_segs_info)   # asm2 -> X
 
@@ -259,6 +281,8 @@ def _compute_lines(aln_blocks, read_names, read_pos,
         a2 = per.get(asm2, [])
         if not a1 or not a2:
             continue
+        if rn in best_only:
+            a1, a2 = _best_blocks(a1, best_tol), _best_blocks(a2, best_tol)
         ri = read_pos[rn]
         for (_, c1, s1, e1, st1, sl1, sr1, hl1, hr1, q1, t1, pid1) in a1:
             r0a, r1a = _read_span(st1, sl1, sr1, hl1, hr1, q1)
