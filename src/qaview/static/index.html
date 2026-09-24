@@ -18,16 +18,36 @@
     <button class="collapse" data-side="left" title="collapse sidebar">&lsaquo;</button>
     <div class="side-body">
       <header class="project">
-        <div id="project-name" class="title">qaview</div>
-        <div id="project-pair" class="muted"></div>
-        <div class="progress" title="seeds recruited / loci scored">
+        <div class="title-row">
+          <div id="project-name" class="title">qaview</div>
+          <a id="change-project" href="#" class="small needs-project" title="open another project">change</a>
+        </div>
+        <div id="project-pair" class="muted needs-project"></div>
+        <div class="progress needs-project" title="seeds recruited / loci scored">
           <div class="bar"><span id="bar-recruit"></span></div>
           <div id="progress-text" class="muted small"></div>
           <div id="failed-seeds" class="warn small"></div>
         </div>
       </header>
 
-      <section class="loci">
+      <section id="open-project" hidden>
+        <div class="section-head"><span>Open a project</span></div>
+        <form id="open-form" autocomplete="off">
+          <input id="open-path" type="text" placeholder="/path/to/project.toml" spellcheck="false">
+          <button class="btn" type="submit">Open</button>
+          <button id="open-cancel" class="btn" type="button" hidden>Cancel</button>
+        </form>
+        <div class="muted small">The project file's path on the server. It names both assemblies,
+          their BAMs, the alignment database, the seeds and the output folder
+          (docs/qaview.md §13.2); opening it starts recruiting and scoring.</div>
+        <pre id="open-error" class="warn small" hidden></pre>
+        <div id="recent-wrap" hidden>
+          <div class="muted small">Recent</div>
+          <ul id="recent"></ul>
+        </div>
+      </section>
+
+      <section class="loci needs-project">
         <div class="section-head">
           <span>Loci</span>
           <span class="head-tools">
@@ -50,7 +70,7 @@
         </div>
       </section>
 
-      <details class="panel" open>
+      <details class="panel needs-project" open>
         <summary>Plotting</summary>
         <div class="form">
           <label>display pid <input id="pid" type="number" step="0.0005" min="0.9" max="1" value="0.997"></label>
@@ -75,12 +95,12 @@
         </div>
       </details>
 
-      <details class="panel">
+      <details class="panel needs-project">
         <summary>Recruitment (from the project file)</summary>
         <dl id="recruitment" class="kv"></dl>
       </details>
 
-      <details class="panel">
+      <details class="panel needs-project">
         <summary>Files</summary>
         <dl id="files" class="kv files"></dl>
       </details>
@@ -95,6 +115,7 @@
     <div id="plot-cell">
       <div id="plot"></div>
       <div id="plot-status" class="muted"></div>
+      <div id="rect-tip" hidden></div>
     </div>
   </main>
 
@@ -102,8 +123,28 @@
     <div class="resizer" data-side="right" title="drag to resize"></div>
     <button class="collapse" data-side="right" title="collapse sidebar">&rsaquo;</button>
     <div class="side-body">
-      <div class="section-head"><span>Details</span></div>
-      <div id="details" class="muted small">Reserved.</div>
+      <div class="slot" id="right-top"></div>
+      <section id="align-panel">
+        <div class="section-head"><span>Alignment</span></div>
+        <div id="align-meta" class="small muted">Shift+drag a rectangle on the dotplot to align the stretches under it.</div>
+        <div id="align-strip" class="strip" hidden>
+          <div id="pile-top" class="pile" hidden></div>
+          <pre id="align-rows"></pre>
+          <div id="pile-bottom" class="pile" hidden></div>
+        </div>
+        <div id="align-legend" class="small muted legend" hidden>
+          <span><i class="sw mm"></i>mismatch</span><span><i class="sw gap"></i>gap</span>
+          <span><i class="sw out"></i>outside the other bin</span>
+        </div>
+        <div id="reads-legend" class="small muted legend" hidden></div>
+      </section>
+      <div class="slot" id="right-bottom">
+        <input id="remember-note" type="text" maxlength="500" placeholder="note (optional)" autocomplete="off" disabled>
+        <div class="buttons">
+          <button id="remember-toggle" class="btn" disabled title="save this alignment to the output folder and mark it on the dotplot">Remember</button>
+          <button id="reads-toggle" class="btn" title="reads on each stretch, coloured and stacked as in the marginals">Show reads</button>
+        </div>
+      </div>
     </div>
   </aside>
 

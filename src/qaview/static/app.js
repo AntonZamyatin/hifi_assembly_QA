@@ -12,6 +12,15 @@ const state = {
   stars: new Set(),         // starred seed names (server-side, per project)
   starOnly: false,
   viewAbort: null,
+  alignAbort: null,
+  lastRect: null,           // the rectangle the alignment panel shows
+  showReads: false,
+  lastAlignment: null,      // the result the panel shows, for "Remember"
+  lastSettings: null,
+  savedId: null,            // set when the panel shows a remembered alignment
+  rects: [],                // remembered alignments on this locus, in plot coordinates
+  boxes: new Map(),         // id -> its BoxAnnotation on the current dotplot
+  boxPlot: null,
   views: [],
 };
 
@@ -52,8 +61,7 @@ function statusText(r) {
 
 // ---- project ----------------------------------------------------------------------
 
-async function loadProject() {
-  const p = await (await fetch("/api/project")).json();
+async function loadProject(p) {
   state.project = p;
   document.title = `qaview — ${p.name}`;
   $("#project-name").textContent = p.name;
@@ -233,7 +241,10 @@ async function openLocus(id) {
   $("#locus-title").title = r.seeds.join("\n");
   $("#locus-title").classList.remove("muted");
   history.replaceState(null, "", `#${id}`);
+  clearAlignment();
   clearPlot();
+  state.rects = [];
+  loadRects(id);
   loadView();
 }
 
@@ -259,6 +270,7 @@ async function loadView() {
   state.views = await Bokeh.embed.embed_item(d.item, "plot");
   $("#plot-status").textContent = "";
   renderScore(d);
+  drawRects();
 }
 
 function renderScore(d) {
@@ -283,6 +295,413 @@ function renderScore(d) {
   bar.style.background = `linear-gradient(to right, ${p.colors.ratio_neg}, #d2d2ca, ${p.colors.ratio_pos})`;
   ramp.append(el("span", p.asm2.name), bar, el("span", p.asm1.name));
   card.append(ds, parts, ramp);
+}
+
+// ---- bin alignment (right sidebar) ------------------------------------------------
+
+function clearAlignment() {
+  if (state.alignAbort) state.alignAbort.abort();
+  $("#align-meta").textContent = "Shift+drag a rectangle on the dotplot to align the stretches under it.";
+  $("#align-strip").hidden = true;
+  $("#align-legend").hidden = true;
+  state.lastRect = null;
+  state.lastAlignment = null;
+  setSaved(null);
+  clearPiles();
+}
+
+function clearPiles() {
+  for (const id of ["#pile-top", "#pile-bottom"]) { $(id).replaceChildren(); $(id).hidden = true; }
+  $("#reads-legend").hidden = true;
+}
+
+async function alignRect(x0, x1, y0, y1) {
+  const id = state.current;
+  if (!id) return;
+  if (state.alignAbort) state.alignAbort.abort();
+  const ctl = new AbortController();
+  state.alignAbort = ctl;
+  $("#align-meta").textContent = "Aligning\u2026";
+  state.lastRect = [x0, x1, y0, y1];
+  const q = params();
+  q.set("x0", x0); q.set("x1", x1); q.set("y0", y0); q.set("y1", y1);
+  if (state.showReads) q.set("reads", "1");
+  $("#align-meta").textContent = state.showReads ? "Aligning and fetching reads\u2026" : "Aligning\u2026";
+  let a;
+  try {
+    const res = await fetch(`/api/loci/${id}/align?${q}`, { signal: ctl.signal });
+    if (!res.ok) {
+      let msg = await res.text();
+      try { msg = JSON.parse(msg).detail || msg; } catch (_) { /* plain text */ }
+      throw new Error(msg);
+    }
+    a = await res.json();
+  } catch (e) {
+    if (e.name !== "AbortError") {
+      $("#align-meta").textContent = `Alignment failed: ${e.message}`;
+      $("#align-strip").hidden = true;
+      $("#align-legend").hidden = true;
+    }
+    return;
+  }
+  if (id !== state.current) return;
+  const q2 = params();
+  state.lastAlignment = a;
+  state.lastSettings = Object.fromEntries(
+    ["pid", "plen", "best_pid_delta", "pid_tie_eps", "binsize", "color_by"].map((k) => [k, q2.get(k)]));
+  setSaved(null);
+  renderAlignment(a);
+}
+
+function renderAlignment(a, saved = null) {
+  const n = (v) => v.toLocaleString();
+  const meta = $("#align-meta");
+  meta.replaceChildren();
+  if (saved) {
+    const d = el("div", `remembered ${saved.created.replace("T", " ")}` + (saved.note ? `  \u00b7  ${saved.note}` : ""));
+    d.id = "align-saved";
+    meta.append(d);
+  }
+  const line = (label, text) => {
+    const d = el("div"); const b = el("b", label); d.append(b, " ", text); return d;
+  };
+  meta.append(
+    line(`${a.top_name}`, `${a.top_contig}:${n(a.top_start + 1)}\u2013${n(a.top_end)}  (top` +
+         (a.clipped[0] ? ", kept to one segment)" : ")")),
+    line(`${a.bottom_name}`, `${a.bottom_contig}:${n(a.bottom_start + 1)}\u2013${n(a.bottom_end)}  (bottom` +
+         (a.strand === "-" ? ", reverse complement" : "") + (a.clipped[1] ? ", kept to one segment)" : ")")),
+    el("div", `compared ${n(a.compared)} columns \u00b7 identity ${(100 * a.identity).toFixed(2)}% \u00b7 ` +
+              `${n(a.mismatches)} mismatches \u00b7 ${n(a.ins)} bp in ${a.ins_opens} insertions \u00b7 ` +
+              `${n(a.del)} bp in ${a.del_opens} deletions`),
+    el("div", `outside the other bin: ${n(a.outside_top)} bp top, ${n(a.outside_bottom)} bp bottom`),
+  );
+  // Runs of equal column kind become one span per row, so a long bin stays cheap.
+  // A blank in the top or bottom row marks bin sequence whose counterpart lies
+  // outside the other bin: shown, but not a difference.
+  const kindAt = (i) => {
+    const c = a.mid[i];
+    if (c === "|") return "";
+    if (c === ".") return "mm";
+    return a.top[i] === " " || a.bottom[i] === " " ? "out" : "gap";
+  };
+  const rows = [a.top, a.mid, a.bottom].map(() => []);
+  let start = 0;
+  for (let i = 1; i <= a.mid.length; i++) {
+    if (i < a.mid.length && kindAt(i) === kindAt(start)) continue;
+    const k = kindAt(start);
+    [a.top, a.mid, a.bottom].forEach((row, r) => {
+      const text = row.slice(start, i);
+      if (!k) { rows[r].push(document.createTextNode(text)); return; }
+      const sp = el("span", text); sp.className = k; rows[r].push(sp);
+    });
+    start = i;
+  }
+  const pre = $("#align-rows");
+  pre.replaceChildren();
+  rows.forEach((parts, r) => { pre.append(...parts); if (r < 2) pre.append("\n"); });
+  const strip = $("#align-strip");
+  strip.hidden = false;
+  // Open on the comparison, not on sequence that lies outside the other stretch.
+  const k = [...a.mid].findIndex((c, i) => c === "|" || c === "." || a.top[i] === "-" || a.bottom[i] === "-");
+  const grid = measureGrid(pre);
+  strip.scrollLeft = k > 0 ? Math.max(0, grid.x0 + k * grid.cw - 24) : 0;
+  if (a.reads) renderPiles(a.reads, grid);
+  else clearPiles();
+  $("#align-legend").hidden = false;
+}
+
+// ---- reads under the alignment ------------------------------------------------------
+
+const ROW_H = 5;                                   // 4 px bar + 1 px gap
+
+// The alignment text's column grid, measured rather than derived: a run of
+// letters placed at the start of the text gives the exact advance of one column
+// and where column 0 begins, relative to the strip's left edge -- which the
+// pileups share. (Padding and scrollWidth differ between browsers.)
+function measureGrid(pre) {
+  const probe = document.createElement("span");
+  probe.textContent = "A".repeat(200);
+  pre.prepend(probe);
+  const r = probe.getBoundingClientRect();
+  const x0 = r.left - pre.getBoundingClientRect().left;
+  probe.remove();
+  return { x0, cw: r.width / 200 };
+}
+
+function renderPiles(reads, grid) {
+  // Both pileups grow away from the alignment: band 0 (the marginal's bottom band)
+  // sits next to the sequence rows, above the top row and below the bottom row.
+  const { x0, cw } = grid;
+  const X = (c) => x0 + c * cw;
+  for (const [side, id] of [["top", "#pile-top"], ["bottom", "#pile-bottom"]]) {
+    const pile = $(id);
+    const rows = reads[side];
+    const n = rows.length;
+    pile.style.height = `${n * ROW_H + (n ? 3 : 0)}px`;
+    const parts = [];
+    rows.forEach((r, i) => {
+      const y = side === "top" ? (n - 1 - i) * ROW_H + 1 : i * ROW_H + 2;
+      const band = reads.bands[r.band];
+      // One box per read carries the tooltip; its runs are drawn inside it.
+      const row = el("div");
+      row.className = "read";
+      row.style.cssText = `left:${X(r.col0)}px;width:${(r.col1 - r.col0 + 1) * cw}px;top:${y}px`;
+      row.title = `${r.name}\n${band.name}\npid ${r.pid}  ${r.strand}${r.supplementary ? "  supplementary" : ""}\n` +
+                  `${(r.start + 1).toLocaleString()}\u2013${r.end.toLocaleString()}` +
+                  (r.sequence ? "" : "\n(no stored sequence: differences not shown)");
+      for (const [c0, c1, kind] of r.runs) {
+        const seg = el("div");
+        seg.className = `run ${kind}`;
+        seg.style.left = `${(c0 - r.col0) * cw}px`;
+        seg.style.width = `${(c1 - c0 + 1) * cw}px`;
+        if (kind === "b" || kind === "g") seg.style.background = band.color;
+        row.append(seg);
+      }
+      parts.push(row);
+      for (const [c, len] of r.ticks) {
+        const t = el("div");
+        t.className = "tick";
+        t.title = `${len} base${len > 1 ? "s" : ""} the read has and its assembly lacks, ` +
+                  "with no gap column in the alignment to put them in";
+        t.style.cssText = `left:${X(c) - 1}px;top:${y - 1}px`;
+        parts.push(t);
+      }
+    });
+    pile.replaceChildren(...parts);
+    pile.hidden = n === 0;
+  }
+  const legend = $("#reads-legend");
+  const used = new Set([...reads.top, ...reads.bottom].map((r) => r.band));
+  const item = (cls, color, text) => {
+    const sp = el("span"); const i = el("i"); i.className = `sw ${cls}`;
+    if (color) i.style.background = color;
+    sp.append(i, text); return sp;
+  };
+  legend.replaceChildren(
+    el("span", `reads: ${reads.top.length} on top, ${reads.bottom.length} below`),
+    ...reads.bands.map((b, k) => used.has(k) ? item("", b.color, b.name) : null).filter(Boolean),
+    item("mkx", null, "mismatch"),
+    item("mki", null, "bases the read has and its assembly lacks"),
+    item("mkd", null, "bases its assembly has and the read lacks"),
+    item("mkg", null, "gap in its assembly too"),
+    item("mkt", null, "extra bases in the read, no gap column for them"));
+  legend.hidden = false;
+}
+
+function toggleReads() {
+  state.showReads = !state.showReads;
+  const b = $("#reads-toggle");
+  b.textContent = state.showReads ? "Hide reads" : "Show reads";
+  b.classList.toggle("on", state.showReads);
+  if (!state.showReads) clearPiles();
+  else if (state.lastRect) alignRect(...state.lastRect);
+}
+
+// ---- remembered alignments ---------------------------------------------------------
+
+async function loadRects(id) {
+  try {
+    const res = await fetch(`/api/loci/${id}/remembered`);
+    if (!res.ok || id !== state.current) return;
+    state.rects = await res.json();
+    drawRects();
+  } catch (_) { /* the plot works without them */ }
+}
+
+function drawRects() {
+  // Bokeh builds views for new annotations asynchronously, so boxes are changed
+  // in place and added or removed in one assignment -- rebuilding them all on
+  // every change raced that build ("cannot find a view for BoxAnnotation").
+  const pv = dotplotView();
+  if (!pv) return;
+  const plot = pv.model;
+  if (state.boxPlot !== plot) {                    // a new dotplot: its boxes start afresh
+    state.boxPlot = plot;
+    state.boxes = new Map();
+  }
+  const style = (id) => ({
+    fill_alpha: id === state.savedId ? 0.38 : 0.2, line_width: id === state.savedId ? 2 : 1,
+  });
+  const want = new Map(state.rects.map((r) => [r.id, r]));
+  const removed = [...state.boxes].filter(([id]) => !want.has(id)).map(([, b]) => b);
+  for (const [id] of [...state.boxes]) if (!want.has(id)) state.boxes.delete(id);
+  const BA = Bokeh.Models.get("BoxAnnotation");
+  const added = [];
+  for (const [id, r] of want) {
+    const box = state.boxes.get(id);
+    if (box) { box.setv(style(id)); continue; }
+    const b = new BA({ left: r.x0, right: r.x1, bottom: r.y0, top: r.y1, editable: false,
+                       fill_color: "#f2c200", line_color: "#c99a00", line_alpha: 0.9, ...style(id) });
+    state.boxes.set(id, b);
+    added.push(b);
+  }
+  if (removed.length || added.length) {
+    plot.center = [...plot.center.filter((x) => !removed.includes(x)), ...added];
+  }
+}
+
+function rectsAt(clientX, clientY) {
+  const pv = dotplotView();
+  if (!pv || !state.rects.length) return [];
+  const cv = pv.canvas_view.el.getBoundingClientRect();
+  const f = pv.frame.bbox;
+  const sx = clientX - cv.left, sy = clientY - cv.top;
+  if (sx < f.left || sx > f.right || sy < f.top || sy > f.bottom) return [];
+  const x = pv.frame.x_scale.invert(sx), y = pv.frame.y_scale.invert(sy);
+  return state.rects.filter((r) => x >= r.x0 && x <= r.x1 && y >= r.y0 && y <= r.y1)
+    .sort((p, q) => (p.x1 - p.x0) * (p.y1 - p.y0) - (q.x1 - q.x0) * (q.y1 - q.y0));
+}
+
+function setSaved(id) {
+  state.savedId = id;
+  const b = $("#remember-toggle"), note = $("#remember-note");
+  b.textContent = id ? "Forget" : "Remember";
+  b.disabled = !state.lastAlignment;
+  note.disabled = !state.lastAlignment || !!id;
+  if (!id) note.value = "";
+  drawRects();
+}
+
+async function restoreRemembered(ident) {
+  let e;
+  try {
+    const res = await fetch(`/api/remembered/${encodeURIComponent(ident)}`);
+    if (!res.ok) throw new Error(`${res.status}`);
+    e = await res.json();
+  } catch (err) {
+    $("#align-meta").textContent = `Could not load the remembered alignment: ${err.message}`;
+    return;
+  }
+  if (state.alignAbort) state.alignAbort.abort();
+  state.lastAlignment = e.alignment;
+  state.lastSettings = e.settings;
+  state.lastRect = null;                           // "Show reads" does not recompute a snapshot
+  renderAlignment(e.alignment, e);
+  setSaved(e.id);
+  $("#remember-note").value = e.note || "";
+}
+
+async function toggleRemember() {
+  const b = $("#remember-toggle");
+  b.disabled = true;
+  try {
+    if (state.savedId) {
+      const res = await fetch(`/api/remembered/${encodeURIComponent(state.savedId)}`, { method: "DELETE" });
+      if (!res.ok) throw new Error(`${res.status}`);
+      state.rects = state.rects.filter((r) => r.id !== state.savedId);
+      setSaved(null);
+    } else {
+      const res = await fetch("/api/remembered", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ lid: state.current, alignment: state.lastAlignment,
+                               note: $("#remember-note").value, settings: state.lastSettings || {} }),
+      });
+      if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
+      const meta = await res.json();
+      if (meta.rect) state.rects.push(meta.rect);
+      renderAlignment(state.lastAlignment, meta);
+      setSaved(meta.id);
+      $("#remember-note").value = meta.note || "";
+    }
+  } catch (err) {
+    $("#align-meta").prepend(el("div", `Remember failed: ${err.message}`));
+  } finally {
+    b.disabled = !state.lastAlignment;
+  }
+}
+
+function wireRects() {
+  const cell = $("#plot-cell");
+  const tip = $("#rect-tip");
+  let down = null;
+  cell.addEventListener("pointerdown", (e) => { down = [e.clientX, e.clientY]; });
+  // A click -- not the end of a pan or a drag -- inside a rectangle restores it.
+  cell.addEventListener("click", (e) => {
+    if (e.shiftKey || !down || Math.hypot(e.clientX - down[0], e.clientY - down[1]) > 4) return;
+    const hit = rectsAt(e.clientX, e.clientY);
+    if (hit.length) restoreRemembered(hit[0].id);
+  });
+  cell.addEventListener("pointermove", (e) => {
+    const hit = e.buttons ? [] : rectsAt(e.clientX, e.clientY);
+    if (!hit.length) { tip.hidden = true; return; }
+    const r = hit[0];
+    tip.textContent = `remembered ${r.created.replace("T", " ")}` + (r.note ? ` \u00b7 ${r.note}` : "") +
+                      "  \u2014 click to open";
+    const c = cell.getBoundingClientRect();
+    tip.style.left = `${e.clientX - c.left + 14}px`;
+    tip.style.top = `${e.clientY - c.top + 14}px`;
+    tip.hidden = false;
+  });
+  cell.addEventListener("pointerleave", () => { tip.hidden = true; });
+}
+
+// ---- shift+drag a rectangle on the dotplot -----------------------------------------
+
+function dotplotView() {
+  if (!window.Bokeh) return null;
+  const views = [];
+  const walk = (v) => { if (!v) return; views.push(v); for (const c of (v.child_views || [])) walk(c); };
+  for (const v of Object.values(Bokeh.index)) walk(v);
+  // The dotplot is the figure owning the wheel zoom. The grid shows the same
+  // toolbar at its edge, so match figures only (they have a canvas view).
+  return views.find((v) => v.canvas_view && v.model && v.model.toolbar &&
+    v.model.toolbar.tools.some((t) => t.constructor.__name__ === "WheelZoomTool")) || null;
+}
+
+function wireRectAlign() {
+  const cell = $("#plot-cell");
+  const box = el("div");
+  box.id = "align-rect";
+  box.hidden = true;
+  cell.append(box);
+
+  // Capture phase on an ancestor: a shift+press on the dotplot is ours and never
+  // reaches Bokeh, so its pan tool does not move the plot. Without shift Bokeh
+  // gets everything as before.
+  const grab = (e) => {
+    if (!e.shiftKey || e.button !== 0 || !state.current) return;
+    const pv = dotplotView();
+    if (!pv) return;
+    const cv = pv.canvas_view.el.getBoundingClientRect();
+    const f = pv.frame.bbox;
+    const fx0 = cv.left + f.left, fx1 = cv.left + f.right, fy0 = cv.top + f.top, fy1 = cv.top + f.bottom;
+    if (e.clientX < fx0 || e.clientX > fx1 || e.clientY < fy0 || e.clientY > fy1) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.type !== "pointerdown") return;
+
+    const clampX = (x) => Math.min(fx1, Math.max(fx0, x));
+    const clampY = (y) => Math.min(fy1, Math.max(fy0, y));
+    const x0 = e.clientX, y0 = e.clientY;
+    let x1 = x0, y1 = y0;
+    const draw = () => {
+      const c = cell.getBoundingClientRect();
+      box.style.left = `${Math.min(x0, x1) - c.left}px`;
+      box.style.top = `${Math.min(y0, y1) - c.top}px`;
+      box.style.width = `${Math.abs(x1 - x0)}px`;
+      box.style.height = `${Math.abs(y1 - y0)}px`;
+    };
+    draw();
+    box.hidden = false;
+    const move = (ev) => {
+      ev.preventDefault(); ev.stopPropagation();
+      x1 = clampX(ev.clientX); y1 = clampY(ev.clientY);
+      draw();
+    };
+    const up = (ev) => {
+      ev.preventDefault(); ev.stopPropagation();
+      window.removeEventListener("pointermove", move, true);
+      window.removeEventListener("pointerup", up, true);
+      box.hidden = true;
+      const dx = (sx) => pv.frame.x_scale.invert(sx - cv.left);
+      const dy = (sy) => pv.frame.y_scale.invert(sy - cv.top);
+      alignRect(dx(x0), dx(x1), dy(y0), dy(y1));     // a shift+click aligns the bins under it
+    };
+    window.addEventListener("pointermove", move, true);
+    window.addEventListener("pointerup", up, true);
+  };
+  cell.addEventListener("pointerdown", grab, true);
+  cell.addEventListener("mousedown", grab, true);
 }
 
 // ---- wiring -----------------------------------------------------------------------
@@ -320,6 +739,10 @@ function wire() {
   });
   restoreWidths();
   wireResizers();
+  wireRectAlign();
+  $("#reads-toggle").addEventListener("click", toggleReads);
+  $("#remember-toggle").addEventListener("click", toggleRemember);
+  wireRects();
   for (const b of document.querySelectorAll(".collapse")) {
     b.addEventListener("click", () => {
       $("#app").classList.toggle(`${b.dataset.side}-collapsed`);
@@ -415,8 +838,87 @@ function wireResizers() {
   }
 }
 
+// ---- opening a project ------------------------------------------------------------
+
+function showOpen(show, p, cancellable) {
+  $("#open-project").hidden = !show;
+  $("#open-cancel").hidden = !cancellable;
+  $("#open-error").hidden = true;
+  if (!show) return;
+  const input = $("#open-path");
+  if (p && p.open && !input.value) input.value = p.path;
+  const list = $("#recent");
+  list.replaceChildren();
+  const recent = (p && p.recent) || [];
+  for (const r of recent) {
+    const li = el("li"), b = el("button");
+    b.type = "button";
+    const cut = r.path.lastIndexOf("/");
+    const name = el("b", r.path.slice(cut + 1));
+    b.append(name, "  ", el("span", r.path.slice(0, cut)));
+    b.title = r.exists ? r.path : `${r.path}\n(no longer there)`;
+    if (r.exists) b.addEventListener("click", () => openProject(r.path));
+    else b.className = "missing";
+    li.append(b);
+    list.append(li);
+  }
+  $("#recent-wrap").hidden = recent.length === 0;
+  input.focus();
+}
+
+async function openProject(path) {
+  const err = $("#open-error");
+  err.hidden = true;
+  $("#open-path").value = path;
+  const submit = $("#open-form button[type=submit]");
+  submit.disabled = true;
+  submit.textContent = "Opening\u2026";
+  try {
+    const res = await fetch("/api/open", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    });
+    if (!res.ok) {
+      let msg = await res.text();
+      try { msg = JSON.parse(msg).detail || msg; } catch (_) { /* plain text */ }
+      throw new Error(msg);
+    }
+    // A fresh page for the new project: every table, view and stream starts clean.
+    history.replaceState(null, "", location.pathname);
+    location.reload();
+  } catch (e) {
+    err.textContent = `Cannot open this project:\n${e.message}`;
+    err.hidden = false;
+    submit.disabled = false;
+    submit.textContent = "Open";
+  }
+}
+
+function wireOpen(p) {
+  $("#open-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const path = $("#open-path").value.trim();
+    if (path) openProject(path);
+  });
+  $("#open-cancel").addEventListener("click", () => showOpen(false, p, false));
+  $("#change-project").addEventListener("click", (e) => {
+    e.preventDefault();
+    showOpen($("#open-project").hidden, p, true);
+  });
+}
+
 async function main() {
-  await loadProject();
+  const p = await (await fetch("/api/project")).json();
+  wireOpen(p);
+  if (!p.open) {
+    // No project yet: the form is the page. Nothing else is wired or fetched.
+    $("#app").classList.add("no-project");
+    document.title = "qaview";
+    $("#locus-title").textContent = "Open a project in the left sidebar to begin.";
+    showOpen(true, p, false);
+    return;
+  }
+  await loadProject(p);
   wire();
   checkTie();
   await loadStars();

@@ -679,8 +679,53 @@ since it knows everything except the seeds.
 
 - CSS grid, three columns. Both sidebars scroll on their own and can be collapsed;
   the plot column takes what is left. One locus at a time.
-- The **right sidebar** is reserved for per-locus and per-read information; its
-  contents are to be designed. It ships as an empty, collapsible panel.
+- The **right sidebar** holds, in its middle, the **alignment** of the stretches
+  under a rectangle shift+dragged on the dotplot (a shift+click takes the single
+  bins under the pointer); above and below are reserved. Each side is snapped
+  outward to whole bins and kept to one segment, at most 200 kb a side. Both
+  whole stretches are shown in one horizontally scrolling strip, hifiasm on top,
+  laid out along their true correspondence: the asm1 stretch is located on asm2
+  with edlib (HW, both orientations, a window centred on the rectangle), the
+  path is polished with affine gaps (parasail) so an indel is one gap, and
+  sequence of one stretch whose counterpart lies outside the other is shown
+  hatched and not counted. `src/qaview/align.py`.
+- **Show reads** (a toggle at the bottom of the right sidebar) adds the reads
+  on each stretch -- above the top row, below the bottom row -- each read
+  *projected* onto the alignment's columns through its CIGAR, as a pairwise
+  alignment extends to a multiple one: aligned bases in their row base's column
+  (bar, or dark where mismatched); row bases the read skips as a dark line;
+  and where the row has gap columns (bases only the other assembly has), a read
+  inserting there fills them as whole nucleotides (purple, compared with the
+  other row), while a read inserting nothing shows a thin line, lacking them as
+  its row does. Inserted bases with no gap columns to go in are an orange tick
+  -- not necessarily bases neither assembly has: in a repeat the assemblies
+  size differently, a read of a third length shows a tick against one row and
+  a deletion against the other. In a tandem repeat an indel can sit anywhere
+  along the repeat at the same score, so each read indel is walked through its
+  equivalent positions in the row as shown (never past a mismatch or another
+  indel, which would change the alignment) and placed on the alignment's gap
+  columns when it can be, else at the leftmost, where the alignment's own gaps
+  are left-aligned. The placements are exactly the ones the marginals count
+  (display pid/plen, best_pid_delta, voting reads at their best placements),
+  coloured and banded as the marginals are for the current colour mode, with
+  band 0 next to the sequence on both sides. BAM records here carry no MD tag
+  and secondaries no SEQ, so a read's sequence comes from its primary record;
+  projected on its own reference a record's differences sum to NM exactly. The
+  page measures the text's column grid (a run of letters placed in it) rather
+  than deriving it from padding, so bars sit on the letters to a fraction of a
+  pixel. `src/qaview/pileup.py`.
+- **Remember** (beside Show reads, with an optional note) saves what the panel
+  shows -- both stretches in genome coordinates, the settings, the alignment,
+  and the reads if shown -- to `<output>/remembered/<seed>_<time>.json`, with a
+  `.txt` of the alignment in 60-column blocks to read without the app. The
+  snapshot is marked on the dotplot as a shaded yellow rectangle on any locus
+  view whose segments contain both stretches (so it survives re-recruitment and
+  shows for every seed recruiting the locus); hovering shows its note, and a
+  click (not the end of a pan) restores it exactly as saved. With a remembered
+  alignment open the button reads **Forget**, which deletes its files.
+  The rectangles are BokehJS BoxAnnotations added by the page, changed in place
+  rather than rebuilt, so remembering never re-renders the plot.
+  `src/qaview/remember.py`.
 - **Sizing:** the page measures the plot cell (ResizeObserver) and asks the server
   for figures at that size; `fit_main` keeps square pixels server-side as now.
   Resizing re-requests after a 300 ms pause.
@@ -702,7 +747,14 @@ FastAPI + uvicorn, one process, reached by ssh port-forwarding.
 | `GET /api/events` | server-sent events: queue progress and row updates |
 | `GET /api/loci/{id}/view?w=&h=&...` | Bokeh `json_item` of the report layout for that size and those settings, plus the score summary |
 
-Launch: `venv/bin/python -m qaview <project.toml> [--port 5006]`.
+Launch: `venv/bin/python -m qaview [project.toml] [--port 5006]`. Without a
+project file the page starts on a form in the left sidebar: the project file's
+path on the server (a browser upload would break the paths inside it, which are
+relative to the file), with the last ten projects opened one click away
+(`~/.config/qaview/recent.json`). "change" beside the project name brings the
+form back; opening another project stops the current one's recruitment and
+scoring and reloads the page onto the new one (`POST /api/open`; everything
+that belongs to a project lives in a `Session` replaced whole).
 
 ### 13.6 Reuse and removal
 
