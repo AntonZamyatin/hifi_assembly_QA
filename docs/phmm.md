@@ -94,6 +94,7 @@ deletion loop for exactly that reason.
 
 ```
 src/qamodel/
+  estimate.py      gap parameters + QV calibration from a BAM            [G, done]
   exposure.py      lambda from genome-wide depth; L_eff; exposure term   [I, done]
   score.py         per-read ratio, clamp at +/-C, Delta S; score_locus   [I, done]
   phmm/
@@ -259,7 +260,7 @@ Realistic simulation (pbsim3 HiFi profiles) belongs after this, to probe
 misspecification. Sampling from the model itself comes first because only there
 is the truth exact.
 
-### Stage F — Fast engines and origin enumeration (L) — F1, F2, F4 DONE
+### Stage F — Fast engines and origin enumeration (L) — DONE
 
 The risky stage. Origin candidates from a per-locus minimap2 run against the
 extracted unit (`-N 200 -p 0.05`). Banded DP anchored on each candidate's
@@ -313,18 +314,92 @@ give `log 3` through the full placement-to-window path.
   half belongs to F3, with real aligner placements.
 - Band-edge mass below a stated threshold; throughput recorded. **Met.**
 
-### Stage G — Parameter estimation (M)
+### Stage G — Parameter estimation (M) — DONE
 
-Method of moments from CIGARs of high-identity primary alignments in undisputed
-sequence: gap opens and extends give `(δ_I, δ_D, γ_I, γ_D)`. Fitted once, held
-fixed across both candidates (§12.5). `τ` cancels under context-independence.
+`qamodel/estimate.py`. Transition counting along alignment paths, which is the
+maximum-likelihood estimate when the path is known:
+
+    delta_I = n(M->I) / n(M->.)      gamma_I = n(I->I) / n(I->.)
+    delta_D = n(M->D) / n(M->.)      gamma_D = n(D->D) / n(D->.)
+
+Fitted on 994,975 primary HiFi alignments (15.3 Gb aligned) drawn from 39,799
+disjoint 100 kb tiles of `hg002.curated` — two thirds of the assembly — in about
+8 minutes. Provenance in `docs/phmm_params_hg002.json`.
+
+| | placeholder | fitted | jackknife | |
+|---|---|---|---|---|
+| `delta_i` | 1e-4 | **4.5e-4** | ±7.8e-7 | insertions open 4.5x more often |
+| `delta_d` | 1e-4 | **8.4e-4** | ±1.3e-6 | deletions 1.9x more often than insertions |
+| `gamma_i` | 0.3 | **0.047** | ±3e-4 | mean run 1.05, not 1.43 |
+| `gamma_d` | 0.3 | **0.065** | ±3e-4 | mean run 1.07 |
+
+**The error bar is a jackknife, not a binomial.** Deleting one tile at a time
+and re-estimating gives 4.6x the binomial standard error, because gap rates vary
+with sequence context and reads in one tile share it; the binomial number treats
+every aligned base as an independent draw and is simply wrong about this data.
+The gap between the two *is* the measurement of how clustered the data are.
+
+Tiles are drawn without replacement for the same reason: overlapping windows
+would count a read in the intersection twice and would break the jackknife's
+assumption that blocks are independent.
+
+**Effect on the HG002 seed locus:** Delta S goes from -271.95 to **-379.27**
+nats, same direction, 40% larger. Short gaps that are expensive to extend charge
+far more for a 6 bp microsatellite difference than `gamma = 0.3` did.
 
 *Accepts when:*
-- **Round trip.** Parameters re-estimated from reads sampled by stage D recover
-  the generating values within Monte Carlo error. This is an identifiability
-  check and is only possible because the sampler exists.
-- No per-candidate fitting path exists in the API — the constraint is structural,
-  not a convention.
+- **Round trip. Met.** Parameters re-estimated from reads sampled by stage D
+  recover the generating values within 4 SE on all four
+  (`tests/test_estimate.py`).
+- **No per-candidate fitting path. Met.** `scan_bam` takes one BAM and the
+  result is a single `PhmmParams`; fitting on `hifiasm_hic` instead moves
+  `delta_i` by 5%, which is the scale of the arbitrariness in that choice —
+  60x the jackknife error, so the choice of reference, not the sample size, is
+  what limits this estimate.
+
+Three findings that changed how the fit is done, or that stage E should pick up:
+
+**MAPQ is not a uniqueness filter on a diploid assembly.** A read from a
+homozygous region maps equally well to both haplotypes and scores MAPQ 0 however
+perfect its alignment, so `min_mapq=60` keeps under 10% of primaries — exactly
+the haplotype-divergent ones. The gap estimates agree within ~3 SE either way,
+so the default is `min_mapq=0` and the identity, clip and `SA` filters do the
+work. The *mismatch* rate does differ (3.2e-4 against 1.6e-4), which is why the
+emission side is measured separately rather than inferred.
+
+**Long runs are not this model's gaps.** A 138 bp deletion is a variant or an
+assembly error; including it drives `gamma_d` towards 1. Runs over `max_gap`
+(20) split the path rather than dropping the read, which would bias the other
+way — reads crossing hard sequence carry most of the short gaps too. This fires
+on ~0.5% of reads.
+
+**Gaps are 4.5x enriched in homopolymers** (4.14e-3 per base inside runs of >= 4,
+against 9.21e-4 elsewhere), measured by `calibrate_bam`. This is the size of
+what context-dependent gaps would buy, and the reason the seed locus's
+microsatellite verdict is the least trustworthy magnitude in the model.
+
+**Emission calibration is a separate, open question.** `calibrate_bam` also
+compares read to reference base by base, tallying by reported quality. Reported
+qualities are pessimistic throughout, and most so where it matters:
+
+| reported | bases | implied eps | observed |
+|---|---|---|---|
+| Q40 | 261M | 1.0e-4 | 1.7e-5 (Q47.6) |
+| Q35 | 22M | 3.2e-4 | 2.0e-4 (Q37.1) |
+| Q27 | 7.6M | 2.0e-3 | 4.4e-4 (Q33.6) |
+| Q10 | 3.4M | 1.0e-1 | 3.0e-3 (Q25.2) |
+
+`eps_from_phred` takes the reported value at face value, so every substitution
+currently costs `log(3(1-eps)/eps)` = 10.3 nats where the data say 11.9. That is
+a ~15% under-charge on substitution-discriminated loci, and a much larger one on
+low-quality bases, which the model currently treats as nearly uninformative.
+
+Recalibrating is *not* done here, because the measurement is confounded in both
+directions and the confounders need separating first: `curated` was built from
+these same reads, so a read error that reached the consensus reads as a match
+(deflating observed eps), while residual assembly errors and haplotype
+mismapping read as read errors (inflating it). A clean estimate wants either a
+held-out assembly or variant-masked regions.
 
 Baum–Welch is the better estimator but waits until context dependence makes `Z`
 matter.
@@ -370,8 +445,11 @@ Regression test: `tests/test_score_hg002.py`.
 **Caveat on magnitude.** The event is a microsatellite length difference — the
 context where HiFi indel error concentrates and where context-independent gap
 parameters are least right. The *direction* rests on 18 spanning reads against
-none; the *size* depends on uncalibrated placeholders. Stage G, and then the
-deferred context-dependent gaps, are what make the magnitude interpretable.
+none. The *size* is now -379.59 under the stage-G estimates rather than -271.95
+under the placeholders, and it stays the model's least trustworthy number:
+stage G measured gaps to be 4.5x more frequent inside homopolymers than outside,
+so one global `gamma` is exactly wrong here (4.5x, measured). The deferred context-dependent gaps
+are what would make this magnitude interpretable.
 
 ## Deferred
 

@@ -68,9 +68,22 @@ class LogTrans:
 class PhmmParams:
     """Gap and termination probabilities, shared by both candidates.
 
-    The defaults are placeholders of the right order for HiFi, to be replaced by
-    the estimates of stage G.  They must never be fitted per candidate: doing so
-    lets a poorer assembly compensate with looser error rates (model.tex §12.5).
+    The defaults are the stage-G estimates: `qamodel.estimate` over 994,975
+    primary HiFi alignments (15.3 Gb aligned) from 39,799 disjoint 100 kb tiles
+    of `hg002.curated`, two thirds of the assembly.  Rounded to two figures,
+    which is where the delete-one-tile jackknife puts the uncertainty
+    (delta_i +/- 7.8e-7, gamma_i +/- 3e-4) -- 4.6x the binomial standard error,
+    because gap rates vary with sequence context and reads in one tile share it.
+
+    They overturn the placeholders in both directions: gaps open ~4x (insertion)
+    and ~8x (deletion) more often than assumed, and they are far shorter --
+    mean run 1.05 against the 1.43 that gamma = 0.3 implies.  Deletions open
+    ~1.9x more often than insertions, so the two are no longer symmetric.
+
+    They must never be fitted per candidate: doing so lets a poorer assembly
+    compensate with looser error rates (model.tex §12.5).  Estimating from
+    `hifiasm_hic` instead moves delta_i by 5%, which is the scale of the
+    arbitrariness in the choice of reference.
 
     `tau` defaults to zero, i.e. read length is conditioned on rather than
     generated.  A HiFi read stops because the size-selected SMRTbell insert ran
@@ -91,10 +104,10 @@ class PhmmParams:
     candidates disagreeing by 100 indels, so it is common mode and cancels.
     """
 
-    delta_i: float = 1e-4       # gap open, insertion
-    delta_d: float = 1e-4       # gap open, deletion
-    gamma_i: float = 0.3        # gap extend, insertion
-    gamma_d: float = 0.3        # gap extend, deletion
+    delta_i: float = 4.5e-4     # gap open, insertion
+    delta_d: float = 8.4e-4     # gap open, deletion
+    gamma_i: float = 0.047      # gap extend, insertion
+    gamma_d: float = 0.065      # gap extend, deletion
     tau: float = 0.0            # termination; 0 = condition on read length
 
     def __post_init__(self) -> None:
