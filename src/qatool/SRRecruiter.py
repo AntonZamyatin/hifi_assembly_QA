@@ -86,6 +86,10 @@ class Recruiter:
                                             "start", "end", "pid", "plen", "ed"])
         self._sealed = {}
         self._common_cache = {}
+        # (assembly, contig) -> extents expand_segments_to_reads has scanned. A read
+        # contained in one was judged then: it joined seen_reads or failed the
+        # static pid/plen filter, so later scans need not look at it again.
+        self._scanned: Dict[Tuple[str, str], List[Tuple[int, int]]] = {}
 
     def _concat_seqs_for_segments(self, sc_sorted: List[Segment], assembly: str) -> str:
         fa = self.fastas[assembly]
@@ -399,18 +403,31 @@ class Recruiter:
             Set of read names
         """
         reads: Set[str] = set()
+        scanned_now: List[Tuple[Tuple[str, str], Tuple[int, int]]] = []
         for seg in self.sc:
+            key = (seg.assembly, seg.contig)
+            done = self._scanned.get(key, [])
+            if any(s <= seg.start and seg.end <= e for s, e in done):
+                continue                    # nothing in here is new
             for aln in self.bams[seg.assembly].fetch(seg.contig, seg.start, seg.end):
                 assert(not aln.is_unmapped)
-                if aln.reference_start < seg.start or aln.reference_end > seg.end:
+                a_start, a_end = aln.reference_start, aln.reference_end
+                if a_start < seg.start or a_end > seg.end:
                     continue
                 if aln.query_name in self.seen_reads:
                     continue
+                if any(s <= a_start and a_end <= e for s, e in done):
+                    continue                # judged when that extent was scanned
                 #pid = calculate_pid(aln)
                 soft_left, soft_right, hard_left, hard_right, q_aln_len, q_len, plen, pid, _ = cigar_stats(aln)
                 if pid < self.pid_threshold or plen is None or plen < self.plen_threshold:
                     continue
                 reads.add(aln.query_name)
+            scanned_now.append((key, (seg.start, seg.end)))
+        # Recorded only after the whole pass: the caller adds `reads` to
+        # seen_reads, which is what makes a scanned extent safe to skip.
+        for key, extent in scanned_now:
+            self._scanned.setdefault(key, []).append(extent)
         return reads
 
     def expand_reads_to_segments(self, reads: Set[str]):

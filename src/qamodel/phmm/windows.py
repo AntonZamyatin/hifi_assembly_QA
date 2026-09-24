@@ -88,6 +88,27 @@ class WindowSet:
     lost: int                   # placements whose starts fell off a clipped window
 
 
+def _home(p, segments):
+    """The segment containing placement `p` (or None), and whether `p` touches any."""
+    touches = False
+    for s in segments:
+        if s.contig != p.contig or p.end <= s.start or p.start >= s.end:
+            continue
+        touches = True
+        if s.start <= p.start and p.end <= s.end:
+            return s, True
+    return None, touches
+
+
+def straddles(placements, segments) -> bool:
+    """Whether any placement crosses a segment boundary -- build_windows' drop rule."""
+    for p in placements:
+        home, touches = _home(p, segments)
+        if home is None and touches:
+            return True
+    return False
+
+
 def build_windows(placements, segments, read_len: int, fasta, *,
                   k: int = 20, extra: int = 50, width: int = 100) -> WindowSet:
     """Windows for one read against one candidate.
@@ -101,14 +122,7 @@ def build_windows(placements, segments, read_len: int, fasta, *,
     groups: dict[tuple, list[Placement]] = {}
     straddles, outside = False, 0
     for p in placements:
-        home, touches = None, False
-        for s in segments:
-            if s.contig != p.contig or p.end <= s.start or p.start >= s.end:
-                continue
-            touches = True
-            if s.start <= p.start and p.end <= s.end:
-                home = s
-                break
+        home, touches = _home(p, segments)
         if home is None:
             if touches:
                 straddles = True

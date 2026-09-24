@@ -116,10 +116,67 @@ def likelihood_report(db_path: str, read_classes: dict,
     print()
 
 
+# Bump when a change to the scoring code alters results, so cached scores from
+# before it are not reused.
+SCORE_CACHE_VERSION = 1
+
+
+def locus_id(segments, read_names, asm1: str, asm2: str) -> str:
+    """Content id of a recruited locus: its segments and read set, not the seed.
+
+    Seeds inside one repeat family usually recruit the same locus; they share
+    this id, so a batch can report the locus once and score it once.
+    """
+    import hashlib
+    import json
+
+    segs = sorted((s.assembly, s.contig, int(s.start), int(s.end)) for s in segments)
+    payload = json.dumps({"asm": [asm1, asm2], "segments": segs,
+                          "reads": sorted(read_names)})
+    return hashlib.sha1(payload.encode()).hexdigest()[:16]
+
+
+def _score_key(lid: str, asm1: str, asm2: str, db_path: str, bams: dict, fastas: dict,
+               genome_fasta: str, library_assembly: str, C: float, kwargs: dict) -> str:
+    """locus_id plus everything else that changes a LocusScore."""
+    import hashlib
+    import inspect
+    import json
+    from dataclasses import asdict
+
+    from qamodel.phmm import PhmmParams
+    from qamodel.score import score_locus
+
+    sig = inspect.signature(score_locus).parameters
+    settings = {n: kwargs.get(n, sig[n].default) for n in ("k", "extra", "width", "prune")}
+    payload = json.dumps({
+        "version": SCORE_CACHE_VERSION, "locus": lid, "asm": [asm1, asm2],
+        "db": db_path, "bams": [bams[asm1], bams[asm2]], "fastas": [fastas[asm1], fastas[asm2]],
+        "genome_fasta": genome_fasta, "library_assembly": library_assembly, "C": C,
+        "phmm": asdict(kwargs.get("params") or PhmmParams()),
+        "qt": repr(kwargs.get("qt")), **settings,
+    }, sort_keys=True)
+    return hashlib.sha1(payload.encode()).hexdigest()[:16]
+
+
+def score_cache_path(cache_dir: str, lid: str, asm1: str, asm2: str, *, db_path: str,
+                     bams: dict, fastas: dict, genome_fasta: str, library_assembly: str,
+                     C: float = 200.0, **kwargs) -> str:
+    """Where phmm_likelihood_report(cache_dir=...) keeps the score of locus `lid`.
+
+    Lets a caller see whether a locus is already scored without scoring it.
+    """
+    import os
+
+    key = _score_key(lid, asm1, asm2, db_path, bams, fastas, genome_fasta,
+                     library_assembly, C, kwargs)
+    return os.path.join(cache_dir, f"score_{key}.pkl")
+
+
 def phmm_likelihood_report(segments, read_names, asm1: str, asm2: str, *,
                            db_path: str, bams: dict, fastas: dict,
                            genome_fasta: str, library_assembly: str,
-                           C: float = 200.0, **kwargs):
+                           C: float = 200.0, cache_dir: str | None = None, **kwargs):
     """Pair-HMM locus score: emission, exposure and Delta S, printed and returned.
 
     The replacement for `likelihood_report` above, which scores reads by
@@ -132,12 +189,43 @@ def phmm_likelihood_report(segments, read_names, asm1: str, asm2: str, *,
     strand, from the primary reads aligned to `library_assembly` over the diploid
     length of `genome_fasta`. Use the same pair for every locus you compare --
     lambda must not depend on the locus under test.
+
+    With `cache_dir`, the result is stored under a key made from the locus
+    content (`locus_id`) and every setting that changes the score, and reused
+    when another seed recruits the same locus. A lock serialises concurrent runs
+    on one locus, so a second notebook waits for the first instead of repeating it.
     """
     from qamodel.exposure import fasta_length, library_stats
     from qamodel.score import score_locus
 
-    lib = library_stats(db_path, library_assembly, fasta_length(genome_fasta))
-    result = score_locus(read_names, segments, asm1, asm2, db_path=db_path,
-                         bams=bams, fastas=fastas, library=lib, C=C, **kwargs)
+    def compute():
+        lib = library_stats(db_path, library_assembly, fasta_length(genome_fasta))
+        return score_locus(read_names, segments, asm1, asm2, db_path=db_path,
+                           bams=bams, fastas=fastas, library=lib, C=C, **kwargs)
+
+    if cache_dir is None:
+        result = compute()
+    else:
+        import fcntl
+        import os
+        import pickle
+
+        lid = locus_id(segments, read_names, asm1, asm2)
+        path = score_cache_path(cache_dir, lid, asm1, asm2, db_path=db_path, bams=bams,
+                                fastas=fastas, genome_fasta=genome_fasta,
+                                library_assembly=library_assembly, C=C, **kwargs)
+        os.makedirs(cache_dir, exist_ok=True)
+        with open(path + ".lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if os.path.exists(path):
+                with open(path, "rb") as fh:
+                    result = pickle.load(fh)
+                print(f"[cache] locus {lid} already scored: {os.path.basename(path)}")
+            else:
+                result = compute()
+                tmp = f"{path}.{os.getpid()}.tmp"
+                with open(tmp, "wb") as fh:
+                    pickle.dump(result, fh)
+                os.replace(tmp, path)
     print(result.summary())
     return result

@@ -61,6 +61,21 @@ def main():
     check(abs(r.at(50) - r.at(1000)) < 1e-6,
           "no read reaches the clamp here, so the verdict must not depend on C")
 
+    # The speed-ups must not change the answer. Workers split the reads, so a
+    # parallel run is the serial one reassembled; pruning skips placements only
+    # after the boundary rule has seen all of them, so the read set is unchanged.
+    from qamodel import fasta_length, library_stats, score_locus
+
+    lib = library_stats(DB, "curated", fasta_length(FAS["curated"]))
+    kw = dict(db_path=DB, bams=BAMS, fastas=FAS, library=lib)
+    serial = score_locus(d["reads"], d["segments"], *ASM, workers=1, **kw)
+    check(serial.reads == r.reads, "a parallel run must equal the serial one read for read")
+    full = score_locus(d["reads"], d["segments"], *ASM, prune=None, workers=4, **kw)
+    check([x.name for x in full.reads] == [x.name for x in r.reads]
+          and full.dropped == r.dropped, "pruning must not change which reads are scored")
+    drift = max(abs(a.ratio - b.ratio) for a, b in zip(full.reads, r.reads))
+    check(drift < 1e-6, f"pruning moved a read's log-ratio by {drift:.2e}")
+
     print(f"all checks passed" if not _failures else f"{len(_failures)} FAILURE(S)")
     return 1 if _failures else 0
 
