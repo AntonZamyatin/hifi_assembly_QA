@@ -113,6 +113,8 @@ def test_hover_tools_wired(tmp):
     check(any("read_name" in f for f in fields), "read tooltip must name the read")
     check(any("pid1" in f for f in fields) and any("pid2" in f for f in fields),
           "read tooltip must show pid on both assemblies")
+    check(main_hovers[0] not in (p["main"].toolbar.active_inspect or []),
+          "the read tooltip starts switched off (it covered the shift+drag rectangle)")
 
     for name in ("cov_top", "cov_right"):
         hovers = [t for t in p[name].tools if isinstance(t, HoverTool)]

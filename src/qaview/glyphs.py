@@ -648,6 +648,9 @@ def report_layout(rd, color_by: str = "class", visible_layers=None,
     )
     for p in (main, cov_top, cov_right):
         p.add_tools(crosshair)
+    # The read tooltip starts switched off: it covered the shift+drag rectangle.
+    # It stays in the dotplot's toolbar, one click away.
+    main.toolbar.active_inspect = [crosshair]
 
     # Wheel zoom on the dotplot only, so scrolling a marginal cannot desync the axes.
     # maintain_focus=False: once one edge reaches its bound, zooming out keeps
@@ -679,6 +682,12 @@ def report_layout(rd, color_by: str = "class", visible_layers=None,
          [None,                                       xbar,    None]],
         toolbar_location=None, merge_tools=False,
     )
+    # The dotplot's toolbar is shown at the grid's right edge, past the right
+    # marginal, so the marginal sits flush against the dotplot. It is the same
+    # Toolbar model, so its tools still act on the dotplot alone.
+    main.toolbar_location = None
+    grid.toolbar = main.toolbar
+    grid.toolbar_location = "right"
     return column(readout, status, grid)
 
 
