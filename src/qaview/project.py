@@ -25,10 +25,46 @@ RECRUITMENT_DEFAULTS = dict(
     ext_rounds=100, max_rounds=100,
 )
 RESOURCE_DEFAULTS = dict(recruit_workers=32, score_workers=32)
+# What each recruitment parameter may be: (type, lowest, highest).
+RECRUITMENT_RANGES = dict(
+    pid_threshold=(float, 0.0, 1.0), plen_threshold=(float, 0.0, 1.0),
+    best_pid_delta=(float, 0.0, 1.0), merge_gap=(int, 0, 10_000_000),
+    extension_window=(int, 1, 100_000), ext_max=(int, 0, 100_000_000),
+    ext_rounds=(int, 0, 10_000), max_rounds=(int, 1, 10_000),
+)
 
 
 class ProjectError(ValueError):
     """The project file is malformed or names files that do not exist."""
+
+
+def validate_recruitment(params: dict) -> dict:
+    """Recruitment parameters checked and coerced to their types; ValueError if not.
+
+    Only the keys given are returned, so this checks partial overrides as well.
+    """
+    out, problems = {}, []
+    for k, v in params.items():
+        if k not in RECRUITMENT_RANGES:
+            problems.append(f"unknown parameter {k}")
+            continue
+        kind, lo, hi = RECRUITMENT_RANGES[k]
+        try:
+            x = float(v)
+            if kind is int:
+                if x != int(x):
+                    raise ValueError
+                x = int(x)
+        except (TypeError, ValueError):
+            problems.append(f"{k} must be {'a whole number' if kind is int else 'a number'}: {v!r}")
+            continue
+        if not lo <= x <= hi:
+            problems.append(f"{k} must be between {lo:,} and {hi:,}: {v!r}")
+            continue
+        out[k] = x
+    if problems:
+        raise ValueError("; ".join(problems))
+    return out
 
 
 @dataclass(frozen=True)

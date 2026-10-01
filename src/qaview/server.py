@@ -27,7 +27,7 @@ from fastapi.staticfiles import StaticFiles
 
 from qaview.glyphs import BAR_SIZE, MARGIN_SIZE, RATIO_NEG, RATIO_POS, report_layout
 from qaview.pipeline import Pipeline
-from qaview.project import Project, ProjectError, load_project
+from qaview.project import RECRUITMENT_RANGES, Project, ProjectError, load_project
 from qaview.region import (LAYER_COMMON, LAYER_OTHER, LAYER_SUPPLEMENTARY, LAYER_SUPPORT,
                            RegionData)
 
@@ -41,6 +41,8 @@ LAYERS = {"common": LAYER_COMMON, "unclassified": LAYER_OTHER,
 # status lines above the grid and Bokeh's toolbar beside the dotplot.
 PAD_W, PAD_H = 40, 64
 SMALL_MARGIN, SMALL_CELL = 120, 700
+TINY_MARGIN, TINY_CELL = 60, 450
+MIN_CELL = 160              # the smallest cell a view is made for (static/app.js)
 
 
 def _hex(rgb) -> str:
@@ -208,6 +210,8 @@ def create_app(project: Project | None = None, pipeline: Pipeline | None = None,
             "asm1": vars(p.asm1), "asm2": vars(p.asm2), "db": p.db,
             "library_assembly": p.library_assembly, "seed_sources": p.seed_sources,
             "recruitment": p.recruitment, "resources": p.resources,
+            "recruitment_ranges": {k: [t.__name__, lo, hi]
+                                   for k, (t, lo, hi) in RECRUITMENT_RANGES.items()},
             "output_dir": p.output_dir,
             "colors": {"ratio_pos": _hex(RATIO_POS), "ratio_neg": _hex(RATIO_NEG)},
             "layers": list(LAYERS),
@@ -255,7 +259,7 @@ def create_app(project: Project | None = None, pipeline: Pipeline | None = None,
                     yield ": keep-alive\n\n"
                     continue
                 seq = new
-                payload = {"progress": pipe.progress(), "rows": rows,
+                payload = {"seq": new, "progress": pipe.progress(), "rows": rows,
                            "failed_seeds": pipe.failed_seeds()}
                 yield f"event: update\ndata: {json.dumps(payload)}\n\n"
         return StreamingResponse(stream(), media_type="text/event-stream",
@@ -332,6 +336,30 @@ def create_app(project: Project | None = None, pipeline: Pipeline | None = None,
             raise HTTPException(404, f"no remembered alignment {ident}") from exc
         return {"ok": True}
 
+    # ---- re-recruitment ----------------------------------------------------------------
+
+    @app.get("/api/loci/{lid}/seeds")
+    def locus_seeds(lid: str):
+        """The locus's seeds, each with the recruitment parameters it was recruited with."""
+        s = cur()
+        try:
+            seeds = s.pipe.seed_info(lid)
+        except KeyError as exc:             # never was, or re-recruited away just now
+            raise HTTPException(404, f"no locus {lid}") from exc
+        return {"defaults": s.project.recruitment, "seeds": seeds}
+
+    @app.post("/api/recruit")
+    def rerecruit(seeds: list[str] = Body(...), params: dict = Body(...)):
+        """Recruit these seeds again with `params`; the result arrives as row updates."""
+        if not seeds:
+            raise HTTPException(400, "no seeds given")
+        try:
+            return cur().pipe.rerecruit(seeds, params)
+        except KeyError as exc:
+            raise HTTPException(400, f"unknown seeds: {exc.args[0]}") from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
     @app.post("/api/loci/{lid}/prioritize")
     def prioritize(lid: str):
         pipe = cur().pipe
@@ -394,7 +422,7 @@ def create_app(project: Project | None = None, pipeline: Pipeline | None = None,
         return out
 
     @app.get("/api/loci/{lid}/view")
-    def view(lid: str, w: int = Query(900, ge=300), h: int = Query(700, ge=300),
+    def view(lid: str, w: int = Query(900, ge=MIN_CELL), h: int = Query(700, ge=MIN_CELL),
              pid: float = 0.997, plen: float = 0.999,
              best_pid_delta: float = 0.001, pid_tie_eps: float = 0.0001,
              binsize: int = 0, color_by: str = "log-ratio", C: float = 200.0,
@@ -412,7 +440,9 @@ def create_app(project: Project | None = None, pipeline: Pipeline | None = None,
         score = loc.score
         ratios = {r.name: r.ratio for r in score.reads} if score is not None else None
         dropped = set(score.dropped) if score is not None else None
-        margin = MARGIN_SIZE if min(w, h) >= SMALL_CELL else SMALL_MARGIN
+        small = min(w, h)
+        margin = (MARGIN_SIZE if small >= SMALL_CELL else
+                  SMALL_MARGIN if small >= TINY_CELL else TINY_MARGIN)
         visible = {LAYERS[x] for x in layers.split(",") if x in LAYERS}
         layout = report_layout(
             rd, color_by=color_by, visible_layers=visible, ratios=ratios, dropped=dropped,

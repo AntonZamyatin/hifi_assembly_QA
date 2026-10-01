@@ -22,6 +22,10 @@ const state = {
   boxes: new Map(),         // id -> its BoxAnnotation on the current dotplot
   boxPlot: null,
   views: [],
+  recruitSeeds: [],         // the open locus's seeds and their recruitment parameters
+  recruitSeedsOf: null,
+  recruitWatch: new Map(),  // seed being re-recruited -> {from: locus id, seq}
+  seq: -1,                  // the server state the rows reflect
 };
 
 // ---- formatting --------------------------------------------------------------------
@@ -55,6 +59,7 @@ function dsColor(x) {
 }
 
 function statusText(r) {
+  if (r.recruiting && r.recruiting.length) return "recruiting";
   if (r.status === "scoring") return `${Math.round(r.progress * 100)}%`;
   return r.status === "scored" ? "done" : r.status;
 }
@@ -67,11 +72,10 @@ async function loadProject(p) {
   $("#project-name").textContent = p.name;
   $("#project-pair").textContent = `${p.asm1.name} vs ${p.asm2.name}  ·  ΔS > 0 favours ${p.asm1.name}`;
 
-  const rec = $("#recruitment");
-  rec.replaceChildren();
-  for (const [k, v] of Object.entries({ ...p.recruitment, ...p.resources })) {
-    rec.append(el("dt", k), el("dd", String(v)));
-  }
+  buildRecruitForm(p);
+  const res = $("#resources");
+  res.replaceChildren();
+  for (const [k, v] of Object.entries(p.resources)) res.append(el("dt", k), el("dd", String(v)));
   const files = $("#files");
   files.replaceChildren();
   const f = {
@@ -103,6 +107,7 @@ function el(tag, text) {
 async function loadLoci() {
   const d = await (await fetch("/api/loci")).json();
   for (const r of d.rows) state.rows.set(r.id, r);
+  state.seq = d.seq;
   showProgress(d.progress, d.failed_seeds);
   renderTable();
 }
@@ -168,8 +173,14 @@ function renderTable() {
                  `${names[1]}: ${r.segments[names[1]]} segments, ${r.span[names[1]].toLocaleString()} bp`;
     const seeds = el("td", r.seeds[0] + (r.seeds.length > 1 ? `  +${r.seeds.length - 1}` : ""));
     seeds.title = r.seeds.join("\n");
-    const st = el("td", statusText(r)); st.className = `status-${r.status}`;
-    if (r.error) st.title = r.error;
+    if (r.custom && r.custom.length) {
+      const own = el("span", "*"); own.className = "own";
+      seeds.append(own);
+      seeds.title += `\n\nrecruited with parameters of its own: ${r.custom.join(", ")}`;
+    }
+    const st = el("td", statusText(r));
+    st.className = r.recruiting && r.recruiting.length ? "status-scoring" : `status-${r.status}`;
+    if (r.error || r.recruit_error) st.title = [r.error, r.recruit_error].filter(Boolean).join("\n");
     const star = el("td"); star.className = "star";
     const sb = el("button", isStarred(r) ? "\u2605" : "\u2606");
     sb.className = isStarred(r) ? "on" : "";
@@ -182,17 +193,29 @@ function renderTable() {
 
 function onUpdate(d) {
   showProgress(d.progress, d.failed_seeds);
-  let reload = false;
+  let reload = false, gone = null, seedsChanged = false;
+  if (d.seq !== undefined) state.seq = Math.max(state.seq, d.seq);
   for (const r of d.rows) {
+    if (r.removed) {                         // its seeds were re-recruited into other loci
+      state.rows.delete(r.id);
+      if (r.id === state.current) gone = r;
+      continue;
+    }
     const old = state.rows.get(r.id);
     if (r.id === state.current && old && old.status !== "scored" && r.status === "scored") reload = true;
+    if (r.id === state.current && old &&
+        String([old.seeds, old.recruiting]) !== String([r.seeds, r.recruiting])) seedsChanged = true;
     state.rows.set(r.id, r);
   }
   renderTable();
+  if (checkRecruitWatch(gone)) return;       // it opened another locus
+  if (seedsChanged) loadRecruitSeeds(state.current);
   if (reload) loadView();
 }
 
 // ---- controls ---------------------------------------------------------------------
+
+const MIN_CELL = 160;                              // the server's floor for w and h
 
 function params() {
   const cell = $("#plot-cell");
@@ -201,7 +224,7 @@ function params() {
   const h = cell.clientHeight - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom);
   const layers = [...document.querySelectorAll("#layers input:checked")].map((b) => b.value);
   return new URLSearchParams({
-    w: Math.max(300, Math.floor(w)), h: Math.max(300, Math.floor(h)),
+    w: Math.max(MIN_CELL, Math.floor(w)), h: Math.max(MIN_CELL, Math.floor(h)),
     pid: $("#pid").value, plen: $("#plen").value,
     best_pid_delta: $("#best_pid_delta").value, pid_tie_eps: $("#pid_tie_eps").value,
     binsize: $("#binsize").value || 0,
@@ -232,7 +255,8 @@ function clearPlot() {
   $("#plot").replaceChildren();
 }
 
-async function openLocus(id) {
+async function openLocus(id, keepMsg = false) {
+  if (!keepMsg) recruitMsg("");
   state.current = id;
   renderTable();
   fetch(`/api/loci/${id}/prioritize`, { method: "POST" });
@@ -245,6 +269,7 @@ async function openLocus(id) {
   clearPlot();
   state.rects = [];
   loadRects(id);
+  loadRecruitSeeds(id);
   loadView();
 }
 
@@ -407,6 +432,8 @@ function renderAlignment(a, saved = null) {
   strip.scrollLeft = k > 0 ? Math.max(0, grid.x0 + k * grid.cw - 24) : 0;
   if (a.reads) renderPiles(a.reads, grid);
   else clearPiles();
+  const top = pre.getBoundingClientRect().top - strip.getBoundingClientRect().top + strip.scrollTop;
+  strip.scrollTop = Math.max(0, top - (strip.clientHeight - pre.offsetHeight) / 2);
   $("#align-legend").hidden = false;
 }
 
@@ -628,9 +655,13 @@ function wireRects() {
     tip.textContent = `remembered ${r.created.replace("T", " ")}` + (r.note ? ` \u00b7 ${r.note}` : "") +
                       "  \u2014 click to open";
     const c = cell.getBoundingClientRect();
-    tip.style.left = `${e.clientX - c.left + 14}px`;
-    tip.style.top = `${e.clientY - c.top + 14}px`;
     tip.hidden = false;
+    // Beside the pointer, flipped to the other side near the cell's right or bottom edge.
+    let x = e.clientX - c.left + 14, y = e.clientY - c.top + 14;
+    if (x + tip.offsetWidth > c.width) x = Math.max(0, e.clientX - c.left - 14 - tip.offsetWidth);
+    if (y + tip.offsetHeight > c.height) y = Math.max(0, e.clientY - c.top - 14 - tip.offsetHeight);
+    tip.style.left = `${x}px`;
+    tip.style.top = `${y}px`;
   });
   cell.addEventListener("pointerleave", () => { tip.hidden = true; });
 }
@@ -742,6 +773,8 @@ function wire() {
   wireRectAlign();
   $("#reads-toggle").addEventListener("click", toggleReads);
   $("#remember-toggle").addEventListener("click", toggleRemember);
+  $("#recruit-run").addEventListener("click", runRecruit);
+  $("#recruit-reset").addEventListener("click", () => fillRecruitForm(state.project.recruitment));
   wireRects();
   for (const b of document.querySelectorAll(".collapse")) {
     b.addEventListener("click", () => {
@@ -759,6 +792,184 @@ function wire() {
   const es = new EventSource("/api/events");
   es.addEventListener("update", (e) => onUpdate(JSON.parse(e.data)));
   es.addEventListener("progress", (e) => showProgress(JSON.parse(e.data), null));
+}
+
+// ---- recruitment -----------------------------------------------------------------
+
+// Arrow steps; any value in range can be typed.
+const REC_STEPS = { pid_threshold: 0.0005, plen_threshold: 0.0005, best_pid_delta: 0.0001,
+                    merge_gap: 1000, extension_window: 10, ext_max: 10000 };
+
+function buildRecruitForm(p) {
+  const form = $("#recruit-form");
+  form.replaceChildren();
+  for (const [k, [kind, lo, hi]] of Object.entries(p.recruitment_ranges)) {
+    const input = el("input");
+    input.type = "number"; input.dataset.key = k;
+    input.min = lo; input.max = hi;
+    input.step = REC_STEPS[k] || (kind === "int" ? 1 : "any");
+    input.value = p.recruitment[k];
+    input.addEventListener("input", markRecruitChanges);
+    const lab = el("label", k); lab.append(input);
+    form.append(lab);
+  }
+  markRecruitChanges();
+}
+
+function recruitInputs() {
+  return [...document.querySelectorAll("#recruit-form input")];
+}
+
+function fillRecruitForm(params) {
+  for (const i of recruitInputs()) i.value = params[i.dataset.key];
+  markRecruitChanges();
+}
+
+// A value unlike the project file's is marked, with the file's value in its tooltip.
+function markRecruitChanges() {
+  const def = state.project.recruitment;
+  for (const i of recruitInputs()) {
+    const d = def[i.dataset.key];
+    const changed = i.value !== "" && Number(i.value) !== d;
+    i.classList.toggle("changed", changed);
+    i.title = changed ? `project file: ${d}` : "as in the project file";
+  }
+}
+
+function recruitMsg(text, warn = false) {
+  const m = $("#recruit-msg");
+  m.replaceChildren();
+  if (text instanceof Node) m.append(text); else m.textContent = text || "";
+  m.classList.toggle("warn", warn);
+  m.hidden = !text;
+}
+
+function updateRecruitButtons() {
+  const open = !!state.current && state.recruitSeeds.length > 0;
+  const ticked = document.querySelectorAll("#recruit-seeds input:checked").length;
+  $("#recruit-run").disabled = !open || ticked === 0;
+  $("#recruit-reset").disabled = !open;
+}
+
+async function loadRecruitSeeds(id) {
+  // Reloading the same locus keeps what was ticked; another locus starts all ticked.
+  const same = state.recruitSeeds.length && state.recruitSeedsOf === id;
+  const unticked = new Set(same ? [...document.querySelectorAll("#recruit-seeds input:not(:checked)")]
+    .map((b) => b.value) : []);
+  state.recruitSeeds = [];
+  updateRecruitButtons();
+  let d;
+  try {
+    const res = await fetch(`/api/loci/${id}/seeds`);
+    if (!res.ok) return;
+    d = await res.json();
+  } catch (_) { return; }
+  if (id !== state.current) return;
+  state.recruitSeeds = d.seeds;
+  state.recruitSeedsOf = id;
+  const several = d.seeds.length > 1;
+  $("#recruit-seeds").replaceChildren(...d.seeds.map((s) => {
+    const lab = el("label");
+    const cb = el("input"); cb.type = "checkbox"; cb.checked = !unticked.has(s.name); cb.value = s.name;
+    cb.hidden = !several;                     // one seed: nothing to choose
+    cb.addEventListener("change", updateRecruitButtons);
+    const name = el("span", s.name); name.className = "seed-name";
+    const where = el("span", `${s.contig}:${(s.start + 1).toLocaleString()}-${s.end.toLocaleString()}`);
+    where.className = "muted";
+    lab.append(cb, name, where);
+    lab.title = `${s.assembly} ${s.contig}:${(s.start + 1).toLocaleString()}-${s.end.toLocaleString()}` +
+                ` (${(s.end - s.start).toLocaleString()} bp), from ${s.source}`;
+    const own = Object.entries(s.own);
+    if (s.pending) {
+      const b = el("span", "recruiting\u2026"); b.className = "badge busy"; lab.append(b);
+    } else if (own.length) {
+      const b = el("span", "own parameters"); b.className = "badge own";
+      b.title = own.map(([k, v]) => `${k} = ${v}`).join("\n");
+      lab.append(b);
+    }
+    return lab;
+  }));
+  const first = d.seeds[0];
+  fillRecruitForm(first.pending || first.params);
+  $("#recruit-hint").textContent = several
+    ? "Tick the seeds to recruit again; the values shown are the first seed's." : "";
+  $("#recruit-hint").hidden = !several;
+  updateRecruitButtons();
+}
+
+async function runRecruit() {
+  const seeds = [...document.querySelectorAll("#recruit-seeds input:checked")].map((b) => b.value);
+  const params = {};
+  for (const i of recruitInputs()) params[i.dataset.key] = i.value;
+  const from = state.current;
+  $("#recruit-run").disabled = true;
+  try {
+    const res = await fetch("/api/recruit", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ seeds, params }),
+    });
+    if (!res.ok) {
+      let msg = await res.text();
+      try { msg = JSON.parse(msg).detail || msg; } catch (_) { /* plain text */ }
+      recruitMsg(msg, true);
+      return;
+    }
+    const d = await res.json();
+    for (const s of d.queued) state.recruitWatch.set(s, { from, seq: d.seq });
+    const parts = [];
+    if (d.queued.length) parts.push(`Recruiting ${d.queued.join(", ")}\u2026`);
+    if (d.unchanged.length) parts.push(`Already recruited with these parameters: ${d.unchanged.join(", ")}.`);
+    recruitMsg(parts.join(" "));
+    // A recruitment already on disk can be through before this reply: settle now.
+    // The seed list follows the row updates (recruiting, then moved or back).
+    checkRecruitWatch(null);
+  } finally {
+    updateRecruitButtons();
+  }
+}
+
+// Seeds being re-recruited settle when no row lists them as recruiting: each is
+// then in the row of its new locus, or still in its old one (same result, or a
+// failure). Only rows at least as new as the request count: before that a row
+// shows the seed as it was. Returns true when it opened another locus.
+function checkRecruitWatch(gone) {
+  if (!state.recruitWatch.size) {
+    if (gone && gone.moved_to && state.rows.has(gone.moved_to)) { openLocus(gone.moved_to, true); return true; }
+    return false;
+  }
+  const busy = new Set(), home = new Map();
+  for (const r of state.rows.values()) {
+    for (const s of r.recruiting || []) busy.add(s);
+    for (const s of r.seeds) home.set(s, r);
+  }
+  const notes = [];
+  let open = null, warn = false;
+  for (const [seed, { from, seq }] of [...state.recruitWatch]) {
+    const r = home.get(seed);
+    if (state.seq < seq || busy.has(seed) || !r) continue;
+    state.recruitWatch.delete(seed);
+    if (r.id === from) {
+      const err = (r.recruit_error || "").startsWith(`${seed}:`) ? r.recruit_error : null;
+      if (err) { notes.push(`Re-recruiting failed: ${err}`); warn = true; }
+      else notes.push(`${seed}: the same locus as before.`);
+    } else {
+      notes.push(`${seed}: moved to another locus, ${r.reads.toLocaleString()} reads.`);
+      if (from === state.current && gone) open = open || r.id;
+      else if (from === state.current) {
+        const a = el("a", `open ${seed}'s locus`); a.href = "#";
+        a.addEventListener("click", (e) => { e.preventDefault(); openLocus(r.id); });
+        notes.push(a);
+      }
+    }
+  }
+  if (!open && gone && gone.moved_to && state.rows.has(gone.moved_to)) open = gone.moved_to;
+  if (notes.length) {
+    const frag = document.createDocumentFragment();
+    notes.forEach((n, i) => { if (i) frag.append(" "); frag.append(n); });
+    recruitMsg(frag, warn);
+  }
+  if (open) { openLocus(open, true); return true; }
+  return false;
 }
 
 // ---- stars -----------------------------------------------------------------------
@@ -786,7 +997,8 @@ async function toggleStar(id) {
 const WIDTHS_KEY = "qaview.sidebar-widths";
 
 function setWidth(side, px) {
-  const max = Math.max(260, window.innerWidth * 0.45);
+  // The CSS caps a sidebar at 40% / 30% of the window as well; keep the two in step.
+  const max = Math.max(200, window.innerWidth * (side === "left" ? 0.4 : 0.3));
   const w = Math.round(Math.min(max, Math.max(200, px)));
   $("#app").style.setProperty(`--${side}-w`, `${w}px`);
   return w;

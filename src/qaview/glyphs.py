@@ -31,6 +31,7 @@ SUPPLEMENTARY_COLOR = "#d62728"
 # Panel sizes in px.  The matplotlib report uses a 16in figure with 2in marginals and
 # 0.15in contig bars; at 100 px/in those become the values below.
 MAIN_WIDTH = 1100
+MIN_MAIN = 40               # fit_main's floor, per side
 MARGIN_SIZE = 200
 BAR_SIZE = 15
 
@@ -348,12 +349,16 @@ def coverage_figure(rd, assembly: str, orientation: str,
         cums.append(list(top))
 
     m = max(base) if base else 1.0
+    # Ticks by the marginal's size: a small one would otherwise run its labels together.
+    n_ticks = max(2, size // 45)
     if orientation == "x":
         p.y_range = Range1d(0, m, bounds=(0, m))
         p.xaxis.visible = False
+        p.yaxis.ticker.desired_num_ticks = n_ticks
     else:
         p.x_range = Range1d(0, m, bounds=(0, m))
         p.yaxis.visible = False
+        p.xaxis.ticker.desired_num_ticks = n_ticks
     p.grid.visible = False
 
     # Invisible full-height target, one quad per bin.  Hovering the stacked series
@@ -390,18 +395,91 @@ def coverage_figure(rd, assembly: str, orientation: str,
     return p
 
 
+END_MARK = BAR_SIZE - 3     # contig-end triangle, px
+# A segment edge this close to its contig's end counts as reaching it: reads seldom
+# align to a contig's last few hundred bases, so recruited segments stop short.
+CONTIG_END_TOL = 1000
+
+
+def contig_end_marks(rd, assembly: str, tol: int = CONTIG_END_TOL) -> list:
+    """(plot position, direction, contig, "start" | "end", contig length, bp short)
+    for each segment edge within `tol` of an end of its contig.
+
+    Direction is the way into the segment: +1 at a contig's start (the segment runs
+    on to larger positions), -1 at its end. Needs `rd.contig_lengths`; a RegionData
+    without them (an older pickle) has no marks.
+    """
+    lengths = (getattr(rd, "contig_lengths", None) or {}).get(assembly, {})
+    out = []
+    for contig, start, end, off in rd.segs_info(assembly):
+        n = lengths.get(contig)
+        if n is None:
+            continue
+        if start <= tol:
+            out.append((off, 1, contig, "start", n, max(0, start)))
+        if end >= n - tol:
+            out.append((off + end - start, -1, contig, "end", n, max(0, n - end)))
+    return out
+
+
+def _draw_end_marks(p, rd, assembly: str, orientation: str, length_px: int):
+    """Black triangles at contig ends on a contig bar, pointing into the segment.
+
+    A marker is centred on its point, so each sits half its size inside its
+    segment; that is a distance in pixels, so the data offset is recomputed as the
+    (linked) range zooms.
+    """
+    marks = contig_end_marks(rd, assembly)
+    if not marks:
+        return None
+    rng = p.x_range if orientation == "x" else p.y_range
+    half = END_MARK / 2
+    per_px = (rng.end - rng.start) / max(1, length_px)
+    base = [m[0] for m in marks]
+    dirs = [m[1] for m in marks]
+    # Markers are drawn pointing up; angles turn them counter-clockwise on screen.
+    if orientation == "x":
+        angle = [-math.pi / 2 if d > 0 else math.pi / 2 for d in dirs]
+    else:
+        angle = [0.0 if d > 0 else math.pi for d in dirs]
+    src = ColumnDataSource(dict(
+        pos=[b + d * half * per_px for b, d in zip(base, dirs)], base=base, dir=dirs,
+        mid=[0.5] * len(marks), angle=angle,
+        label=[f"{c} {which} ({n:,} bp)" + (f", {short:,} bp beyond the segment" if short else "")
+               for _, _, c, which, n, short in marks]))
+    xy = dict(x="pos", y="mid") if orientation == "x" else dict(x="mid", y="pos")
+    r = p.scatter(**xy, source=src, marker="triangle", size=END_MARK, angle="angle",
+                  fill_color="#000000", line_color="#ffffff", line_width=1)
+    shift = CustomJS(args=dict(src=src, rng=rng, px=max(1, length_px), half=half), code="""
+        const per = (rng.end - rng.start) / px;
+        const d = src.data;
+        d.pos = d.base.map((b, i) => b + d.dir[i] * half * per);
+        src.change.emit();
+    """)
+    rng.js_on_change("start", shift)
+    rng.js_on_change("end", shift)
+    p.add_tools(HoverTool(renderers=[r], tooltips=[("contig", "@label")]))
+    return r
+
+
 def contig_bar_figure(rd, assembly: str, orientation: str, colors: dict,
-                      width: int = MAIN_WIDTH, height: int | None = None):
-    """Thin coloured bar marking which contig each stretch of the axis belongs to."""
+                      width: int = MAIN_WIDTH, height: int | None = None, rng=None):
+    """Thin coloured bar marking which contig each stretch of the axis belongs to.
+
+    A black triangle at a segment's edge marks the start or end of its contig,
+    pointing into the segment. `rng` is the axis range to share (the dotplot's),
+    so the triangles follow its zoom.
+    """
     segs_info = rd.segs_info(assembly)
     total = rd.plot_w if orientation == "x" else rd.plot_h
+    rng = rng if rng is not None else Range1d(0, total)
 
     if orientation == "x":
-        p = figure(width=width, height=BAR_SIZE, x_range=Range1d(0, total),
+        p = figure(width=width, height=BAR_SIZE, x_range=rng,
                    y_range=Range1d(0, 1), tools="")
     else:
         p = figure(width=BAR_SIZE, height=height or main_height(rd, width),
-                   y_range=Range1d(0, total), x_range=Range1d(0, 1), tools="")
+                   y_range=rng, x_range=Range1d(0, 1), tools="")
 
     for contig, off, end in contig_runs(segs_info, total):
         if orientation == "x":
@@ -416,6 +494,7 @@ def contig_bar_figure(rd, assembly: str, orientation: str, colors: dict,
     p.grid.visible = False
     p.toolbar_location = None
     p.min_border = 0
+    _draw_end_marks(p, rd, assembly, orientation, p.width if orientation == "x" else p.height)
     return p
 
 
@@ -592,14 +671,18 @@ def fit_main(rd, max_width: int = MAIN_WIDTH, max_height: int | None = None) -> 
     """(width, height) of the dotplot: square pixels, inside the given box.
 
     Width is tried first; if the resulting height overflows `max_height` the plot is
-    shrunk to that height instead, so the whole report fits a browser window.
+    shrunk to that height instead, so the whole report fits a browser window. The
+    floor is small on purpose: a larger one would push the report out of a small
+    window rather than shrink it.
     """
     ratio = rd.plot_h / max(rd.plot_w, 1)
-    w = max(200, int(max_width))
+    bw = max(MIN_MAIN, int(max_width))
+    w = bw
     h = main_height(rd, w)
     if max_height is not None and h > max_height:
-        h = max(200, int(max_height))
-        w = max(200, int(round(h / max(ratio, 1e-9))))
+        h = max(MIN_MAIN, int(max_height))
+        # Never wider than the box: main_height's clamps can make h/ratio exceed it.
+        w = min(bw, max(MIN_MAIN, int(round(h / max(ratio, 1e-9)))))
     return w, h
 
 
@@ -630,8 +713,8 @@ def report_layout(rd, color_by: str = "class", visible_layers=None,
                               size=margin_size)
     cov_right = coverage_figure(rd, rd.asm1, "y", width=w, height=h, stacking=stacking,
                                 size=margin_size)
-    xbar = contig_bar_figure(rd, rd.asm2, "x", colors, width=w)
-    ybar = contig_bar_figure(rd, rd.asm1, "y", colors, width=w, height=h)
+    xbar = contig_bar_figure(rd, rd.asm2, "x", colors, width=w, rng=main.x_range)
+    ybar = contig_bar_figure(rd, rd.asm1, "y", colors, width=w, height=h, rng=main.y_range)
 
     # Linked ranges: every panel follows the dotplot's viewport.
     cov_top.x_range = main.x_range
@@ -688,6 +771,12 @@ def report_layout(rd, color_by: str = "class", visible_layers=None,
     main.toolbar_location = None
     grid.toolbar = main.toolbar
     grid.toolbar_location = "right"
+    # One line each, as wide as the plots: a wrapped line would make the report
+    # taller than the cell it was sized for (server.PAD_H counts one line each).
+    for div in (readout, status):
+        div.width = BAR_SIZE + w + margin_size
+        div.styles = {**div.styles, "white-space": "nowrap", "overflow": "hidden",
+                      "text-overflow": "ellipsis"}
     return column(readout, status, grid)
 
 

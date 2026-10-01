@@ -13,7 +13,7 @@ each renderer can build its own mapping — see `docs/qaview.md` §5.
 
 import math
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import pysam
@@ -118,6 +118,9 @@ class RegionData:
     cov1: CoverageBins          # asm1 — right-hand marginal
     cov2: CoverageBins          # asm2 — top marginal
     bucket_keys: list
+    # assembly -> {contig: length} for the contigs in `segments`, from the BAM
+    # headers: which segment edges are contig ends (glyphs.contig_bar_figure).
+    contig_lengths: dict = field(default_factory=dict)
 
     def segs_info(self, assembly: str) -> list:
         if assembly == self.asm1:
@@ -220,7 +223,16 @@ class RegionData:
                    asm1_segs_info=asm1_segs_info, asm2_segs_info=asm2_segs_info,
                    plot_w=plot_w, plot_h=plot_h,
                    read_names=read_names_l, read_class=read_class, lines=lines,
-                   cov1=cov1, cov2=cov2, bucket_keys=list(SUPPORT_BUCKET_KEYS))
+                   cov1=cov1, cov2=cov2, bucket_keys=list(SUPPORT_BUCKET_KEYS),
+                   contig_lengths={asm1: _contig_lengths(asm1_bam, asm1_segs),
+                                   asm2: _contig_lengths(asm2_bam, asm2_segs)})
+
+
+def _contig_lengths(bam_path: str, segs) -> dict:
+    """{contig: length} for the segments' contigs, from the BAM header."""
+    with pysam.AlignmentFile(bam_path, "rb") as bam:
+        known = set(bam.references)
+        return {c: bam.get_reference_length(c) for c in {s.contig for s in segs} if c in known}
 
 
 def _classify_support(db_path, all_reads, pid_threshold, plen_threshold,

@@ -650,6 +650,16 @@ since it knows everything except the seeds.
    server process is avoided). A locus the user opens moves to the front.
 6. State is only ever derived from these files, so a crash or restart loses at
    most the jobs in flight.
+7. **Re-recruitment.** A seed can be recruited again with parameters of its own
+   (the Recruitment panel, `POST /api/recruit`). Only the values that differ from
+   the project file are kept, per seed name, in
+   `output/qaview_recruitment.json`; the seed's cache key uses its own values, so
+   a reopened project recruits it the same way, and going back to the project
+   file's values finds the old recruitment on disk at once. Requests run in a
+   pool of their own (up to 4 workers), not behind the startup queue. The seed
+   keeps its locus while it recruits; the result then moves it to the locus it
+   makes (scored next), and a locus left with no seed is removed from the table.
+   A failed request leaves the seed where it was, with the error on its row.
 
 ### 13.4 Page
 
@@ -673,7 +683,8 @@ since it knows everything except the seeds.
 |  layers        |                                           |               |
 |                |                                           |               |
 | recruitment    |                                           |               |
-|  (read-only)   |                                           |               |
+|  parameters,   |                                           |               |
+|  Re-recruit    |                                           |               |
 +----------------+-------------------------------------------+---------------+
 ```
 
@@ -728,7 +739,35 @@ since it knows everything except the seeds.
   `src/qaview/remember.py`.
 - **Sizing:** the page measures the plot cell (ResizeObserver) and asks the server
   for figures at that size; `fit_main` keeps square pixels server-side as now.
-  Resizing re-requests after a 300 ms pause.
+  Resizing re-requests after a 300 ms pause. The grid's one row is the window's
+  height (`minmax(0, 1fr)`), never its content's, so the sidebars scroll on
+  their own and the plot cell is never taller than the window. Sidebars take at
+  most 40% (left) and 30% (right) of the window's width, whatever was saved, so
+  a narrow window shrinks them before the plot. The figure shrinks to any cell
+  down to 160 px (smaller marginals below 450 px, and fewer ticks on them); the
+  coordinate and status lines above it stay one line each. Only below Bokeh's
+  own minimum sizes is the figure larger than its cell, and then the cell
+  scrolls. With reads shown, the alignment strip is capped at 60% of the
+  window's height and scrolls both ways, opening on the sequence rows.
+- **Recruitment** (left sidebar) shows the open locus's seeds, each with its
+  interval, and the parameters they were recruited with, editable; a value unlike
+  the project file's is highlighted, with the file's value in its tooltip.
+  **Re-recruit** recruits the ticked seeds (all, by default) again with the
+  values in the form; **Project values** fills in the file's. While a seed
+  recruits its row reads "recruiting"; when it is done the panel says where it
+  went -- the same locus, or another one, with a link to it, and if the open
+  locus lost its last seed the page opens the new one. A seed with parameters of
+  its own is marked `*` in the table. The plotting controls' display pid, plen
+  and best_pid_delta are separate from these: they filter what is drawn, not
+  what is recruited.
+- **Contig ends.** On the contig bars beside the dotplot, a black triangle marks a
+  segment edge that is the start or the end of its contig, pointing into the
+  segment. An edge within 1 kb of the contig's end counts (`CONTIG_END_TOL`):
+  reads seldom align to a contig's last few hundred bases, so recruited segments
+  stop just short; the hover text gives the contig's length and how far past the
+  segment its end lies. Lengths come from the BAM headers
+  (`RegionData.contig_lengths`). The triangles keep their size in pixels and sit
+  half of it inside their segment at any zoom. `glyphs.contig_end_marks`.
 - **Plotting controls** are the Panel app's tiers 2 and 3: display pid, plen,
   best_pid_delta, pid_tie_eps (with the tie warning), binsize, colour-by, clamp C,
   layers. Tier 2 rebuilds `RegionData` server-side (~1 s, cached per locus and
@@ -744,7 +783,9 @@ FastAPI + uvicorn, one process, reached by ssh port-forwarding.
 | `GET /bokeh/...` | BokehJS from the installed `bokeh` package -- no internet needed |
 | `GET /api/project` | names, files, seed sources, recruitment parameters, resources |
 | `GET /api/loci` | the table: id, seeds, segments, span per candidate, reads, status, Delta S |
-| `GET /api/events` | server-sent events: queue progress and row updates |
+| `GET /api/events` | server-sent events: queue progress and row updates (a locus re-recruited away comes as `{id, removed, moved_to}`) |
+| `GET /api/loci/{id}/seeds` | the locus's seeds with the recruitment parameters each was recruited with |
+| `POST /api/recruit` | `{seeds, params}`: recruit those seeds again with those parameters |
 | `GET /api/loci/{id}/view?w=&h=&...` | Bokeh `json_item` of the report layout for that size and those settings, plus the score summary |
 
 Launch: `venv/bin/python -m qaview [project.toml] [--port 5006]`. Without a

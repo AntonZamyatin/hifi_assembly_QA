@@ -5,7 +5,11 @@ Opening a project starts two queues:
 - **recruitment** -- every seed not already on disk, `recruit_workers` at a time
   in worker processes (spawned, not forked: the server process has threads). A
   result is `(segments, reads)` pickled under `output/recruit/`, keyed by the
-  seed, the data files and the recruitment parameters.
+  seed, the data files and the recruitment parameters. A seed can be recruited
+  again with parameters of its own (`rerecruit`, from the page); those differ
+  from the project file only for that seed and are kept in
+  `output/qaview_recruitment.json`, so a reopened project recruits it the same
+  way. Re-recruitments run in a small pool of their own, not behind the queue.
 - **scoring** -- each distinct locus once. A finished seed's locus is
   `locus_id(segments, reads)`; seeds that recruit the same locus share a row.
   Scores live in `output/loci/`, the cache the batch notebooks write, so a locus
@@ -30,19 +34,21 @@ import time
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 
-from qaview.project import Project, Seed
+from qaview.project import Project, Seed, validate_recruitment
 
 # Bump when a recruiter change alters results, so older recruitments are redone.
 RECRUIT_VERSION = 1
+USER_WORKERS = 4            # re-recruitments the user asked for, at once
 
 
 # ---- recruitment (worker side) ----------------------------------------------------
 
-def recruit_key(project: Project, seed: Seed) -> str:
+def recruit_key(project: Project, seed: Seed, params: dict | None = None) -> str:
     payload = json.dumps({
         "version": RECRUIT_VERSION, "db": project.db,
         "asm": [[c.name, c.fasta, c.bam] for c in (project.asm1, project.asm2)],
-        "seed": list(seed.interval), "params": project.recruitment,
+        "seed": list(seed.interval),
+        "params": project.recruitment if params is None else params,
     }, sort_keys=True)
     return hashlib.sha1(payload.encode()).hexdigest()[:16]
 
@@ -78,13 +84,56 @@ def recruit_one(job: dict) -> str:
 
 # ---- state --------------------------------------------------------------------------
 
+class Overrides:
+    """Per-seed recruitment parameters that differ from the project file.
+
+    Kept by seed name in `<output>/qaview_recruitment.json`; only the keys that
+    differ are stored, so a later change to the project file still reaches the
+    rest of a seed's parameters.
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        self._lock = threading.Lock()
+        self.seeds: dict[str, dict] = {}
+        try:
+            with open(path) as fh:
+                stored = json.load(fh).get("seeds", {})
+        except (OSError, ValueError):
+            stored = {}
+        for name, params in stored.items():
+            try:
+                self.seeds[name] = validate_recruitment(params)
+            except (ValueError, AttributeError):
+                continue                                  # a hand-edited bad entry is dropped
+
+    def get(self, name: str) -> dict:
+        return dict(self.seeds.get(name, {}))
+
+    def set(self, name: str, diff: dict) -> None:
+        with self._lock:
+            if self.seeds.get(name, {}) == diff:
+                return
+            if diff:
+                self.seeds[name] = dict(diff)
+            else:
+                self.seeds.pop(name, None)
+            tmp = f"{self.path}.tmp"
+            with open(tmp, "w") as fh:
+                json.dump({"seeds": self.seeds}, fh, indent=1, sort_keys=True)
+            os.replace(tmp, self.path)
+
+
 @dataclass
 class SeedState:
     seed: Seed
     path: str                   # recruitment pickle
+    params: dict                # the recruitment parameters behind `path`
     status: str = "queued"      # queued | done | failed
     locus: str | None = None
     error: str | None = None
+    gen: int = 0                # bumped per request; a result for an older one is ignored
+    pending: dict | None = None  # parameters of a re-recruitment in flight
 
 
 @dataclass
@@ -99,13 +148,16 @@ class Locus:
     progress: float = 0.0       # scoring, 0..1
     score: object = None        # qamodel LocusScore
     error: str | None = None
+    recruiting: set = field(default_factory=set)   # its seeds being re-recruited
+    recruit_error: str | None = None               # the last re-recruitment that failed
 
     def row(self) -> dict:
         s = self.score
         row = {"id": self.id, "seeds": list(self.seeds), "n_seeds": len(self.seeds),
                "reads": self.n_reads, "span": self.span, "segments": self.n_segments,
                "status": self.status, "progress": round(self.progress, 3),
-               "error": self.error, "delta_s": None}
+               "error": self.error, "delta_s": None,
+               "recruiting": sorted(self.recruiting), "recruit_error": self.recruit_error}
         if s is not None:
             up, down = s.clamped_counts()
             row.update(delta_s=round(s.delta_s, 2), emission=round(s.emission, 2),
@@ -122,16 +174,20 @@ class Pipeline:
         self.python = python or sys.executable
         os.makedirs(project.recruit_dir, exist_ok=True)
         os.makedirs(project.loci_dir, exist_ok=True)
-        self.seeds = {s.name: SeedState(s, os.path.join(
-            project.recruit_dir, f"recruit_{recruit_key(project, s)}.pkl"))
-            for s in project.seeds}
+        self.overrides = Overrides(os.path.join(project.output_dir, "qaview_recruitment.json"))
+        self.seeds = {}
+        for s in project.seeds:
+            params = self.params_for(s.name)
+            self.seeds[s.name] = SeedState(s, self._recruit_path(s, params), params)
         self.loci: dict[str, Locus] = {}
+        self._moved: dict[str, str | None] = {}     # removed locus id -> where its seed went
         self._lock = threading.RLock()
         self._wake = threading.Condition(self._lock)
         self._seq = 0
         self._changed: dict[str, int] = {}          # locus id -> seq of its last change
         self._front: list[str] = []                 # loci to score next, newest first
         self._pool: ProcessPoolExecutor | None = None
+        self._user_pool: ProcessPoolExecutor | None = None
         self._score_proc: subprocess.Popen | None = None
         self._stopping = False
         self.started = time.time()
@@ -147,10 +203,12 @@ class Pipeline:
         with self._lock:
             self._stopping = True
             self._wake.notify_all()
-        if self._pool is not None:
+        for pool in (self._pool, self._user_pool):
+            if pool is None:
+                continue
             # shutdown() only cancels queued seeds; running workers must be ended.
-            procs = list(getattr(self._pool, "_processes", {}).values())
-            self._pool.shutdown(wait=False, cancel_futures=True)
+            procs = list(getattr(pool, "_processes", {}).values())
+            pool.shutdown(wait=False, cancel_futures=True)
             for proc in procs:
                 if proc.is_alive():
                     proc.terminate()
@@ -164,13 +222,26 @@ class Pipeline:
 
     # ---- recruitment -----------------------------------------------------------------
 
-    def _job(self, st: SeedState) -> dict:
+    def params_for(self, name: str) -> dict:
+        """The recruitment parameters a seed is recruited with: the project's, then its own."""
+        return {**self.project.recruitment, **self.overrides.get(name)}
+
+    def _recruit_path(self, seed: Seed, params: dict) -> str:
+        return os.path.join(self.project.recruit_dir,
+                            f"recruit_{recruit_key(self.project, seed, params)}.pkl")
+
+    def _job(self, st: SeedState, params: dict, path: str) -> dict:
         p = self.project
         return {"db": p.db, "asm1": p.asm1.name, "asm2": p.asm2.name,
                 "bam1": p.asm1.bam, "bam2": p.asm2.bam,
                 "fa1": p.asm1.fasta, "fa2": p.asm2.fasta,
-                "recruitment": p.recruitment, "seed": list(st.seed.interval),
-                "out": st.path}
+                "recruitment": params, "seed": list(st.seed.interval), "out": path}
+
+    def _submit(self, pool: ProcessPoolExecutor, st: SeedState, gen: int,
+                params: dict, path: str):
+        fut = pool.submit(recruit_one, self._job(st, params, path))
+        fut.add_done_callback(
+            lambda f: self._on_recruited(st, gen, params, path, f))
 
     def _recruit_all(self):
         # Seeds already on disk first, so a reopened project fills its table at once.
@@ -179,7 +250,7 @@ class Pipeline:
             if self._stopping:
                 return
             if os.path.exists(st.path):
-                self._seed_done(st)
+                self._seed_done(st, st.gen, st.params, st.path)
             else:
                 todo.append(st)
         if not todo:
@@ -189,35 +260,107 @@ class Pipeline:
             max_workers=max(1, min(self.project.resources["recruit_workers"], len(todo))),
             mp_context=mp.get_context("spawn"))
         for st in todo:
-            fut = self._pool.submit(recruit_one, self._job(st))
-            fut.add_done_callback(lambda f, st=st: self._on_recruited(st, f))
+            self._submit(self._pool, st, st.gen, st.params, st.path)
 
-    def _on_recruited(self, st: SeedState, fut):
+    def rerecruit(self, names: list[str], params: dict) -> dict:
+        """Recruit these seeds again with `params` over the project file's (the page's button).
+
+        A seed keeps its locus until the new result is in; then it moves to the
+        locus that result makes (and the old one goes if no seed is left in it).
+        Parameters equal to the project file's clear the seed's own. Returns the
+        seeds queued and those already recruited with exactly these parameters.
+        """
+        diff_all = validate_recruitment(params)
+        unknown = [n for n in names if n not in self.seeds]
+        if unknown:
+            raise KeyError(", ".join(unknown))
+        queued, unchanged = [], []
+        for name in names:
+            with self._lock:
+                st = self.seeds[name]
+                eff = {**self.project.recruitment, **diff_all}
+                current = st.pending if st.pending is not None else st.params
+                if eff == current and st.status != "failed":
+                    unchanged.append(name)
+                    continue
+                st.gen += 1
+                gen, path = st.gen, self._recruit_path(st.seed, eff)
+                st.pending, st.error = eff, None
+                loc = self.loci.get(st.locus) if st.locus else None
+                if loc is not None:
+                    loc.recruiting.add(name)
+                    loc.recruit_error = None
+                    self._bump(loc.id)
+                if os.path.exists(path):
+                    # Recruited like this before (or reverted): no worker needed.
+                    threading.Thread(target=self._seed_done, args=(st, gen, eff, path),
+                                     daemon=True).start()
+                else:
+                    if self._user_pool is None:
+                        import multiprocessing as mp
+                        self._user_pool = ProcessPoolExecutor(
+                            max_workers=max(1, min(USER_WORKERS,
+                                                   self.project.resources["recruit_workers"])),
+                            mp_context=mp.get_context("spawn"))
+                    self._submit(self._user_pool, st, gen, eff, path)
+                queued.append(name)
+        with self._lock:
+            # Updates from this seq on show the seeds as recruiting (or already done).
+            return {"queued": queued, "unchanged": unchanged, "seq": self._seq}
+
+    def _on_recruited(self, st: SeedState, gen: int, params: dict, path: str, fut):
         if fut.cancelled():
             return
         exc = fut.exception()
         if exc is not None:
-            with self._lock:
-                st.status, st.error = "failed", f"{type(exc).__name__}: {exc}"
-                self._bump(None)
+            self._recruit_failed(st, gen, f"{type(exc).__name__}: {exc}")
             return
-        self._seed_done(st)
+        self._seed_done(st, gen, params, path)
 
-    def _seed_done(self, st: SeedState):
+    def _recruit_failed(self, st: SeedState, gen: int, error: str):
+        with self._lock:
+            if st.gen != gen:
+                return                                    # superseded by a later request
+            loc = self.loci.get(st.locus) if st.locus else None
+            if loc is None:
+                st.status, st.error = "failed", error
+            else:                                         # the seed keeps its old locus
+                st.pending = None
+                loc.recruiting.discard(st.seed.name)
+                loc.recruit_error = f"{st.seed.name}: {error}"
+            self._bump(loc.id if loc else None)
+
+    def _seed_done(self, st: SeedState, gen: int, params: dict, path: str):
         from qatool.plotters.likelihood import locus_id
 
         try:
-            with open(st.path, "rb") as fh:
+            with open(path, "rb") as fh:
                 rec = pickle.load(fh)
         except Exception as exc:                      # a torn or stale file: redo it
-            with self._lock:
-                st.status, st.error = "failed", f"unreadable recruitment: {exc}"
-                self._bump(None)
+            self._recruit_failed(st, gen, f"unreadable recruitment: {exc}")
             return
         segs, reads = rec["segments"], rec["reads"]
         lid = locus_id(segs, reads, self.project.asm1.name, self.project.asm2.name)
+        name = st.seed.name
         with self._lock:
-            st.status, st.locus = "done", lid
+            if st.gen != gen:
+                return
+            asked = st.pending is not None
+            old = st.locus
+            st.status, st.locus, st.path, st.params = "done", lid, path, params
+            st.pending, st.error = None, None
+            if asked:
+                self.overrides.set(name, {k: v for k, v in params.items()
+                                          if self.project.recruitment.get(k) != v})
+            prev = self.loci.get(old) if old else None
+            if prev is not None:
+                prev.recruiting.discard(name)
+                if old != lid:
+                    prev.seeds.remove(name)
+                    if not prev.seeds:
+                        del self.loci[old]
+                        self._moved[old] = lid
+                self._bump(old)
             loc = self.loci.get(lid)
             if loc is None:
                 names = (self.project.asm1.name, self.project.asm2.name)
@@ -226,9 +369,13 @@ class Pipeline:
                                   for a in names},
                             n_segments={a: sum(s.assembly == a for s in segs) for a in names})
                 self.loci[lid] = loc
+                self._moved.pop(lid, None)
                 self._wake.notify_all()
-            loc.seeds.append(st.seed.name)
+            if name not in loc.seeds:
+                loc.seeds.append(name)
             self._bump(lid)
+            if asked:
+                self.prioritize(lid)                  # the user is waiting on it
 
     # ---- scoring ---------------------------------------------------------------------
 
@@ -325,14 +472,36 @@ class Pipeline:
                     "scored": lo.count("scored"), "scoring": lo.count("scoring"),
                     "score_failed": lo.count("failed"), "seq": self._seq}
 
+    def _row(self, loc: Locus) -> dict:
+        row = loc.row()
+        row["custom"] = [n for n in loc.seeds if self.overrides.get(n)]
+        return row
+
     def rows(self) -> list[dict]:
         with self._lock:
-            return [l.row() for l in self.loci.values()]
+            return [self._row(l) for l in self.loci.values()]
 
     def changes_since(self, seq: int) -> tuple[int, list[dict]]:
+        """Rows changed after `seq`; a locus gone since is `{id, removed, moved_to}`."""
         with self._lock:
-            rows = [self.loci[lid].row() for lid, s in self._changed.items() if s > seq]
+            rows = [self._row(self.loci[lid]) if lid in self.loci
+                    else {"id": lid, "removed": True, "moved_to": self._moved.get(lid)}
+                    for lid, s in self._changed.items() if s > seq]
             return self._seq, rows
+
+    def seed_info(self, lid: str) -> list[dict]:
+        """The seeds of a locus with the parameters each was recruited with."""
+        with self._lock:
+            loc = self.loci[lid]
+            out = []
+            for name in loc.seeds:
+                st = self.seeds[name]
+                a, c, s, e = st.seed.interval
+                out.append({"name": name, "assembly": a, "contig": c, "start": s, "end": e,
+                            "source": st.seed.source, "params": dict(st.params),
+                            "own": self.overrides.get(name),
+                            "pending": dict(st.pending) if st.pending else None})
+            return out
 
     def failed_seeds(self) -> list[dict]:
         with self._lock:

@@ -21,14 +21,21 @@
 [hidden] { display: none !important; }
 html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 
+/* The one row is the window's height, never its content's: without minmax(0, ...)
+   the row grows to the tallest sidebar, the sidebars never scroll and the plot is
+   sized to a cell taller than the window. Sidebars give way to the plot in a
+   narrow window (at most 40% and 30% of it, as setWidth allows). */
 #app {
+  --left: min(var(--left-w), 40vw);
+  --right: min(var(--right-w), 30vw);
   display: grid;
-  grid-template-columns: var(--left-w) minmax(0, 1fr) var(--right-w);
+  grid-template-columns: var(--left) minmax(0, 1fr) var(--right);
+  grid-template-rows: minmax(0, 1fr);
   height: 100vh;
+  height: 100dvh;
 }
-#app.left-collapsed  { grid-template-columns: var(--collapsed) minmax(0, 1fr) var(--right-w); }
-#app.right-collapsed { grid-template-columns: var(--left-w) minmax(0, 1fr) var(--collapsed); }
-#app.left-collapsed.right-collapsed { grid-template-columns: var(--collapsed) minmax(0, 1fr) var(--collapsed); }
+#app.left-collapsed  { --left: var(--collapsed); }
+#app.right-collapsed { --right: var(--collapsed); }
 
 /* ---- sidebars -------------------------------------------------------------- */
 
@@ -37,6 +44,7 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
   z-index: 2;               /* above the plot, so the resize handle can overhang it */
   background: var(--panel);
   min-width: 0;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   overflow: visible;        /* .side-body scrolls; the aside must not clip its handle */
@@ -107,7 +115,8 @@ body.resizing #plot { pointer-events: none; }
   max-height: 42vh; overflow: auto;
   border: 1px solid var(--line); border-radius: 3px;
 }
-#loci { width: 100%; border-collapse: collapse; font-size: 12px; table-layout: fixed; }
+/* min-width: a narrow sidebar scrolls the table sideways rather than squeeze the seeds column to nothing. */
+#loci { width: 100%; min-width: 350px; border-collapse: collapse; font-size: 12px; table-layout: fixed; }
 #loci th, #loci td { padding: 3px 5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 #loci th {
   position: sticky; top: 0; background: var(--panel); z-index: 1;
@@ -145,9 +154,10 @@ details.panel { border-top: 1px solid var(--line); padding-top: 8px; }
 details.panel > summary { cursor: pointer; font-weight: 600; margin-bottom: 6px; }
 .form { display: grid; gap: 6px; }
 .form label, .form .field {
-  display: grid; grid-template-columns: 110px minmax(0, 1fr); align-items: center; gap: 8px;
-  color: var(--muted);
+  display: grid; grid-template-columns: minmax(0, 110px) minmax(0, 1fr); align-items: center; gap: 8px;
+  color: var(--muted); overflow-wrap: anywhere;   /* a long name wraps, never runs into its input */
 }
+#recruit-form label { grid-template-columns: minmax(0, 124px) minmax(0, 1fr); }
 .form input, .form select {
   font: inherit; color: var(--ink); min-width: 0; width: 100%;
   padding: 2px 6px; border: 1px solid var(--line); border-radius: 3px; background: var(--panel);
@@ -178,13 +188,16 @@ dl.files dd { font-family: ui-monospace, monospace; font-size: 11px; }
   padding: 8px 14px; border-bottom: 1px solid var(--line); background: var(--panel); min-height: 44px;
 }
 #locus-title { font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-#score-card { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
+#score-card { display: flex; align-items: baseline; gap: 4px 14px; flex-wrap: wrap; min-width: 0; }
 #score-card .ds { font-size: 16px; font-weight: 600; font-variant-numeric: tabular-nums; }
 #score-card .parts { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
-.legend-ramp { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
-.legend-ramp i { display: inline-block; width: 120px; height: 8px; border-radius: 2px; }
+.legend-ramp { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 2px 6px; color: var(--muted); font-size: 12px; min-width: 0; }
+.legend-ramp i { display: inline-block; width: 120px; max-width: 30vw; height: 8px; border-radius: 2px; }
 
-#plot-cell { position: relative; flex: 1; min-height: 0; overflow: hidden; padding: 8px 12px; }
+/* The report is sized to fit this cell; only in a window too small for Bokeh's own
+   minimum sizes can it be larger, and then the cell scrolls rather than hide it. */
+#plot-cell { position: relative; flex: 1; min-height: 0; overflow: auto; padding: 8px 12px; }
+#topbar { flex: none; }
 #plot { width: 100%; height: 100%; }
 #plot-status {
   position: absolute; left: 50%; top: 45%; transform: translate(-50%, -50%);
@@ -194,12 +207,16 @@ dl.files dd { font-family: ui-monospace, monospace; font-size: 11px; }
 /* ---- right sidebar: bin alignment -------------------------------------------- */
 
 #right .side-body { padding-left: 16px; }
-#right .slot { flex: 1 1 0; min-height: 0; }      /* reserved above and below */
+/* Reserved above and below: they share the spare height, and never shrink below
+   their content -- a short window scrolls the sidebar instead of overlapping them. */
+#right .slot { flex: 1 0 auto; }
 #align-panel { display: flex; flex-direction: column; gap: 6px; }
 #align-meta { line-height: 1.5; }
 #align-meta b { color: var(--ink); font-weight: 600; }
+/* Capped in height so its horizontal scrollbar stays in view when reads make it
+   tall: it scrolls both ways itself, opened on the sequence rows (app.js). */
 .strip {
-  overflow-x: auto; overflow-y: hidden;
+  overflow: auto; max-height: 60vh; max-height: 60dvh;
   border: 1px solid var(--line); border-radius: 3px; background: var(--panel);
 }
 .strip pre {
@@ -225,7 +242,7 @@ dl.files dd { font-family: ui-monospace, monospace; font-size: 11px; }
 /* ---- reads under the alignment ------------------------------------------------- */
 
 #right-bottom { display: flex; flex-direction: column; justify-content: flex-end; gap: 6px; }
-#right-bottom .buttons { display: flex; gap: 8px; }
+#right-bottom .buttons { display: flex; flex-wrap: wrap; gap: 8px; }
 #remember-note { font: inherit; padding: 3px 6px; border: 1px solid var(--line); border-radius: 3px; min-width: 0; }
 .btn:disabled { opacity: .45; cursor: default; }
 #align-saved { color: #8a6d00; }
@@ -279,3 +296,18 @@ dl.files dd { font-family: ui-monospace, monospace; font-size: 11px; }
 }
 #recent button:hover { background: var(--hover); }
 #recent button.missing { color: var(--muted); text-decoration: line-through; cursor: default; }
+
+/* ---- recruitment ---------------------------------------------------------------- */
+
+#recruit-panel { display: block; }
+#recruit-panel > * + * { margin-top: 6px; }
+#recruit-panel .buttons { display: flex; flex-wrap: wrap; gap: 8px; }
+.seed-list { display: grid; gap: 2px; font-size: 12px; }
+.seed-list label { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 6px; }
+.seed-list input { margin: 0; }
+.seed-list .seed-name { font-weight: 600; overflow-wrap: anywhere; }
+.badge { font-size: 11px; padding: 0 5px; border-radius: 8px; border: 1px solid var(--line); }
+.badge.own { color: var(--accent); border-color: var(--accent); }
+.badge.busy { color: var(--muted); }
+#recruit-form input.changed { border-color: var(--accent); background: var(--select); }
+#loci td .own { color: var(--accent); font-weight: 700; margin-left: 2px; }

@@ -95,9 +95,17 @@
         </div>
       </details>
 
-      <details class="panel needs-project">
-        <summary>Recruitment (from the project file)</summary>
-        <dl id="recruitment" class="kv"></dl>
+      <details class="panel needs-project" id="recruit-panel" open>
+        <summary>Recruitment</summary>
+        <div id="recruit-hint" class="muted small">Open a locus to recruit its seeds again.</div>
+        <div id="recruit-seeds" class="seed-list"></div>
+        <div id="recruit-form" class="form"></div>
+        <div class="buttons">
+          <button id="recruit-run" class="btn" disabled title="recruit the ticked seeds again with these parameters">Re-recruit</button>
+          <button id="recruit-reset" class="btn" disabled title="fill in the project file's values (Re-recruit to apply)">Project values</button>
+        </div>
+        <div id="recruit-msg" class="small" hidden></div>
+        <dl id="resources" class="kv"></dl>
       </details>
 
       <details class="panel needs-project">

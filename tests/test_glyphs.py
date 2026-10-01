@@ -22,7 +22,7 @@ from fixtures import make_region_data
 
 from qaview.glyphs import (
     BAR_SIZE, MAIN_WIDTH, MARGIN_SIZE, contig_bar_figure, contig_colors,
-    coverage_figure, dotplot_figure, main_height, report_layout, save_html,
+    END_MARK, contig_end_marks, coverage_figure, dotplot_figure, fit_main, main_height, report_layout, save_html,
 )
 
 _failures = []
@@ -65,6 +65,22 @@ def test_square_pixels(tmp):
     check(p.height == h, f"dotplot height {p.height} != {h}")
     check(p.x_range.end == rd.plot_w and p.y_range.end == rd.plot_h,
           "dotplot ranges must span the full region")
+
+
+def test_fit_main_stays_in_its_box(tmp):
+    """The dotplot never exceeds the box it is given, however small or lopsided.
+
+    main_height clamps (200..4000 px), so recomputing the width from the height
+    once overflowed a narrow box on a very wide locus; a 200 px floor overflowed
+    small windows.
+    """
+    from types import SimpleNamespace
+
+    for pw, ph in ((1_000_000, 1_000), (1_000, 1_000_000), (300_000, 200_000)):
+        rd = SimpleNamespace(plot_w=pw, plot_h=ph)
+        for bw, bh in ((1100, 800), (300, 150), (90, 70), (60, 400), (500, 60)):
+            w, h = fit_main(rd, bw, bh)
+            check(w <= bw and h <= bh, f"{pw}x{ph} locus in {bw}x{bh}: got {w}x{h}")
 
 
 def test_ranges_are_linked(tmp):
@@ -170,6 +186,48 @@ def test_contig_colors_and_bars(tmp):
     check(bar.y_range.end == rd.plot_h, "contig bar must span the full axis")
 
 
+def test_contig_end_marks(tmp):
+    """A triangle where a segment reaches its contig's start or end, pointing inward."""
+    import math
+
+    rd = make_region_data(tmp, "ce")
+    check(rd.contig_lengths == {"asm1": {"ctgA": 20_000}, "asm2": {"ctgB": 12_000}},
+          f"contig lengths come from the BAM headers: {rd.contig_lengths}")
+    check(contig_end_marks(rd, "asm1", tol=0) == [] and contig_end_marks(rd, "asm2", tol=0) == [],
+          "the fixture's segments reach no contig end")
+    near = contig_end_marks(rd, "asm2", tol=1_000)          # ctgB 1,000-4,300 of 12,000
+    check([(m[3], m[5]) for m in near] == [("start", 1_000)],
+          f"an edge within the tolerance counts, with how far short it is: {near}")
+
+    # asm1: ctgA 2,000-6,500 and 9,000-11,200 -> as if ctgA started at 2,000 and
+    # ended at 11,200 (the length says where the end is; the start is 0 by definition)
+    rd.contig_lengths = {"asm1": {"ctgA": 11_200}, "asm2": {"ctgB": 4_300}}
+    rd.asm1_segs_info = [("ctgA", 0, 6_500, 0)] + [tuple(x) for x in rd.asm1_segs_info[1:]]
+    marks = contig_end_marks(rd, "asm1", tol=0)
+    off2 = rd.asm1_segs_info[1][3]
+    check([(m[0], m[1], m[3]) for m in marks] == [(0, 1, "start"), (off2 + 2_200, -1, "end")],
+          f"asm1: start of the first segment, end of the second: {marks}")
+    check([(m[1], m[3]) for m in contig_end_marks(rd, "asm2", tol=0)] == [(-1, "end")],
+          "asm2: ctgB's end only")
+
+    colors = contig_colors(rd)
+    bar = contig_bar_figure(rd, rd.asm1, "y", colors)
+    tri = [r for r in bar.renderers if getattr(r.glyph, "marker", None) == "triangle"]
+    check(len(tri) == 1, f"one triangle renderer: {bar.renderers}")
+    d = tri[0].data_source.data
+    check(d["angle"] == [0.0, math.pi], f"y bar: up at the start, down at the end: {d['angle']}")
+    check(d["pos"][0] > 0 and d["pos"][1] < off2 + 2_200,
+          f"each triangle sits inside its segment: {d['pos']}")
+    per_px = rd.plot_h / bar.height
+    check(abs((d["pos"][0] - 0) / per_px - END_MARK / 2) < 1e-6, "by half its size, in pixels")
+    xbar = contig_bar_figure(rd, rd.asm2, "x", colors)
+    xd = [r for r in xbar.renderers if getattr(r.glyph, "marker", None) == "triangle"][0].data_source.data
+    # ctgB 1,000-4,300 of 4,300: its end, and its start within the default 1 kb
+    check(xd["angle"] == [-math.pi / 2, math.pi / 2],
+          f"x bar: a start points right, an end left: {xd['angle']}")
+    check(bar.y_range.js_property_callbacks.get("change:start"), "the offset follows zoom")
+
+
 def test_color_modes(tmp):
     rd = make_region_data(tmp, "cm")
     from qaview.glyphs import SUPPLEMENTARY_COLOR
@@ -206,10 +264,10 @@ def test_save_html(tmp):
 
 def main():
     tmp = tempfile.mkdtemp(prefix="qaview_glyph_tests_")
-    tests = [test_square_pixels, test_ranges_are_linked, test_shared_crosshair,
+    tests = [test_square_pixels, test_fit_main_stays_in_its_box, test_ranges_are_linked, test_shared_crosshair,
              test_wheel_zoom_on_dotplot_only, test_panel_proportions,
              test_coverage_areas_stack, test_coverage_has_no_bin_borders,
-             test_contig_colors_and_bars,
+             test_contig_colors_and_bars, test_contig_end_marks,
              test_color_modes, test_save_html]
     for fn in tests:
         print(f"{fn.__name__} ...")
