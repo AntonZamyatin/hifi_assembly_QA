@@ -157,6 +157,8 @@ class Locus:
     recruit_path: str           # any one seed's pickle: all of them hold this locus
     seeds: list[str] = field(default_factory=list)
     n_reads: int = 0
+    params: dict = field(default_factory=dict)     # recruitment parameters behind it
+    boundary: frozenset = frozenset()              # reads crossing a sealed edge
     span: dict = field(default_factory=dict)       # assembly -> bp
     n_segments: dict = field(default_factory=dict)  # assembly -> count
     status: str = "queued"      # queued | scoring | scored | failed
@@ -171,7 +173,7 @@ class Locus:
         row = {"id": self.id, "seeds": list(self.seeds), "n_seeds": len(self.seeds),
                "reads": self.n_reads, "span": self.span, "segments": self.n_segments,
                "status": self.status, "progress": round(self.progress, 3),
-               "error": self.error, "delta_s": None,
+               "error": self.error, "delta_s": None, "boundary": len(self.boundary),
                "recruiting": sorted(self.recruiting), "recruit_error": self.recruit_error}
         if s is not None:
             up, down = s.clamped_counts()
@@ -379,7 +381,8 @@ class Pipeline:
             loc = self.loci.get(lid)
             if loc is None:
                 names = (self.project.asm1.name, self.project.asm2.name)
-                loc = Locus(lid, st.path, n_reads=len(reads),
+                loc = Locus(lid, st.path, n_reads=len(reads), params=dict(params),
+                            boundary=frozenset(rec.get("boundary_reads", ())),
                             span={a: sum(s.end - s.start for s in segs if s.assembly == a)
                                   for a in names},
                             n_segments={a: sum(s.assembly == a for s in segs) for a in names})
@@ -394,6 +397,13 @@ class Pipeline:
 
     # ---- scoring ---------------------------------------------------------------------
 
+    def score_kwargs(self, loc: Locus) -> dict:
+        """What scoring takes from the recruitment: its thresholds and boundary reads."""
+        params = loc.params or self.project.recruitment
+        return {"boundary_reads": sorted(loc.boundary),
+                "pid_threshold": params["pid_threshold"],
+                "plen_threshold": params["plen_threshold"]}
+
     def score_path(self, loc: Locus) -> str:
         from qatool.plotters.likelihood import score_cache_path
 
@@ -402,7 +412,8 @@ class Pipeline:
             p.loci_dir, loc.id, p.asm1.name, p.asm2.name, db_path=p.db,
             bams={p.asm1.name: p.asm1.bam, p.asm2.name: p.asm2.bam},
             fastas={p.asm1.name: p.asm1.fasta, p.asm2.name: p.asm2.fasta},
-            genome_fasta=p.genome_fasta, library_assembly=p.library_assembly)
+            genome_fasta=p.genome_fasta, library_assembly=p.library_assembly,
+            **self.score_kwargs(loc))
 
     def prioritize(self, lid: str):
         """Score this locus next (the user opened it)."""
@@ -452,8 +463,10 @@ class Pipeline:
     def _run_score_job(self, loc: Locus):
         env = dict(os.environ, PYTHONUNBUFFERED="1",
                    QAMODEL_SCORE_WORKERS=str(self.project.resources["score_workers"]))
+        kw = self.score_kwargs(loc)
         proc = subprocess.Popen(
-            [self.python, "-m", "qaview.score_job", self.project.path, loc.recruit_path],
+            [self.python, "-m", "qaview.score_job", self.project.path, loc.recruit_path,
+             "--pid", repr(kw["pid_threshold"]), "--plen", repr(kw["plen_threshold"])],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
             start_new_session=True)        # its own group, so stop() reaches its workers
         self._score_proc = proc

@@ -1,5 +1,9 @@
 """Score one recruited locus into the project's score cache:
-`python -m qaview.score_job <project.toml> <recruitment.pkl>`.
+`python -m qaview.score_job <project.toml> <recruitment.pkl> [--pid X --plen Y]`.
+
+`--pid`/`--plen` are the thresholds the locus was recruited with (the pipeline
+knows them for every seed; older recruitment files do not record them); the
+recruitment's boundary reads are scored too (`score_locus(boundary_reads=)`).
 
 A subprocess so the server never imports the pair-HMM engine or forks from a
 threaded process; this one forks the scoring workers itself. It goes through
@@ -8,22 +12,27 @@ and the lock are theirs and a locus is scored once whoever gets there first.
 Prints `scored <i>/<n>` lines for the server's progress bar.
 """
 
+import argparse
 import pickle
 import sys
 
 
 def main(argv=None):
-    argv = argv if argv is not None else sys.argv[1:]
-    if len(argv) != 2:
-        print("usage: python -m qaview.score_job <project.toml> <recruitment.pkl>",
-              file=sys.stderr)
-        return 2
+    ap = argparse.ArgumentParser(prog="python -m qaview.score_job")
+    ap.add_argument("project")
+    ap.add_argument("recruitment")
+    ap.add_argument("--pid", type=float, help="recruitment pid threshold (default: the project's)")
+    ap.add_argument("--plen", type=float, help="recruitment plen threshold (default: the project's)")
+    args = ap.parse_args(argv)
     from qatool.plotters.likelihood import phmm_likelihood_report
     from qaview.project import load_project
 
-    p = load_project(argv[0], check_files=False)
-    with open(argv[1], "rb") as fh:
+    p = load_project(args.project, check_files=False)
+    with open(args.recruitment, "rb") as fh:
         rec = pickle.load(fh)
+    params = rec.get("params") or p.recruitment
+    pid = args.pid if args.pid is not None else params["pid_threshold"]
+    plen = args.plen if args.plen is not None else params["plen_threshold"]
     step = max(1, len(rec["reads"]) // 100)
     last = [0]
 
@@ -38,7 +47,9 @@ def main(argv=None):
         bams={p.asm1.name: p.asm1.bam, p.asm2.name: p.asm2.bam},
         fastas={p.asm1.name: p.asm1.fasta, p.asm2.name: p.asm2.fasta},
         genome_fasta=p.genome_fasta, library_assembly=p.library_assembly,
-        cache_dir=p.loci_dir, progress=progress)
+        cache_dir=p.loci_dir, progress=progress,
+        boundary_reads=sorted(rec.get("boundary_reads", ())),
+        pid_threshold=pid, plen_threshold=plen)
     return 0
 
 

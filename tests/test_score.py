@@ -21,8 +21,8 @@ import numpy as np
 from qamodel.exposure import Library, effective_length, exposure_term
 from qamodel.phmm import PhmmParams, quality_table, sample_read
 from qamodel.phmm.kernel import forward_numba
-from qamodel.phmm.windows import Placement, build_windows
-from qamodel.score import LocusScore, ReadScore, score_read
+from qamodel.phmm.windows import Placement, build_windows, straddles
+from qamodel.score import LocusScore, ReadScore, placements, score_read
 
 QT = quality_table()
 _failures = []
@@ -130,10 +130,71 @@ def test_false_duplication_end_to_end():
           f"exposure {ls.exposure.value:+.2f}, Delta S {ls.delta_s:+.2f}")
 
 
+def test_boundary_read_scores_as_if_the_unit_held_the_flank():
+    """A boundary read crosses a segment edge into flank both candidates share.
+    Scored with windows past the edge, its ratio is the one it would have if the
+    segments simply contained it -- the flank cancels."""
+    rng = np.random.default_rng(12)
+    R = lambda n: "".join(rng.choice(list("ACGT"), size=n))
+    left, inside, flank = R(500), R(1500), R(1500)
+    A1 = left + inside + flank
+    A2 = left + inside[:1200] + "TTT" + inside[1200:] + flank  # differs inside the segment only
+    fa = {"A1": NS(fetch=lambda c, lo, hi: A1[lo:hi]), "A2": NS(fetch=lambda c, lo, hi: A2[lo:hi])}
+    edge1, edge2 = len(left) + len(inside), len(left) + len(inside) + 3
+    seg = {"A1": [NS(contig="c", start=0, end=edge1)], "A2": [NS(contig="c", start=0, end=edge2)]}
+    whole = {"A1": [NS(contig="c", start=0, end=len(A1))], "A2": [NS(contig="c", start=0, end=len(A2))]}
+    err = PhmmParams(delta_i=2e-3, delta_d=2e-3)
+    L, o = 1200, 1500                       # 1,500-2,700 in A1: over the edge at 2,000
+    sr = sample_read(A1, err, rng, origin=o, qual=40, max_len=L)
+    pl = {"A1": [Placement("c", o, o + L, 1, f"{L}M", 0, 0)],
+          "A2": [Placement("c", o, o + L + 3, 1, f"{L}M", 0, 0)]}
+
+    def ratio(segs, cross):
+        lp = {}
+        for a in ("A1", "A2"):
+            ws = build_windows(pl[a], segs[a], len(sr.read), fa[a], cross_edges=cross)
+            lp[a] = score_read(sr.read, sr.qual, ws.windows, err, QT, forward_numba)[0]
+        return lp["A1"] - lp["A2"]
+
+    check(straddles(pl["A1"], seg["A1"]), "the read crosses the edge: an ordinary read is dropped")
+    contained, boundary = ratio(whole, False), ratio(seg, True)
+    check(abs(contained - boundary) < 1e-9,
+          f"boundary ratio {boundary:.6f} equals the contained one {contained:.6f}")
+    check(boundary > 5, f"and it sees the 3 bp difference inside: {boundary:.2f} nats for A1")
+
+
+def test_placements_follow_recruitment_thresholds():
+    """Only alignments the recruiter would follow are placements: a junk secondary
+    crossing an edge can no longer drop a read whose real placement is inside."""
+    import sqlite3
+    import tempfile
+
+    from fixtures import write_db
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db = sqlite3.connect(write_db(os.path.join(tmp, "a.sqlite"), [
+            {"assembly": "A", "read_name": "r", "contig": "c", "start": 1000, "end": 3000,
+             "pid": 0.9995, "plen": 1.0},
+            {"assembly": "A", "read_name": "r", "contig": "c", "start": 9000, "end": 10_800,
+             "pid": 0.95, "plen": 0.9, "aln_type": "secondary"},
+        ]))
+        seg = [NS(contig="c", start=0, end=10_000)]
+        every, _ = placements(db, "A", "r")
+        check(len(every) == 2 and straddles(every, seg),
+              "without thresholds the junk secondary crosses the edge (the old drop)")
+        every, kept = placements(db, "A", "r", pid_min=0.997, plen_min=0.999)
+        check([(p.start, p.end) for p in every] == [(1000, 3000)] and not straddles(every, seg),
+              "with the recruitment's thresholds only the real placement counts")
+        none, _ = placements(db, "A", "r", pid_min=0.9999)
+        check(none == [], "nothing passing: no placement, so no window in that candidate")
+
+
 def main():
     tests = [test_clamp_and_infinities, test_sweep_needs_no_rescoring,
              test_effective_length_exact_form, test_lambda_definition,
-             test_false_duplication_end_to_end]
+             test_false_duplication_end_to_end,
+             test_boundary_read_scores_as_if_the_unit_held_the_flank,
+             test_placements_follow_recruitment_thresholds]
     for fn in tests:
         print(f"{fn.__name__} ...")
         fn()

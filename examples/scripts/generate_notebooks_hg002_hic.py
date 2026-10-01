@@ -97,6 +97,10 @@ def run_pipe(db_path, asm1, asm2, bam1, bam2, fasta1, fasta2, sg, fig_path,
         fastas={asm1: fasta1, asm2: fasta2},
         genome_fasta=genome_fasta, library_assembly=library_assembly,
         cache_dir=LOCI_DIR,
+        # the recruitment's thresholds and boundary reads, as qaview passes them,
+        # so both find the same cached score
+        boundary_reads=sorted(getattr(SRR, "boundary_reads", ())),
+        pid_threshold=pid_threshold, plen_threshold=plen_threshold,
     )
     if score_path:
         up, down = result.clamped_counts()

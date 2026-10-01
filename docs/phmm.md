@@ -442,6 +442,30 @@ an Alu poly-T tail at `h2tg000020l:61,904,626`. All 18 reads that favour
 `curated` span it; no read favours `hifiasm_hic` by more than 0.69 nats.
 Regression test: `tests/test_score_hg002.py`.
 
+**Which alignments are placements.** With `pid_threshold`/`plen_threshold`
+(the recruitment's; qaview and the batch notebooks pass them), only alignments
+passing them are placements: scored, and able to drop a read by crossing a
+segment edge. Before, every alignment counted for the edge rule, so a read whose
+real placement sat well inside the locus was dropped by a partial secondary at
+pid 0.90-0.95 poking over an edge -- 98 of 270 reads on
+`h2tg000063l_relocation_002`. A candidate where none passes gives the read no
+window: its ratio is +/-inf and lands on the clamp, as for a read the recruiter
+would call one-sided. `prune` still trims placements far below the read's best,
+for speed. Without thresholds every alignment counts, as before.
+
+**Boundary reads.** The anchor extension seals an edge where the outermost
+crossing read is common, so the sequence past the edge is shared by both
+candidates, and passes the reads crossing it as `boundary_reads`. They are
+scored with windows reaching past the edge (`build_windows(cross_edges=True)`,
+clipped at the contig only). That is the score they would get if both units were
+enlarged by the shared flank: the flank's contribution cancels from each ratio
+(`test_boundary_read_scores_as_if_the_unit_held_the_flank`: identical to 1e-9),
+and enlarging both units by the same flank leaves L_eff1 - L_eff2, so the
+exposure term is unchanged -- provided the matching edge is extended in the
+other candidate too, which the anchor's counterpart seal is for. A boundary read
+none of whose placements reaches one candidate's segments is not compared:
+`LocusScore.dropped_boundary`.
+
 **Caveat on magnitude.** The event is a microsatellite length difference — the
 context where HiFi indel error concentrates and where context-independent gap
 parameters are least right. The *direction* rests on 18 spanning reads against

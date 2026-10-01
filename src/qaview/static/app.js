@@ -313,8 +313,13 @@ function renderScore(d) {
   ds.title = `${s.delta_s.toFixed(2)} nats at C = ${s.C}`;
   const parts = el("span",
     `emission ${fmtDs(s.emission)} (${s.at_plus_C} at +C, ${s.at_minus_C} at −C)  ·  ` +
-    `exposure ${fmtDs(s.exposure)}  ·  ${s.scored.toLocaleString()} scored, ${s.dropped} dropped`);
+    `exposure ${fmtDs(s.exposure)}  ·  ${s.scored.toLocaleString()} scored, ${s.dropped} dropped` +
+    (s.boundary || s.dropped_boundary ? `  ·  boundary ${s.boundary} scored, ${s.dropped_boundary} dropped` : ""));
   parts.className = "parts";
+  parts.title = "scored: reads with a log-ratio (boundary reads included)\n" +
+    "dropped: a placement passing the recruitment's pid/plen crosses a segment edge\n" +
+    "boundary: reads crossing a sealed edge, scored with windows past it; dropped when " +
+    "they do not reach one candidate's segments";
   const ramp = el("span"); ramp.className = "legend-ramp";
   const bar = el("i");
   bar.style.background = `linear-gradient(to right, ${p.colors.ratio_neg}, #d2d2ca, ${p.colors.ratio_pos})`;
@@ -813,11 +818,6 @@ function buildRecruitForm(p) {
     const lab = el("label", k); lab.append(input);
     form.append(lab);
   }
-  markRecruitChanges();
-}
-
-function recruitInputs() {
-  return [...document.querySelectorAll("#recruit-form [data-key]")];
   for (const [k, names] of Object.entries(p.recruitment_choices || {})) {
     const sel = el("select"); sel.dataset.key = k;
     for (const n of names) sel.append(el("option", n));
@@ -826,6 +826,11 @@ function recruitInputs() {
     const lab = el("label", k); lab.append(sel);
     form.append(lab);
   }
+  markRecruitChanges();
+}
+
+function recruitInputs() {
+  return [...document.querySelectorAll("#recruit-form [data-key]")];
 }
 
 function fillRecruitForm(params) {

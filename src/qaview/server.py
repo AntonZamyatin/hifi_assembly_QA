@@ -463,7 +463,9 @@ def create_app(project: Project | None = None, pipeline: Pipeline | None = None,
                 "Leff1": x.Leff1, "Leff2": x.Leff2,
                 "worst_band_edge": score.worst_band_edge,
                 "placements": getattr(score, "placements", 0),
-                "pruned": getattr(score, "pruned", 0)}
+                "pruned": getattr(score, "pruned", 0),
+                "boundary": len(getattr(score, "boundary", ())),
+                "dropped_boundary": len(getattr(score, "dropped_boundary", ()))}
         return JSONResponse(out)
 
     return app

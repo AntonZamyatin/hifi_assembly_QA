@@ -118,7 +118,8 @@ def likelihood_report(db_path: str, read_classes: dict,
 
 # Bump when a change to the scoring code alters results, so cached scores from
 # before it are not reused.
-SCORE_CACHE_VERSION = 1
+# 2: boundary reads scored; placements filtered by the recruitment's pid/plen.
+SCORE_CACHE_VERSION = 2
 
 
 def locus_id(segments, read_names, asm1: str, asm2: str) -> str:
@@ -148,7 +149,11 @@ def _score_key(lid: str, asm1: str, asm2: str, db_path: str, bams: dict, fastas:
     from qamodel.score import score_locus
 
     sig = inspect.signature(score_locus).parameters
-    settings = {n: kwargs.get(n, sig[n].default) for n in ("k", "extra", "width", "prune")}
+    settings = {n: kwargs.get(n, sig[n].default)
+                for n in ("k", "extra", "width", "prune", "pid_threshold", "plen_threshold")}
+    # Boundary reads are scored too but are not part of locus_id: key them here.
+    settings["boundary"] = hashlib.sha1(
+        "\n".join(sorted(kwargs.get("boundary_reads") or ())).encode()).hexdigest()
     payload = json.dumps({
         "version": SCORE_CACHE_VERSION, "locus": lid, "asm": [asm1, asm2],
         "db": db_path, "bams": [bams[asm1], bams[asm2]], "fastas": [fastas[asm1], fastas[asm2]],

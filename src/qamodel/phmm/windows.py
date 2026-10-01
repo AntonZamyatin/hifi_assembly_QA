@@ -11,7 +11,11 @@ Four rules, each of which was found to matter the hard way:
   A placement inside a segment is scored; one crossing a segment boundary means
   the read's origin may sit outside the unit, and the whole read is dropped from
   both candidates so the read set stays symmetric. Placements elsewhere in the
-  genome are not part of this unit's sum and are ignored.
+  genome are not part of this unit's sum and are ignored. The exception is a
+  *boundary read* (`cross_edges`): the recruiter sealed the edge it crosses where
+  both candidates share the sequence outside, so its placements touching a
+  segment are scored with windows reaching past the edge -- the flank is the same
+  in both candidates and cancels from the read's ratio.
 
   Clips are recorded in reference orientation. For a reverse-strand placement the
   read's first base as sequenced is at the reference *right* end, so the read's
@@ -100,6 +104,19 @@ def _home(p, segments):
     return None, touches
 
 
+def _touching(p, segments):
+    """The first segment placement `p` overlaps, or None."""
+    for s in segments:
+        if s.contig == p.contig and p.end > s.start and p.start < s.end:
+            return s
+    return None
+
+
+def touches_unit(placements, segments) -> bool:
+    """Whether any placement overlaps a segment -- contained or crossing an edge."""
+    return any(_touching(p, segments) is not None for p in placements)
+
+
 def straddles(placements, segments) -> bool:
     """Whether any placement crosses a segment boundary -- build_windows' drop rule."""
     for p in placements:
@@ -110,19 +127,24 @@ def straddles(placements, segments) -> bool:
 
 
 def build_windows(placements, segments, read_len: int, fasta, *,
-                  k: int = 20, extra: int = 50, width: int = 100) -> WindowSet:
+                  k: int = 20, extra: int = 50, width: int = 100,
+                  cross_edges: bool = False) -> WindowSet:
     """Windows for one read against one candidate.
 
     `segments` are that candidate's recruited segments -- anything with
     `.contig`, `.start`, `.end`. `fasta` needs only `.fetch(contig, lo, hi)`.
     `k` is how far the true start may sit from where the aligner put it;
     `extra` is template beyond the read's reach, room for deletions; `width` is
-    the band's tolerance around the aligner's path.
+    the band's tolerance around the aligner's path. With `cross_edges` (a
+    boundary read), a placement crossing a segment edge is scored rather than
+    flagged, and windows are clipped at the contig, not at the segment.
     """
     groups: dict[tuple, list[Placement]] = {}
     straddles, outside = False, 0
     for p in placements:
         home, touches = _home(p, segments)
+        if home is None and touches and cross_edges:
+            home = _touching(p, segments)
         if home is None:
             if touches:
                 straddles = True
@@ -144,9 +166,11 @@ def build_windows(placements, segments, read_len: int, fasta, *,
                 merged.append([p])
 
         for grp in merged:
-            lo = max(seg_lo, min(p.start - p.clip_left for p in grp) - k - extra)
-            hi = min(seg_hi, max(p.end + p.clip_right for p in grp) + k + extra)
+            lo = min(p.start - p.clip_left for p in grp) - k - extra
+            hi = max(p.end + p.clip_right for p in grp) + k + extra
+            lo, hi = (max(0, lo), hi) if cross_edges else (max(seg_lo, lo), min(seg_hi, hi))
             tmpl = fasta.fetch(contig, lo, hi).upper()
+            hi = lo + len(tmpl)                 # a fetch past the contig's end stops at it
             if strand == 0:
                 tmpl = revcomp(tmpl)
             T = len(tmpl)

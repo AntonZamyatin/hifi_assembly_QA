@@ -33,14 +33,15 @@ import numpy as np
 
 from qamodel.exposure import Exposure, Library, exposure_term
 from qamodel.phmm.params import PhmmParams, QualityTable, quality_table
-from qamodel.phmm.windows import Placement, build_windows, straddles
+from qamodel.phmm.windows import Placement, build_windows, straddles, touches_unit
 
 DEFAULT_C = 200.0
 NEG_INF = -math.inf
 
 # A placement whose pid * plen trails the read's best in the same candidate by
 # more than this is not scored -- a speed-up only: the boundary rule still sees
-# every placement, so the set of reads scored does not change. pid is the
+# every placement that passes the thresholds, so the set of reads scored does not
+# change. pid is the
 # aligner's, which weighs every edit alike where the pair HMM weighs them by
 # quality and context, so the two disagree by ~10-15 edits' worth. At 0.001 that
 # moved unclamped log-ratios by up to 24 nats on a repeat-family locus; at 0.005
@@ -92,6 +93,9 @@ class LocusScore:
     unscorable: list[str] = field(default_factory=list)  # no window in either candidate
     placements: int = 0                                  # offered, both candidates
     pruned: int = 0                                      # skipped by the pid * plen rule
+    boundary: list[str] = field(default_factory=list)    # boundary reads among `reads`
+    # boundary reads not scored: no placement touches one candidate's segments
+    dropped_boundary: list[str] = field(default_factory=list)
 
     def emission_at(self, C: float) -> float:
         return float(sum(r.clamped(C) for r in self.reads))
@@ -126,6 +130,8 @@ class LocusScore:
             f"=== pair-HMM locus score: {self.asm1} vs {self.asm2} ===",
             f"reads scored {len(self.reads)}   dropped (crossed a segment edge) "
             f"{len(self.dropped)}   unscorable {len(self.unscorable)}",
+            f"boundary reads scored {len(self.boundary)}   dropped (out of one "
+            f"candidate's segments) {len(self.dropped_boundary)}",
             "",
             f"  emission   {self.emission:+12.2f} nats   "
             f"({up} reads at +C, {down} at -C, C = {self.C:g})",
@@ -179,19 +185,26 @@ def score_read(read, qual, windows, params: PhmmParams, qt: QualityTable,
 
 
 def placements(db: sqlite3.Connection, assembly: str, read_name: str,
-               prune: float | None = None) -> tuple[list[Placement], list[Placement]]:
-    """A read's alignments in one candidate: all of them, and those worth scoring.
+               prune: float | None = None, pid_min: float | None = None,
+               plen_min: float | None = None) -> tuple[list[Placement], list[Placement]]:
+    """A read's alignments in one candidate: all that count, and those worth scoring.
 
-    With `prune`, placements whose pid * plen trails the read's best in this
-    candidate by more than `prune` are left out of the second list (see
-    DEFAULT_PRUNE). The best is taken per candidate, so a read that fits one
-    candidate badly keeps its best bad placement there.
+    `pid_min` and `plen_min` are the recruitment's thresholds: an alignment the
+    recruiter would not follow is not a placement at all -- not scored, and not
+    able to drop the read by crossing an edge. A candidate where none passes
+    gives the read no window there, so it fits the other one only. With `prune`,
+    placements whose pid * plen trails the read's best in this candidate by more
+    than `prune` are left out of the second list (see DEFAULT_PRUNE).
     """
     rows = db.execute(
         "SELECT contig, start, end, strand, cigar, soft_left + hard_left, "
         "soft_right + hard_right, pid, plen FROM aln "
         "WHERE assembly = ? AND read_name = ? AND contig IS NOT NULL AND cigar IS NOT NULL",
         (assembly, read_name)).fetchall()
+    if pid_min is not None or plen_min is not None:
+        rows = [r for r in rows
+                if (pid_min is None or (r[7] is not None and r[7] >= pid_min))
+                and (plen_min is None or (r[8] is not None and r[8] >= plen_min))]
     every = [Placement(*r[:7]) for r in rows]
     if prune is None or not rows:
         return every, every
@@ -219,8 +232,10 @@ def _default_engine():
 
 
 def _score_names(names, segs, asm1, asm2, db_path, bams, fastas, params, qt,
-                 k, extra, width, engine, prune, progress=None, offset=0, total=None):
-    """Score `names` serially; returns (scored, dropped, unscorable, offered, pruned).
+                 k, extra, width, engine, prune, pid_min=None, plen_min=None,
+                 boundary=frozenset(), progress=None, offset=0, total=None):
+    """Score `names` serially; returns a dict of the LocusScore lists and counts:
+    scored, dropped, unscorable, boundary, dropped_boundary, offered, pruned.
 
     Opens its own database, FASTA and read-store handles, so it runs unchanged in
     a worker process.
@@ -233,37 +248,46 @@ def _score_names(names, segs, asm1, asm2, db_path, bams, fastas, params, qt,
     total = len(names) if total is None else total
     db = sqlite3.connect(db_path)
     fa = {a: pysam.FastaFile(fastas[a]) for a in (asm1, asm2)}
-    scored, dropped, unscorable = [], [], []
-    offered = skipped = 0
+    out = {"scored": [], "dropped": [], "unscorable": [], "boundary": [],
+           "dropped_boundary": [], "offered": 0, "pruned": 0}
     try:
         with ReadStore(db_path, {a: bams[a] for a in (asm1, asm2)}) as store:
             for i, name in enumerate(names):
                 seq, qual = store.get(name)
-                pl = {a: placements(db, a, name, prune) for a in (asm1, asm2)}
-                if any(straddles(pl[a][0], segs[a]) for a in (asm1, asm2)):
-                    dropped.append(name)
+                pl = {a: placements(db, a, name, prune, pid_min, plen_min) for a in (asm1, asm2)}
+                cross = name in boundary
+                if cross:
+                    # A boundary read crosses a sealed edge, past which both
+                    # candidates agree; compared only where it reaches both units.
+                    if not all(touches_unit(pl[a][0], segs[a]) for a in (asm1, asm2)):
+                        out["dropped_boundary"].append(name)
+                        continue
+                elif any(straddles(pl[a][0], segs[a]) for a in (asm1, asm2)):
+                    out["dropped"].append(name)
                     continue
                 ws = {}
                 for a in (asm1, asm2):
                     every, kept = pl[a]
-                    offered += len(every)
-                    skipped += len(every) - len(kept)
+                    out["offered"] += len(every)
+                    out["pruned"] += len(every) - len(kept)
                     ws[a] = build_windows(kept, segs[a], len(seq), fa[a],
-                                          k=k, extra=extra, width=width)
+                                          k=k, extra=extra, width=width, cross_edges=cross)
                 cache: dict = {}
                 lp1, n1, e1 = score_read(seq, qual, ws[asm1].windows, params, qt, engine, cache)
                 lp2, n2, e2 = score_read(seq, qual, ws[asm2].windows, params, qt, engine, cache)
                 if lp1 == NEG_INF and lp2 == NEG_INF:
-                    unscorable.append(name)
+                    out["unscorable"].append(name)
                     continue
-                scored.append(ReadScore(name, len(seq), lp1, lp2, n1, n2, max(e1, e2)))
+                out["scored"].append(ReadScore(name, len(seq), lp1, lp2, n1, n2, max(e1, e2)))
+                if cross:
+                    out["boundary"].append(name)
                 if progress:
                     progress(offset + i + 1, total)
     finally:
         for f in fa.values():
             f.close()
         db.close()
-    return scored, dropped, unscorable, offered, skipped
+    return out
 
 
 def score_locus(read_names, segments, asm1: str, asm2: str, *,
@@ -272,13 +296,22 @@ def score_locus(read_names, segments, asm1: str, asm2: str, *,
                 params: PhmmParams | None = None, qt: QualityTable | None = None,
                 k: int = 20, extra: int = 50, width: int = 100,
                 engine=None, progress=None, prune: float | None = DEFAULT_PRUNE,
-                workers: int | None = None) -> LocusScore:
+                workers: int | None = None, boundary_reads=(),
+                pid_threshold: float | None = None,
+                plen_threshold: float | None = None) -> LocusScore:
     """Score a recruited locus: read names and segments, as the recruiter returns them.
 
     `segments` may be any objects with `.assembly`, `.contig`, `.start`, `.end`,
     so this takes qatool Segments without importing qatool. The same read set is
     scored against both candidates; a read crossing a segment edge in either is
     dropped from both, which is what keeps the containment rule symmetric.
+
+    `boundary_reads` are the recruiter's reads crossing a sealed edge: scored too,
+    with windows past the edge (the flank is shared, so it cancels from each
+    ratio and the exposure term is unchanged), unless one candidate's segments are
+    out of their reach. `pid_threshold` and `plen_threshold` are the recruitment's:
+    only alignments passing them are placements (see `placements`); None keeps
+    every alignment, as before they existed.
 
     Reads are independent, so with `workers` > 1 they are split into chunks and
     scored in worker processes; results are reassembled in read-name order and
@@ -292,9 +325,10 @@ def score_locus(read_names, segments, asm1: str, asm2: str, *,
     segs = {asm1: [s for s in segments if s.assembly == asm1],
             asm2: [s for s in segments if s.assembly == asm2]}
     exposure = exposure_term(segs[asm1], segs[asm2], library)
-    names = sorted(read_names)
+    boundary = frozenset(boundary_reads) - set(read_names)
+    names = sorted(set(read_names) | boundary)
     common = (segs, asm1, asm2, db_path, bams, fastas, params, qt, k, extra, width,
-              engine, prune)
+              engine, prune, pid_threshold, plen_threshold, boundary)
 
     # Small chunks balance the load: a read in a repeat family has ~40 windows,
     # a unique read two.
@@ -304,16 +338,16 @@ def score_locus(read_names, segments, asm1: str, asm2: str, *,
     else:
         parts = _score_parallel(names, common, workers, chunk, progress)
 
-    scored, dropped, unscorable = [], [], []
+    tot = {k_: [] for k_ in ("scored", "dropped", "unscorable", "boundary", "dropped_boundary")}
     offered = skipped = 0
-    for sc, dr, un, of, sk in parts:
-        scored += sc
-        dropped += dr
-        unscorable += un
-        offered += of
-        skipped += sk
-    return LocusScore(asm1, asm2, scored, exposure, C, dropped, unscorable,
-                      placements=offered, pruned=skipped)
+    for part in parts:
+        for k_ in tot:
+            tot[k_] += part[k_]
+        offered += part["offered"]
+        skipped += part["pruned"]
+    return LocusScore(asm1, asm2, tot["scored"], exposure, C, tot["dropped"], tot["unscorable"],
+                      placements=offered, pruned=skipped, boundary=tot["boundary"],
+                      dropped_boundary=tot["dropped_boundary"])
 
 
 def _score_parallel(names, common, workers, chunk, progress):
