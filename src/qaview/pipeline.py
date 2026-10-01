@@ -38,17 +38,26 @@ from qaview.project import Project, Seed, validate_recruitment
 
 # Bump when a recruiter change alters results, so older recruitments are redone.
 RECRUIT_VERSION = 1
+# The same for the anchor extension alone, so its fixes leave legacy results be.
+# 2: reads at a seal that a merge put inside a segment are recruited.
+ANCHOR_VERSION = 2
 USER_WORKERS = 4            # re-recruitments the user asked for, at once
 
 
 # ---- recruitment (worker side) ----------------------------------------------------
 
 def recruit_key(project: Project, seed: Seed, params: dict | None = None) -> str:
+    params = dict(project.recruitment if params is None else params)
+    # The legacy extension leaves the key as it was before `extension` existed, so
+    # recruitments made then are still found.
+    if params.get("extension", "legacy") == "legacy":
+        params.pop("extension", None)
+    else:
+        params["extension_version"] = ANCHOR_VERSION
     payload = json.dumps({
         "version": RECRUIT_VERSION, "db": project.db,
         "asm": [[c.name, c.fasta, c.bam] for c in (project.asm1, project.asm2)],
-        "seed": list(seed.interval),
-        "params": project.recruitment if params is None else params,
+        "seed": list(seed.interval), "params": params,
     }, sort_keys=True)
     return hashlib.sha1(payload.encode()).hexdigest()[:16]
 
@@ -70,6 +79,7 @@ def recruit_one(job: dict) -> str:
         plen_threshold=r["plen_threshold"], best_pid_delta=r["best_pid_delta"],
         extension_window=r["extension_window"], ext_max=r["ext_max"],
         ext_rounds=r["ext_rounds"], max_rounds=r["max_rounds"],
+        extension=r.get("extension", "legacy"),
         out_dir=None, verbose=False,
     )
     seed = SegmentCollection([Segment(*job["seed"])])
@@ -77,7 +87,12 @@ def recruit_one(job: dict) -> str:
         segments, reads, _ = srr.run(seed)
     tmp = f"{job['out']}.{os.getpid()}.tmp"
     with open(tmp, "wb") as fh:
-        pickle.dump({"segments": list(segments), "reads": set(reads)}, fh)
+        # boundary_reads: reads crossing a sealed edge (anchor extension), kept apart
+        # from `reads` and out of locus_id; edge_log: why each edge stopped.
+        # params: what it was recruited with -- the scorer takes its pid/plen.
+        pickle.dump({"segments": list(segments), "reads": set(reads),
+                     "boundary_reads": set(srr.boundary_reads),
+                     "edge_log": list(srr.edge_log), "params": dict(r)}, fh)
     os.replace(tmp, job["out"])
     return job["out"]
 

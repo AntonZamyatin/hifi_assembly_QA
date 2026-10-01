@@ -508,6 +508,50 @@ recruited picture.
 - Round scrubbing (`_write_round_plot`, `max_rounds`, `ext_rounds`) remains available
   for later; not implemented.
 
+### 10.1 Extension strategies (`[recruitment] extension`)
+
+Each round, before reads are collected, every segment's two edges are moved out
+along its contig. Two strategies, chosen per project or per seed:
+
+- **`legacy`** (default): crawl 100 bp windows (`extension_window`). A window with
+  more than `extension_k` = 5 common reads, or with no uncommon read, seals the
+  edge after snapping out to the nearest common read crossing it; otherwise the
+  edge moves to the outermost start (end) of any qualifying read in the window.
+  Seals are kept per exact segment, so a segment that changes is unsealed.
+- **`anchor`** (experimental, branch `recruit-anchor`): at each edge, among the
+  alignments passing pid/plen that cross it (start < edge < end), take the one
+  reaching furthest out.
+  - If that read is *common* (best pids tie within `best_pid_delta` and the
+    reference under its best placements is identical in both candidates) and this
+    alignment is one of its best, the edge is **sealed where it is** -- the read is
+    the anchor. The qualifying reads crossing the edge are **boundary reads**:
+    held back from the locus's reads and never expanded into segments -- but only
+    while the seal is still an edge. When a merge (within `merge_gap`) or an
+    extension puts a seal inside a segment, its reads cover sequence the locus
+    now contains and are recruited like any other. The final set, reads crossing
+    sealed edges of the final segments, is `boundary_reads` in the recruitment
+    pickle, and they are scored with windows past the edge (docs/phmm.md, stage
+    I: "Boundary reads"); the score card counts them. Anchor recruitments carry
+    `extension_version` in their cache key (`pipeline.ANCHOR_VERSION`), so a fix
+    to this strategy redoes them without touching legacy ones. If the
+    anchor has exactly one best placement in each candidate, the matching
+    position in the other candidate (from the anchor's identical sequence, in
+    either orientation) is sealed too; it waits until an edge there reaches it.
+  - Otherwise -- not common, or not at one of its best alignments -- the edge moves
+    to that read's outer end, and the rule repeats there.
+  - No qualifying read crosses the edge: step out `gap_step` = 1000 bp and look
+    again, until a read crosses or the contig ends.
+  - Seals are positions, so they survive merges and later rounds; an edge moving
+    out stops at the first seal it meets. A segment already past a seal is not
+    trimmed. `ext_max` limits one phase, as in legacy; `extension_window` and
+    `extension_k` are not used.
+  - `Recruiter.edge_log` records each edge decision (round, from, to, and why:
+    anchor, seal, contig_end, limit) to compare strategies; it is saved as
+    `edge_log` in the recruitment pickle.
+
+The legacy strategy's cache key is the one it had before the option existed, so
+existing recruitments stay valid; an anchor recruitment has a key of its own.
+
 ---
 
 ## 11. Phasing
@@ -611,6 +655,7 @@ extension_window = 100
 ext_max = 300000
 ext_rounds = 100
 max_rounds = 100
+extension = "legacy"                      # or "anchor" (§10.1)
 
 [resources]
 recruit_workers = 32                      # seeds recruited at once

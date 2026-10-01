@@ -817,7 +817,15 @@ function buildRecruitForm(p) {
 }
 
 function recruitInputs() {
-  return [...document.querySelectorAll("#recruit-form input")];
+  return [...document.querySelectorAll("#recruit-form [data-key]")];
+  for (const [k, names] of Object.entries(p.recruitment_choices || {})) {
+    const sel = el("select"); sel.dataset.key = k;
+    for (const n of names) sel.append(el("option", n));
+    sel.value = p.recruitment[k];
+    sel.addEventListener("change", markRecruitChanges);
+    const lab = el("label", k); lab.append(sel);
+    form.append(lab);
+  }
 }
 
 function fillRecruitForm(params) {
@@ -830,7 +838,7 @@ function markRecruitChanges() {
   const def = state.project.recruitment;
   for (const i of recruitInputs()) {
     const d = def[i.dataset.key];
-    const changed = i.value !== "" && Number(i.value) !== d;
+    const changed = i.tagName === "SELECT" ? i.value !== d : i.value !== "" && Number(i.value) !== d;
     i.classList.toggle("changed", changed);
     i.title = changed ? `project file: ${d}` : "as in the project file";
   }

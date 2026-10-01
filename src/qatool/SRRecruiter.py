@@ -29,6 +29,17 @@ from qatool.SegmentStorage import *
 from qatool.aln_utils import cigar_stats
 from qatool.plotters import report_plot
 
+# Extension strategies (Recruiter(extension=...)):
+#   legacy -- crawl 100 bp windows; seal a window with more than extension_k common
+#             reads (or none uncommon), snapping out to the nearest common read.
+#   anchor -- per edge, the outermost qualifying read crossing it decides: common and
+#             at one of its best alignments -> seal the edge where it is (the read is
+#             the anchor); otherwise move the edge to that read's outer end. Nothing
+#             crossing -> step out gap_step bp. See Recruiter._anchor_extension_phase.
+EXTENSIONS = ("legacy", "anchor")
+_REVCOMP = str.maketrans("ACGTNacgtn", "TGCANtgcan")
+
+
 class Recruiter:
 
     def __init__(self, db_path: str,
@@ -40,7 +51,8 @@ class Recruiter:
                  extension_window: int=100, extension_k: int=5,
                  ext_max: int=100_000, ext_rounds: int=100,
                  max_rounds=100, out_dir: str | None = "recruitment_out",
-                 best_pid_delta: float = 0.0001):
+                 best_pid_delta: float = 0.0001,
+                 extension: str = "legacy", gap_step: int = 1000):
         self.db_path = db_path
         self.con = sqlite3.connect(db_path)
         _tables = {r[0] for r in self.con.execute(
@@ -70,6 +82,10 @@ class Recruiter:
         self.ext_rounds = ext_rounds
         self.out_dir = out_dir
         self.best_pid_delta = best_pid_delta
+        if extension not in EXTENSIONS:
+            raise ValueError(f"extension must be one of {EXTENSIONS}, not {extension!r}")
+        self.extension = extension
+        self.gap_step = gap_step
 
         self.sc: SegmentCollection = SegmentCollection(merge_gap=self.merge_gap)
         self.seen_reads: Set[str] = set()
@@ -78,6 +94,28 @@ class Recruiter:
         self._sealed: Dict[Tuple[str, str, int, int], Tuple[bool, bool]] = {}
         self._contig_lens: Dict[str, Dict[str, int]] = {}
         self._common_cache: Dict[str, bool] = {}
+        self._aln_cache: Dict[str, list] = {}
+        self._init_anchor_state()
+
+    def _init_anchor_state(self):
+        # Anchor extension. Seals are positions, so they survive merges and rounds:
+        # (assembly, contig, side) -> positions an edge on that side stops at. Own
+        # seals come from an anchor read at the edge; the other assembly's come from
+        # the anchor's matching position there and wait until an edge reaches them.
+        self._edge_seals: Dict[Tuple[str, str, str], Set[int]] = {}
+        # (assembly, contig, side, position) -> qualifying reads crossing that seal.
+        # They are held back -- not recruited, not expanded -- only while the seal is
+        # still an edge of a segment: once a merge or an extension puts it inside a
+        # segment, they are ordinary reads of the locus again (_active_boundary).
+        self._seal_reads: Dict[Tuple[str, str, str, int], Set[str]] = {}
+        self._held: Set[str] = set()      # reads skipped as boundary, their seal still an edge
+        # After run(): qualifying reads crossing a sealed edge of the final segments,
+        # kept apart from the locus reads for scoring later.
+        self.boundary_reads: Set[str] = set()
+        # One row per edge decision, for comparing strategies: round, assembly,
+        # contig, side, from, to, why ("anchor", "seal", "contig_end", "limit").
+        self.edge_log: List[dict] = []
+        self._round = 0
 
     def reset(self):
         self.sc = SegmentCollection(merge_gap=self.merge_gap)
@@ -86,6 +124,8 @@ class Recruiter:
                                             "start", "end", "pid", "plen", "ed"])
         self._sealed = {}
         self._common_cache = {}
+        self._aln_cache = {}
+        self._init_anchor_state()
         # (assembly, contig) -> extents expand_segments_to_reads has scanned. A read
         # contained in one was judged then: it joined seen_reads or failed the
         # static pid/plen filter, so later scans need not look at it again.
@@ -132,6 +172,7 @@ class Recruiter:
             if cur_round > self.max_rounds:
                 print(f"max rounds ({self.max_rounds}) exseeded, stopping.")
                 break
+            self._round = cur_round
             if self.verbose: print(f"[round {cur_round} start]\tnumber of segments: {len(self.sc)}\t"+
                                                               f"number of seen reads: {len(self.seen_reads)}")
             if self.ext_rounds is None or cur_round <= self.ext_rounds:
@@ -148,6 +189,8 @@ class Recruiter:
         final_reads = self.expand_segments_to_reads()
         if final_reads:
             self.seen_reads.update(final_reads)
+        # A read recruited through another segment is a locus read, not a boundary one.
+        self.boundary_reads = self._active_boundary() - self.seen_reads
         return self.sc, self.seen_reads, self.aln_df
 
     def _prime_contig_lengths(self):
@@ -184,20 +227,37 @@ class Recruiter:
                 new_sealed[key] = self._sealed[key]
         self._sealed = new_sealed
 
+    def _read_alns(self, read_name: str) -> list:
+        """The read's qualifying alignments in both assemblies: (assembly, contig, start, end, pid)."""
+        rows = self._aln_cache.get(read_name)
+        if rows is None:
+            rows = self.con.execute(
+                """SELECT assembly, contig, start, end, pid
+                   FROM aln
+                   WHERE assembly IN (?,?)
+                     AND read_name = ?
+                     AND pid >= ?
+                     AND plen >= ?""",
+                [self.asm1, self.asm2, read_name, self.pid_threshold, self.plen_threshold],
+            ).fetchall()
+            self._aln_cache[read_name] = rows
+        return rows
+
+    def _best_loci(self, read_name: str, asm: str) -> List[Tuple[str, int, int, float]]:
+        """The read's alignments in `asm` within best_pid_delta of its best there."""
+        rows = [(str(c), int(s), int(e), float(p))
+                for a, c, s, e, p in self._read_alns(read_name) if a == asm]
+        if not rows:
+            return []
+        best = max(r[3] for r in rows)
+        return [r for r in rows if r[3] + self.best_pid_delta >= best]
+
     def _read_is_common(self, read_name: str) -> bool:
         cached = self._common_cache.get(read_name)
         if cached is not None:
             return cached
 
-        rows = self.con.execute(
-            """SELECT assembly, contig, start, end, pid
-               FROM aln
-               WHERE assembly IN (?,?)
-                 AND read_name = ?
-                 AND pid >= ?
-                 AND plen >= ?""",
-            [self.asm1, self.asm2, read_name, self.pid_threshold, self.plen_threshold],
-        ).fetchall()
+        rows = self._read_alns(read_name)
 
         # Step 1: best PID per assembly
         best_pid: Dict[str, float] = {}
@@ -264,6 +324,146 @@ class Recruiter:
         return None
 
     def extension_phase(self):
+        if self.extension == "anchor":
+            self._anchor_extension_phase()
+        else:
+            self._legacy_extension_phase()
+
+    # ---- anchor extension -------------------------------------------------------------
+
+    def _crossing(self, asm: str, contig: str, pos: int) -> List[Tuple[str, int, int]]:
+        """Qualifying alignments crossing position `pos` (start < pos < end): (read, start, end)."""
+        out = []
+        for aln in self.bams[asm].fetch(contig, max(0, pos - 1), pos + 1):
+            a_start, a_end = aln.reference_start, aln.reference_end
+            if not (a_start < pos < a_end):
+                continue
+            _, _, _, _, _, _, plen, pid, _ = cigar_stats(aln)
+            if pid < self.pid_threshold or plen is None or plen < self.plen_threshold:
+                continue
+            out.append((aln.query_name, int(a_start), int(a_end)))
+        return out
+
+    def _anchor_locus(self, asm: str, contig: str, read: str, start: int, end: int):
+        """The read's best locus this alignment is, or None if it is not one of its best."""
+        for c, s, e, p in self._best_loci(read, asm):
+            if c == contig and s == start and e == end:
+                return (c, s, e)
+        return None
+
+    def _counterpart(self, asm: str, locus, read: str, pos: int, side: str):
+        """(other assembly, contig, side, position) matching `pos` on the anchor's locus.
+
+        Only for an anchor with one best locus in each assembly: with several, the
+        identical copies cannot be told apart and no counterpart is sealed.
+        """
+        other = self.asm2 if asm == self.asm1 else self.asm1
+        mine, theirs = self._best_loci(read, asm), self._best_loci(read, other)
+        if len(mine) != 1 or len(theirs) != 1:
+            return None
+        c, s, e = locus
+        oc, os_, oe, _ = theirs[0]
+        seq = self.fastas[asm].fetch(c, s, e).upper()
+        oseq = self.fastas[other].fetch(oc, os_, oe).upper()
+        if seq == oseq:
+            return other, oc, side, os_ + (pos - s)
+        if seq == oseq.translate(_REVCOMP)[::-1]:
+            return other, oc, ("R" if side == "L" else "L"), oe - (pos - s)
+        return None
+
+    def _seal(self, asm: str, contig: str, side: str, pos: int):
+        """Seal an edge at `pos`, noting the reads that cross it (once)."""
+        self._edge_seals.setdefault((asm, contig, side), set()).add(pos)
+        key = (asm, contig, side, pos)
+        if key not in self._seal_reads:
+            self._seal_reads[key] = {r for r, _, _ in self._crossing(asm, contig, pos)}
+
+    def _active_boundary(self) -> Set[str]:
+        """Reads crossing a seal that is still an edge of a current segment."""
+        if not self._seal_reads:
+            return set()
+        edges = set()
+        for seg in self.sc:
+            edges.add((seg.assembly, seg.contig, "L", seg.start))
+            edges.add((seg.assembly, seg.contig, "R", seg.end))
+        out: Set[str] = set()
+        for key, reads in self._seal_reads.items():
+            if key in edges:
+                out |= reads
+        return out
+
+    def _seal_between(self, asm: str, contig: str, side: str, pos: int, new: int) -> int | None:
+        """The first seal an edge moving from `pos` to `new` meets, if any."""
+        seals = self._edge_seals.get((asm, contig, side), ())
+        if side == "L":
+            hit = [q for q in seals if new <= q < pos]
+            return max(hit) if hit else None
+        hit = [q for q in seals if pos < q <= new]
+        return min(hit) if hit else None
+
+    def _extend_edge(self, asm: str, contig: str, pos: int, side: str, limit: int) -> int:
+        """Move one edge outward by the anchor rule; returns its new position."""
+        contig_len = self._contig_lens[asm][contig]
+        sign = -1 if side == "L" else 1
+        start_pos = pos
+
+        def log(to, why):
+            self.edge_log.append({"round": self._round, "assembly": asm, "contig": contig,
+                                  "side": side, "from": start_pos, "to": to, "why": why})
+            return to
+
+        while True:
+            if pos in self._edge_seals.get((asm, contig, side), ()):
+                # sealed before, or the other assembly's anchor waits here
+                self._seal(asm, contig, side, pos)
+                return log(pos, "seal") if pos != start_pos else pos
+            if pos <= 0 or pos >= contig_len:
+                return log(pos, "contig_end") if pos != start_pos else pos
+            if pos == limit:
+                return log(pos, "limit")
+            crossing = self._crossing(asm, contig, pos)
+            if not crossing:
+                new = pos + sign * self.gap_step                  # a coverage gap: step out
+            else:
+                read, a_start, a_end = (min(crossing, key=lambda r: r[1]) if side == "L"
+                                        else max(crossing, key=lambda r: r[2]))
+                locus = self._anchor_locus(asm, contig, read, a_start, a_end)
+                if locus is not None and self._read_is_common(read):
+                    self._seal(asm, contig, side, pos)
+                    other = self._counterpart(asm, locus, read, pos, side)
+                    if other is not None:
+                        o_asm, o_contig, o_side, o_pos = other
+                        self._edge_seals.setdefault((o_asm, o_contig, o_side), set()).add(o_pos)
+                    if self.verbose:
+                        print("ANCHOR", asm, contig, side, pos, read, "->", other)
+                    return log(pos, "anchor")
+                new = a_start if side == "L" else a_end
+            new = max(new, limit) if side == "L" else min(new, limit)
+            q = self._seal_between(asm, contig, side, pos, new)
+            if q is not None:
+                self._seal(asm, contig, side, q)
+                return log(q, "seal")
+            pos = new
+
+    def _anchor_extension_phase(self):
+        if self.ext_max <= 0:
+            return
+        updated = []
+        for seg in list(self.sc):
+            contig_len = self._contig_lens[seg.assembly].get(seg.contig)
+            if contig_len is None:
+                raise ValueError(f"Unknown contig length for {seg.assembly}:{seg.contig}")
+            # As in legacy, ext_max limits one phase, measured from where the edge is now.
+            left_limit = max(0, seg.start - self.ext_max)
+            right_limit = min(contig_len, seg.end + self.ext_max)
+            start = self._extend_edge(seg.assembly, seg.contig, seg.start, "L", left_limit)
+            end = self._extend_edge(seg.assembly, seg.contig, seg.end, "R", right_limit)
+            updated.append(Segment(seg.assembly, seg.contig, start, end))
+        self.sc = SegmentCollection(updated, merge_gap=self.merge_gap)
+
+    # ---- legacy extension -------------------------------------------------------------
+
+    def _legacy_extension_phase(self):
         self._remap_sealed_to_current_segments()
         if self.extension_window <= 0 or self.extension_k <= 0:
             return
@@ -404,6 +604,12 @@ class Recruiter:
         """
         reads: Set[str] = set()
         scanned_now: List[Tuple[Tuple[str, str], Tuple[int, int]]] = []
+        boundary = self._active_boundary()
+        if self._held - boundary:
+            # A read held back at a seal that is now inside a segment: the extents it
+            # was skipped in must be scanned again, or it would stay out for good.
+            self._scanned = {}
+        self._held &= boundary          # kept across passes: a skipped extent is not revisited
         for seg in self.sc:
             key = (seg.assembly, seg.contig)
             done = self._scanned.get(key, [])
@@ -416,6 +622,9 @@ class Recruiter:
                     continue
                 if aln.query_name in self.seen_reads:
                     continue
+                if aln.query_name in boundary:
+                    self._held.add(aln.query_name)
+                    continue                # crosses a sealed edge: not recruited
                 if any(s <= a_start and a_end <= e for s, e in done):
                     continue                # judged when that extent was scanned
                 #pid = calculate_pid(aln)

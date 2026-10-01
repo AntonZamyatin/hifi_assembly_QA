@@ -27,7 +27,8 @@ from fastapi.staticfiles import StaticFiles
 
 from qaview.glyphs import BAR_SIZE, MARGIN_SIZE, RATIO_NEG, RATIO_POS, report_layout
 from qaview.pipeline import Pipeline
-from qaview.project import RECRUITMENT_RANGES, Project, ProjectError, load_project
+from qaview.project import (RECRUITMENT_CHOICES, RECRUITMENT_RANGES, Project, ProjectError,
+                            load_project)
 from qaview.region import (LAYER_COMMON, LAYER_OTHER, LAYER_SUPPLEMENTARY, LAYER_SUPPORT,
                            RegionData)
 
@@ -212,6 +213,7 @@ def create_app(project: Project | None = None, pipeline: Pipeline | None = None,
             "recruitment": p.recruitment, "resources": p.resources,
             "recruitment_ranges": {k: [t.__name__, lo, hi]
                                    for k, (t, lo, hi) in RECRUITMENT_RANGES.items()},
+            "recruitment_choices": {k: list(v) for k, v in RECRUITMENT_CHOICES.items()},
             "output_dir": p.output_dir,
             "colors": {"ratio_pos": _hex(RATIO_POS), "ratio_neg": _hex(RATIO_NEG)},
             "layers": list(LAYERS),

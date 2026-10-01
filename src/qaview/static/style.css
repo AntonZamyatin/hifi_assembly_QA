@@ -309,5 +309,5 @@ dl.files dd { font-family: ui-monospace, monospace; font-size: 11px; }
 .badge { font-size: 11px; padding: 0 5px; border-radius: 8px; border: 1px solid var(--line); }
 .badge.own { color: var(--accent); border-color: var(--accent); }
 .badge.busy { color: var(--muted); }
-#recruit-form input.changed { border-color: var(--accent); background: var(--select); }
+#recruit-form .changed { border-color: var(--accent); background: var(--select); }
 #loci td .own { color: var(--accent); font-weight: 700; margin-left: 2px; }

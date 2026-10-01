@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 RECRUITMENT_DEFAULTS = dict(
     pid_threshold=0.997, plen_threshold=0.999, best_pid_delta=0.001,
     merge_gap=50_000, extension_window=100, ext_max=300_000,
-    ext_rounds=100, max_rounds=100,
+    ext_rounds=100, max_rounds=100, extension="legacy",
 )
 RESOURCE_DEFAULTS = dict(recruit_workers=32, score_workers=32)
 # What each recruitment parameter may be: (type, lowest, highest).
@@ -32,6 +32,8 @@ RECRUITMENT_RANGES = dict(
     extension_window=(int, 1, 100_000), ext_max=(int, 0, 100_000_000),
     ext_rounds=(int, 0, 10_000), max_rounds=(int, 1, 10_000),
 )
+# Parameters that take one of a few names (qatool.SRRecruiter.EXTENSIONS).
+RECRUITMENT_CHOICES = dict(extension=("legacy", "anchor"))
 
 
 class ProjectError(ValueError):
@@ -45,6 +47,12 @@ def validate_recruitment(params: dict) -> dict:
     """
     out, problems = {}, []
     for k, v in params.items():
+        if k in RECRUITMENT_CHOICES:
+            if v not in RECRUITMENT_CHOICES[k]:
+                problems.append(f"{k} must be one of {', '.join(RECRUITMENT_CHOICES[k])}: {v!r}")
+            else:
+                out[k] = v
+            continue
         if k not in RECRUITMENT_RANGES:
             problems.append(f"unknown parameter {k}")
             continue
@@ -215,6 +223,10 @@ def load_project(path: str, check_files: bool = True) -> Project:
     if unknown:
         raise ProjectError(f"[recruitment] unknown keys: {', '.join(sorted(unknown))}")
     recruitment = {**RECRUITMENT_DEFAULTS, **t.get("recruitment", {})}
+    for k, names in RECRUITMENT_CHOICES.items():
+        if recruitment[k] not in names:
+            raise ProjectError(f"[recruitment] {k} must be one of {', '.join(names)}: "
+                               f"{recruitment[k]!r}")
     unknown = set(t.get("resources", {})) - set(RESOURCE_DEFAULTS)
     if unknown:
         raise ProjectError(f"[resources] unknown keys: {', '.join(sorted(unknown))}")
