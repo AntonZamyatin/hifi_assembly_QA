@@ -1,0 +1,43 @@
+# qaview project: mPleAur1 reference against candidate 2 at the seed of
+# "Figure for Anton.ipynb" in the repository root, whose data are under the root's
+# alignments/ and genomes/. Written by examples/scripts/make_projects.py.
+# Paths are relative to this file.
+
+name = "figure_for_anton"
+
+[asm1]                                    # Delta S > 0 favours asm1
+name  = "ref"
+fasta = "../../genomes/mPleAur1/mPleAur1.dip.ref.fasta.bgz"
+bam   = "../../alignments/mPleAur1.ref.sorted.bam"
+
+[asm2]
+name  = "cand2"
+fasta = "../../genomes/mPleAur1/mPleAur1.dip.cand2.fasta.bgz"
+bam   = "../../alignments/mPleAur1.cand2.sorted.bam"
+
+[data]
+db = "../../alignments/mPleAur1.aln.sqlite"
+library_assembly = "ref"                  # lambda reference; keep fixed across loci
+
+[[seeds]]
+format   = "bed"
+path     = "seeds/figure_for_anton.bed"
+assembly = "ref"
+
+[recruitment]                             # hg002_hic's values, with the anchor extension
+pid_threshold    = 0.997
+plen_threshold   = 0.999
+best_pid_delta   = 0.001
+merge_gap        = 50000
+extension_window = 100
+ext_max          = 300000
+ext_rounds       = 100
+max_rounds       = 100
+extension        = "anchor"
+
+[resources]
+recruit_workers = 32
+score_workers   = 32
+
+[output]
+dir = "../analysis/figure_for_anton"

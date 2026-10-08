@@ -25,7 +25,10 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from qaview.glyphs import BAR_SIZE, MARGIN_SIZE, RATIO_NEG, RATIO_POS, report_layout
+from qaview.glyphs import (BACKGROUND_COLORS, BAR_SIZE, MARGIN_SIZE, RATIO_NEG, RATIO_POS,
+                           report_layout, style_spec)
+from qamodel.phmm.reads import FALLBACK_QUAL
+from qaview.similarity import FLOOR as SIM_FLOOR
 from qaview.pipeline import Pipeline
 from qaview.project import (RECRUITMENT_CHOICES, RECRUITMENT_RANGES, Project, ProjectError,
                             load_project)
@@ -112,7 +115,7 @@ class Session:
         self.stars = Stars(os.path.join(project.output_dir, "qaview_stars.json"))
 
 
-RECENT_MAX = 10
+RECENT_MAX = 30
 
 
 def recent_path() -> str:
@@ -216,6 +219,8 @@ def create_app(project: Project | None = None, pipeline: Pipeline | None = None,
             "recruitment_choices": {k: list(v) for k, v in RECRUITMENT_CHOICES.items()},
             "output_dir": p.output_dir,
             "colors": {"ratio_pos": _hex(RATIO_POS), "ratio_neg": _hex(RATIO_NEG)},
+            "background_colors": list(BACKGROUND_COLORS),
+            "fallback_qual": FALLBACK_QUAL,
             "layers": list(LAYERS),
         }
 
@@ -338,6 +343,25 @@ def create_app(project: Project | None = None, pipeline: Pipeline | None = None,
             raise HTTPException(404, f"no remembered alignment {ident}") from exc
         return {"ok": True}
 
+    # ---- adding a seed ------------------------------------------------------------------
+
+    @app.post("/api/seeds")
+    def add_seed(assembly: str = Body(...), region: str = Body(...), name: str = Body("")):
+        """A new seed on `assembly` at `region` (contig:start-end, 1-based inclusive):
+        saved to the output folder's qaview_seeds.json and recruited at once."""
+        from qaview.project import new_seed, save_added_seed
+
+        sess = cur()
+        with switching:                    # one check-and-add at a time
+            try:
+                seed = new_seed(sess.project, assembly, region, name)
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
+            save_added_seed(sess.project.output_dir, seed)
+            sess.pipe.add_seed(seed)
+        return {"name": seed.name, "assembly": seed.assembly, "contig": seed.contig,
+                "start": seed.start, "end": seed.end}
+
     # ---- re-recruitment ----------------------------------------------------------------
 
     @app.get("/api/loci/{lid}/seeds")
@@ -428,8 +452,14 @@ def create_app(project: Project | None = None, pipeline: Pipeline | None = None,
              pid: float = 0.997, plen: float = 0.999,
              best_pid_delta: float = 0.001, pid_tie_eps: float = 0.0001,
              binsize: int = 0, color_by: str = "log-ratio", C: float = 200.0,
-             layers: str = ",".join(LAYERS)):
-        """The report for one locus, sized to a w x h cell, as a Bokeh json_item."""
+             layers: str = ",".join(LAYERS), reads: str = "hover", background: bool = True):
+        """The report for one locus, sized to a w x h cell, as a Bokeh json_item.
+
+        `reads`: "all" draws every read line, "hover" only the reads of a hovered
+        marginal bin. `background`: the segments' k-mer similarity underneath, from
+        `pid` up, once computed (it is started here; the row's `background` says
+        when it is ready).
+        """
         from bokeh.embed import json_item
 
         s = cur()
@@ -438,6 +468,17 @@ def create_app(project: Project | None = None, pipeline: Pipeline | None = None,
             raise HTTPException(404, f"no locus {lid}")
         if color_by not in ("class", "block", "log-ratio"):
             raise HTTPException(400, f"unknown colour mode {color_by!r}")
+        if reads not in ("all", "hover"):
+            raise HTTPException(400, f"unknown reads mode {reads!r}")
+        bg = None
+        if background:
+            s.pipe.request_background(lid)
+            bg = s.pipe.background(lid)
+        # The background shows what the recruitment followed: drawn from the
+        # locus's own recruitment pid, whatever the display pid (lowering that to
+        # see more reads must not flood the background). The cache keeps cells
+        # from similarity.FLOOR up, so a lower recruitment pid draws from there.
+        bg_floor = max((loc.params or s.project.recruitment)["pid_threshold"], SIM_FLOOR)
         rd = region(s, lid, pid, plen, best_pid_delta, pid_tie_eps, binsize)
         score = loc.score
         ratios = {r.name: r.ratio for r in score.reads} if score is not None else None
@@ -449,9 +490,19 @@ def create_app(project: Project | None = None, pipeline: Pipeline | None = None,
         layout = report_layout(
             rd, color_by=color_by, visible_layers=visible, ratios=ratios, dropped=dropped,
             C=C, max_width=w - BAR_SIZE - margin - PAD_W,
-            max_height=h - BAR_SIZE - margin - PAD_H, margin_size=margin)
+            max_height=h - BAR_SIZE - margin - PAD_H, margin_size=margin,
+            background=bg, floor=bg_floor, reads=reads)
         out = {"item": json_item(layout), "locus": loc.row(),
-               "tie_warning": pid_tie_eps >= best_pid_delta, "score": None}
+               "background": {"status": loc.background, "error": loc.background_error,
+                              "drawn": bg is not None, "floor": bg_floor,
+                              "cells": int((bg["identity"] >= bg_floor).sum()) if bg is not None else 0,
+                              "grid": [bg["n1"], bg["n2"]] if bg is not None else None,
+                              "binsize": bg["binsize"] if bg is not None else None,
+                              "sampling": bg["settings"]["sampling_scale"] if bg is not None else None},
+               "tie_warning": pid_tie_eps >= best_pid_delta, "score": None,
+               # what the page needs to restyle without coming back: colouring,
+               # C, layers, reads mode and the background are all applied there
+               "style": {**style_spec(), "layers": dict(LAYERS)}}
         if score is not None:
             up, down = score.clamped_counts(C)
             x = score.exposure
@@ -465,7 +516,11 @@ def create_app(project: Project | None = None, pipeline: Pipeline | None = None,
                 "placements": getattr(score, "placements", 0),
                 "pruned": getattr(score, "pruned", 0),
                 "boundary": len(getattr(score, "boundary", ())),
-                "dropped_boundary": len(getattr(score, "dropped_boundary", ()))}
+                "dropped_boundary": len(getattr(score, "dropped_boundary", ())),
+                "fixed_quality": len(getattr(score, "fixed_quality", ())),
+                # per read, for Delta S at another C on the page (+/-inf as 1e308:
+                # JSON has no infinity, and any C clamps it the same)
+                "ratios": [max(-1e308, min(1e308, r.ratio)) for r in score.reads]}
         return JSONResponse(out)
 
     return app

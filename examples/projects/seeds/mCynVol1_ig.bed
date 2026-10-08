@@ -1,0 +1,3 @@
+# mCynVol1: IG anomalies from anomaly_table.csv, on ref (make_projects.py)
+SUPER_2	206159189	206163561	IGL_001_SUPER_2_mismatch
+SUPER_2	206164980	206178601	IGL_002_SUPER_2_mismatch

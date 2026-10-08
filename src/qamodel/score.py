@@ -96,6 +96,8 @@ class LocusScore:
     boundary: list[str] = field(default_factory=list)    # boundary reads among `reads`
     # boundary reads not scored: no placement touches one candidate's segments
     dropped_boundary: list[str] = field(default_factory=list)
+    # reads stored without base qualities, scored at reads.FALLBACK_QUAL
+    fixed_quality: list[str] = field(default_factory=list)
 
     def emission_at(self, C: float) -> float:
         return float(sum(r.clamped(C) for r in self.reads))
@@ -235,7 +237,8 @@ def _score_names(names, segs, asm1, asm2, db_path, bams, fastas, params, qt,
                  k, extra, width, engine, prune, pid_min=None, plen_min=None,
                  boundary=frozenset(), progress=None, offset=0, total=None):
     """Score `names` serially; returns a dict of the LocusScore lists and counts:
-    scored, dropped, unscorable, boundary, dropped_boundary, offered, pruned.
+    scored, dropped, unscorable, boundary, dropped_boundary, fixed_quality,
+    offered, pruned.
 
     Opens its own database, FASTA and read-store handles, so it runs unchanged in
     a worker process.
@@ -249,7 +252,7 @@ def _score_names(names, segs, asm1, asm2, db_path, bams, fastas, params, qt,
     db = sqlite3.connect(db_path)
     fa = {a: pysam.FastaFile(fastas[a]) for a in (asm1, asm2)}
     out = {"scored": [], "dropped": [], "unscorable": [], "boundary": [],
-           "dropped_boundary": [], "offered": 0, "pruned": 0}
+           "dropped_boundary": [], "fixed_quality": [], "offered": 0, "pruned": 0}
     try:
         with ReadStore(db_path, {a: bams[a] for a in (asm1, asm2)}) as store:
             for i, name in enumerate(names):
@@ -283,6 +286,7 @@ def _score_names(names, segs, asm1, asm2, db_path, bams, fastas, params, qt,
                     out["boundary"].append(name)
                 if progress:
                     progress(offset + i + 1, total)
+            out["fixed_quality"] = sorted(store.fixed_quality)
     finally:
         for f in fa.values():
             f.close()
@@ -338,7 +342,8 @@ def score_locus(read_names, segments, asm1: str, asm2: str, *,
     else:
         parts = _score_parallel(names, common, workers, chunk, progress)
 
-    tot = {k_: [] for k_ in ("scored", "dropped", "unscorable", "boundary", "dropped_boundary")}
+    tot = {k_: [] for k_ in ("scored", "dropped", "unscorable", "boundary", "dropped_boundary",
+                             "fixed_quality")}
     offered = skipped = 0
     for part in parts:
         for k_ in tot:
@@ -347,7 +352,8 @@ def score_locus(read_names, segments, asm1: str, asm2: str, *,
         skipped += part["pruned"]
     return LocusScore(asm1, asm2, tot["scored"], exposure, C, tot["dropped"], tot["unscorable"],
                       placements=offered, pruned=skipped, boundary=tot["boundary"],
-                      dropped_boundary=tot["dropped_boundary"])
+                      dropped_boundary=tot["dropped_boundary"],
+                      fixed_quality=sorted(tot["fixed_quality"]))
 
 
 def _score_parallel(names, common, workers, chunk, progress):

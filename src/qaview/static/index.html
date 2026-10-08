@@ -51,10 +51,23 @@
         <div class="section-head">
           <span>Loci</span>
           <span class="head-tools">
+            <button id="add-seed-toggle" class="toggle" title="add a seed to this project">+</button>
             <button id="star-only" class="toggle" title="show starred loci only">&#9733;</button>
             <input id="filter" type="search" placeholder="filter seeds" autocomplete="off">
           </span>
         </div>
+        <form id="add-seed" class="add-seed" autocomplete="off" hidden>
+          <div class="row">
+            <select id="seed-assembly" title="the assembly the region is on"></select>
+            <input id="seed-region" type="text" spellcheck="false" placeholder="contig:start-end"
+                   title="1-based and inclusive, as the page shows coordinates; commas allowed">
+          </div>
+          <div class="row">
+            <input id="seed-name" type="text" spellcheck="false" placeholder="name (optional)">
+            <button class="btn" type="submit">Add</button>
+          </div>
+          <div id="seed-msg" class="small" hidden></div>
+        </form>
         <div class="table-wrap">
           <table id="loci">
             <thead><tr>
@@ -92,6 +105,18 @@
             <span>layers</span>
             <div id="layers" class="checks"></div>
           </div>
+          <div class="field">
+            <span>reads</span>
+            <div class="segmented" id="reads_mode" title="on hover: only the reads of the marginal bin under the pointer (fast on large loci); all: every read line">
+              <button data-v="hover" class="on">on hover</button><button data-v="all">all</button>
+            </div>
+          </div>
+          <div class="field">
+            <span>background</span>
+            <div class="checks"><label title="k-mer similarity of every pair of bins, drawn under the reads where its estimated identity reaches the display pid"><input id="background" type="checkbox" checked>k-mer similarity</label></div>
+          </div>
+          <div id="syn-legend" class="small muted legend"></div>
+          <div id="syn-status" class="small muted"></div>
         </div>
       </details>
 
@@ -122,6 +147,8 @@
     </div>
     <div id="plot-cell">
       <div id="plot"></div>
+      <div id="plot-grip" hidden></div>
+      <div id="plot-ghost" hidden></div>
       <div id="plot-status" class="muted"></div>
       <div id="rect-tip" hidden></div>
     </div>

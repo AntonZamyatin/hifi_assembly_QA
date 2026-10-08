@@ -10,8 +10,14 @@ Opening a project starts two queues:
   from the project file only for that seed and are kept in
   `output/qaview_recruitment.json`, so a reopened project recruits it the same
   way. Re-recruitments run in a small pool of their own, not behind the queue.
-- **scoring** -- each distinct locus once. A finished seed's locus is
-  `locus_id(segments, reads)`; seeds that recruit the same locus share a row.
+- **background** -- k-mer similarity between a locus's segments
+  (`qaview.similarity`), for the dotplot: started when the locus is viewed, a
+  few at a time, cached under `output/similarity/`.
+- **scoring** -- each distinct locus once. Seeds that recruit the same read set
+  share a row, even if their segments differ (a seed's own coordinates, or an
+  edge stopped by `ext_max`, can shift an end with no read beyond it): the row
+  keeps the segments of the seed that made it, and its id is that seed's
+  `locus_id(segments, reads)`.
   Scores live in `output/loci/`, the cache the batch notebooks write, so a locus
   the batch scored is loaded, not recomputed. Scoring runs in a subprocess
   (`qaview.score_job`), which forks `score_workers` processes of its own.
@@ -40,11 +46,18 @@ from qaview.project import Project, Seed, validate_recruitment
 RECRUIT_VERSION = 1
 # The same for the anchor extension alone, so its fixes leave legacy results be.
 # 2: reads at a seal that a merge put inside a segment are recruited.
-ANCHOR_VERSION = 2
+# 3: edges move to the nearest anchor region; anchors' copies become segments;
+#    common reads add no segments; no boundary reads.
+ANCHOR_VERSION = 3
 USER_WORKERS = 4            # re-recruitments the user asked for, at once
 
 
 # ---- recruitment (worker side) ----------------------------------------------------
+
+def reads_key(reads) -> str:
+    """A read set's hash: seeds recruiting the same reads share a locus."""
+    return hashlib.sha1("\n".join(sorted(reads)).encode()).hexdigest()[:16]
+
 
 def recruit_key(project: Project, seed: Seed, params: dict | None = None) -> str:
     params = dict(project.recruitment if params is None else params)
@@ -87,8 +100,8 @@ def recruit_one(job: dict) -> str:
         segments, reads, _ = srr.run(seed)
     tmp = f"{job['out']}.{os.getpid()}.tmp"
     with open(tmp, "wb") as fh:
-        # boundary_reads: reads crossing a sealed edge (anchor extension), kept apart
-        # from `reads` and out of locus_id; edge_log: why each edge stopped.
+        # boundary_reads: reads crossing a sealed edge, kept apart from `reads` and out
+        # of locus_id (empty since anchor version 3); edge_log: why each edge stopped.
         # params: what it was recruited with -- the scorer takes its pid/plen.
         pickle.dump({"segments": list(segments), "reads": set(reads),
                      "boundary_reads": set(srr.boundary_reads),
@@ -154,7 +167,8 @@ class SeedState:
 @dataclass
 class Locus:
     id: str
-    recruit_path: str           # any one seed's pickle: all of them hold this locus
+    recruit_path: str           # the pickle of the seed that made it: its segments
+    reads_key: str = ""         # the read set's hash; seeds with the same one join
     seeds: list[str] = field(default_factory=list)
     n_reads: int = 0
     params: dict = field(default_factory=dict)     # recruitment parameters behind it
@@ -167,6 +181,8 @@ class Locus:
     error: str | None = None
     recruiting: set = field(default_factory=set)   # its seeds being re-recruited
     recruit_error: str | None = None               # the last re-recruitment that failed
+    background: str | None = None  # k-mer similarity: None | running | ready | failed
+    background_error: str | None = None
 
     def row(self) -> dict:
         s = self.score
@@ -174,7 +190,8 @@ class Locus:
                "reads": self.n_reads, "span": self.span, "segments": self.n_segments,
                "status": self.status, "progress": round(self.progress, 3),
                "error": self.error, "delta_s": None, "boundary": len(self.boundary),
-               "recruiting": sorted(self.recruiting), "recruit_error": self.recruit_error}
+               "recruiting": sorted(self.recruiting), "recruit_error": self.recruit_error,
+               "background": self.background, "background_error": self.background_error}
         if s is not None:
             up, down = s.clamped_counts()
             row.update(delta_s=round(s.delta_s, 2), emission=round(s.emission, 2),
@@ -198,6 +215,7 @@ class Pipeline:
             self.seeds[s.name] = SeedState(s, self._recruit_path(s, params), params)
         self.loci: dict[str, Locus] = {}
         self._moved: dict[str, str | None] = {}     # removed locus id -> where its seed went
+        self._by_reads: dict[str, str] = {}         # read-set hash -> locus id
         self._lock = threading.RLock()
         self._wake = threading.Condition(self._lock)
         self._seq = 0
@@ -206,6 +224,8 @@ class Pipeline:
         self._pool: ProcessPoolExecutor | None = None
         self._user_pool: ProcessPoolExecutor | None = None
         self._score_proc: subprocess.Popen | None = None
+        self._bg_pool = None                        # ThreadPoolExecutor, made on first use
+        self._bg_paths: dict[str, str] = {}         # locus id -> its background cache file
         self._stopping = False
         self.started = time.time()
 
@@ -229,6 +249,8 @@ class Pipeline:
             for proc in procs:
                 if proc.is_alive():
                     proc.terminate()
+        if self._bg_pool is not None:
+            self._bg_pool.shutdown(wait=False, cancel_futures=True)
         proc = self._score_proc
         if proc is not None and proc.poll() is None:
             # The scoring job forks its own workers: end the whole process group.
@@ -313,17 +335,39 @@ class Pipeline:
                     threading.Thread(target=self._seed_done, args=(st, gen, eff, path),
                                      daemon=True).start()
                 else:
-                    if self._user_pool is None:
-                        import multiprocessing as mp
-                        self._user_pool = ProcessPoolExecutor(
-                            max_workers=max(1, min(USER_WORKERS,
-                                                   self.project.resources["recruit_workers"])),
-                            mp_context=mp.get_context("spawn"))
-                    self._submit(self._user_pool, st, gen, eff, path)
+                    self._submit(self._user_pool_get(), st, gen, eff, path)
                 queued.append(name)
         with self._lock:
             # Updates from this seq on show the seeds as recruiting (or already done).
             return {"queued": queued, "unchanged": unchanged, "seq": self._seq}
+
+    def _user_pool_get(self) -> ProcessPoolExecutor:
+        """The pool for work the user asked for (call with the lock held)."""
+        if self._user_pool is None:
+            import multiprocessing as mp
+            self._user_pool = ProcessPoolExecutor(
+                max_workers=max(1, min(USER_WORKERS, self.project.resources["recruit_workers"])),
+                mp_context=mp.get_context("spawn"))
+        return self._user_pool
+
+    def add_seed(self, seed: Seed) -> None:
+        """A seed added from the page: recruit it now, with the project's parameters,
+        and score its locus next. `seed` is checked and saved by the caller."""
+        params = self.params_for(seed.name)
+        path = self._recruit_path(seed, params)
+        with self._lock:
+            if seed.name in self.seeds:
+                raise KeyError(seed.name)
+            self.project.seeds.append(seed)
+            st = SeedState(seed, path, params)
+            st.pending = params                   # asked for: its locus is scored next
+            self.seeds[seed.name] = st
+            self._bump(None)
+            if os.path.exists(path):
+                threading.Thread(target=self._seed_done, args=(st, st.gen, params, path),
+                                 daemon=True).start()
+            else:
+                self._submit(self._user_pool_get(), st, st.gen, params, path)
 
     def _on_recruited(self, st: SeedState, gen: int, params: dict, path: str, fut):
         if fut.cancelled():
@@ -357,11 +401,15 @@ class Pipeline:
             self._recruit_failed(st, gen, f"unreadable recruitment: {exc}")
             return
         segs, reads = rec["segments"], rec["reads"]
-        lid = locus_id(segs, reads, self.project.asm1.name, self.project.asm2.name)
+        rkey = reads_key(reads)
         name = st.seed.name
         with self._lock:
             if st.gen != gen:
                 return
+            # The same reads as a locus already here: the same locus, whatever its
+            # segments' ends; otherwise a new one, named by its content.
+            lid = self._by_reads.get(rkey) or locus_id(
+                segs, reads, self.project.asm1.name, self.project.asm2.name)
             asked = st.pending is not None
             old = st.locus
             st.status, st.locus, st.path, st.params = "done", lid, path, params
@@ -376,17 +424,19 @@ class Pipeline:
                     prev.seeds.remove(name)
                     if not prev.seeds:
                         del self.loci[old]
+                        self._by_reads.pop(prev.reads_key, None)
                         self._moved[old] = lid
                 self._bump(old)
             loc = self.loci.get(lid)
             if loc is None:
                 names = (self.project.asm1.name, self.project.asm2.name)
-                loc = Locus(lid, st.path, n_reads=len(reads), params=dict(params),
+                loc = Locus(lid, st.path, reads_key=rkey, n_reads=len(reads), params=dict(params),
                             boundary=frozenset(rec.get("boundary_reads", ())),
                             span={a: sum(s.end - s.start for s in segs if s.assembly == a)
                                   for a in names},
                             n_segments={a: sum(s.assembly == a for s in segs) for a in names})
                 self.loci[lid] = loc
+                self._by_reads[rkey] = lid
                 self._moved.pop(lid, None)
                 self._wake.notify_all()
             if name not in loc.seeds:
@@ -541,3 +591,70 @@ class Pipeline:
             loc = self.loci[lid]
         with open(loc.recruit_path, "rb") as fh:
             return pickle.load(fh)
+
+    # ---- k-mer similarity background (qaview.similarity) ------------------------------
+
+    BACKGROUND_JOBS = 2    # loci computed at once (numpy, ~1 GB each at 29 Mb)
+
+    def background_path(self, lid: str) -> str:
+        from qaview import similarity
+
+        path = self._bg_paths.get(lid)
+        if path is None:
+            p = self.project
+            path = similarity.cache_path(os.path.join(p.output_dir, "similarity"),
+                                         self.recruitment(lid)["segments"], p.asm1.name,
+                                         p.asm2.name, p.asm1.fasta, p.asm2.fasta)
+            self._bg_paths[lid] = path
+        return path
+
+    def request_background(self, lid: str) -> str | None:
+        """The locus's background state, starting its computation if it is not done."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        with self._lock:
+            loc = self.loci.get(lid)
+            if loc is None or self._stopping:
+                return None
+            if loc.background in ("running", "ready"):
+                return loc.background
+        path = self.background_path(lid)
+        with self._lock:
+            if loc.background in ("running", "ready"):
+                return loc.background
+            if os.path.exists(path):
+                loc.background = "ready"
+            else:
+                loc.background, loc.background_error = "running", None
+                if self._bg_pool is None:
+                    self._bg_pool = ThreadPoolExecutor(self.BACKGROUND_JOBS,
+                                                       thread_name_prefix="background")
+                self._bg_pool.submit(self._run_background, loc, path)
+            self._bump(lid)
+            return loc.background
+
+    def _run_background(self, loc: Locus, path: str):
+        from qaview import similarity
+
+        p = self.project
+        try:
+            res = similarity.compute(self.recruitment(loc.id)["segments"], p.asm1.name,
+                                     p.asm2.name, p.asm1.fasta, p.asm2.fasta)
+            similarity.save(path, res)
+            status, error = "ready", None
+        except Exception as exc:                      # shown on the page, retried on request
+            status, error = "failed", f"{type(exc).__name__}: {exc}"
+        with self._lock:
+            if self._stopping:
+                return
+            loc.background, loc.background_error = status, error
+            self._bump(loc.id)
+
+    def background(self, lid: str) -> dict | None:
+        """The locus's k-mer similarity cells, if they are ready."""
+        from qaview import similarity
+
+        loc = self.loci.get(lid)
+        if loc is None or loc.background != "ready":
+            return None
+        return similarity.load_or_none(self.background_path(lid))

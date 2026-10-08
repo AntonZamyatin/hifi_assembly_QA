@@ -1,0 +1,42 @@
+# qaview project: mOryCun1 reference against its LJA assembly over the IG loci
+# (IGH, IGK), the analysis of examples/analysis/mOryCun1_*.ipynb (generate_notebooks.py).
+# Written by examples/scripts/make_projects.py. Paths are relative to this file.
+
+name = "mOryCun1_ig"
+
+[asm1]                                    # Delta S > 0 favours asm1
+name  = "ref"
+fasta = "../bgz/mOryCun1.ref.fasta.bgz"
+bam   = "../alignments/mOryCun1.ref.sorted.bam"
+
+[asm2]
+name  = "lja"
+fasta = "../bgz/mOryCun1.lja.fasta.bgz"
+bam   = "../alignments/mOryCun1.lja.sorted.bam"
+
+[data]
+db = "../dbs/mOryCun1.aln.sqlite"
+library_assembly = "ref"                  # lambda reference; keep fixed across loci
+
+[[seeds]]
+format   = "bed"
+path     = "seeds/mOryCun1_ig.bed"
+assembly = "ref"
+
+[recruitment]                             # hg002_hic's values, with the anchor extension
+pid_threshold    = 0.997
+plen_threshold   = 0.999
+best_pid_delta   = 0.001
+merge_gap        = 50000
+extension_window = 100
+ext_max          = 300000
+ext_rounds       = 100
+max_rounds       = 100
+extension        = "anchor"
+
+[resources]
+recruit_workers = 32
+score_workers   = 32
+
+[output]
+dir = "../analysis/mOryCun1"

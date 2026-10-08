@@ -518,36 +518,44 @@ along its contig. Two strategies, chosen per project or per seed:
   edge after snapping out to the nearest common read crossing it; otherwise the
   edge moves to the outermost start (end) of any qualifying read in the window.
   Seals are kept per exact segment, so a segment that changes is unsealed.
-- **`anchor`** (experimental, branch `recruit-anchor`): at each edge, among the
-  alignments passing pid/plen that cross it (start < edge < end), take the one
-  reaching furthest out.
-  - If that read is *common* (best pids tie within `best_pid_delta` and the
-    reference under its best placements is identical in both candidates) and this
-    alignment is one of its best, the edge is **sealed where it is** -- the read is
-    the anchor. The qualifying reads crossing the edge are **boundary reads**:
-    held back from the locus's reads and never expanded into segments -- but only
-    while the seal is still an edge. When a merge (within `merge_gap`) or an
-    extension puts a seal inside a segment, its reads cover sequence the locus
-    now contains and are recruited like any other. The final set, reads crossing
-    sealed edges of the final segments, is `boundary_reads` in the recruitment
-    pickle, and they are scored with windows past the edge (docs/phmm.md, stage
-    I: "Boundary reads"); the score card counts them. Anchor recruitments carry
-    `extension_version` in their cache key (`pipeline.ANCHOR_VERSION`), so a fix
-    to this strategy redoes them without touching legacy ones. If the
-    anchor has exactly one best placement in each candidate, the matching
-    position in the other candidate (from the anchor's identical sequence, in
-    either orientation) is sealed too; it waits until an edge there reaches it.
-  - Otherwise -- not common, or not at one of its best alignments -- the edge moves
-    to that read's outer end, and the rule repeats there.
-  - No qualifying read crosses the edge: step out `gap_step` = 1000 bp and look
-    again, until a read crosses or the contig ends.
-  - Seals are positions, so they survive merges and later rounds; an edge moving
-    out stops at the first seal it meets. A segment already past a seal is not
-    trimmed. `ext_max` limits one phase, as in legacy; `extension_window` and
+- **`anchor`** (experimental, branch `recruit-anchor`): edges move to anchor
+  regions, so that a locus is **closed** -- every read touching it either lies
+  inside its segments or overlaps them only on sequence both candidates share.
+  - An **anchor region** is a best alignment of a *common* read (best pids tie
+    within `best_pid_delta`, and the reference under its best placements is the
+    same multiset of sequences in both candidates, either orientation) that no
+    qualifying alignment **bridges** -- starts before it and ends after it. Every
+    best locus of the read, in both candidates, must be unbridged; the read's
+    best loci are the anchor's **copies**. A repeat read with three best loci in
+    each candidate is an anchor with six copies.
+  - An **anchored segment** ends at a contig end or at an anchor's outer end, the
+    anchor inside it. A read crossing that edge from outside cannot bridge the
+    anchor, so it ends within it: it overlaps the segment only on the anchor's
+    sequence, the same in both candidates. Such reads are left out (no boundary
+    reads any more); a read starting in the anchor and running inward lies inside
+    the segment and is an ordinary locus read.
+  - Each open edge moves to the **nearest** anchor region outward -- for a left
+    edge the one with the largest start below it, for a right edge the smallest
+    end above it -- or to the contig end. Coverage gaps hold no anchor and are
+    crossed. `ext_max` limits one move; an edge stopped by it moves on next round.
+  - Every other copy of that anchor becomes a segment of its own, sealed on the
+    same outer side (the other side for a copy in reverse complement), and its
+    inner edge moves the same way. This builds the other candidate's matching
+    segment directly, and every copy of a repeat the anchor lies in.
+  - Seals are positions, (assembly, contig, side), so they survive merges and
+    rounds. The phase repeats until no edge is open, each edge position moving
+    once per phase.
+  - Common reads are recruited but add no segments: they lie the same in both
+    candidates and add nothing to Delta S wherever placed; anchors' copies bring
+    the segments that matter. Non-common reads add every qualifying alignment, as
+    in legacy.
+  - `Recruiter.edge_log` records each edge decision (round, from, to, why: anchor,
+    copy, contig_end, limit; and the anchor read) to compare strategies; it is
+    saved as `edge_log` in the recruitment pickle. `extension_window` and
     `extension_k` are not used.
-  - `Recruiter.edge_log` records each edge decision (round, from, to, and why:
-    anchor, seal, contig_end, limit) to compare strategies; it is saved as
-    `edge_log` in the recruitment pickle.
+  - Anchor recruitments carry `extension_version` in their cache key
+    (`pipeline.ANCHOR_VERSION`, 3 since this rule), so a change to this strategy
+    redoes them without touching legacy ones.
 
 The legacy strategy's cache key is the one it had before the option existed, so
 existing recruitments stay valid; an anchor recruitment has a key of its own.
@@ -660,6 +668,7 @@ extension = "legacy"                      # or "anchor" (§10.1)
 [resources]
 recruit_workers = 32                      # seeds recruited at once
 score_workers = 32                        # processes scoring one locus
+synteny_threads = 32                      # minimap2 threads per genome alignment
 
 [output]
 dir = "../analysis/hg002_hic"             # recruit/, loci/ (score cache), state
@@ -686,8 +695,13 @@ since it knows everything except the seeds.
    process (`recruit_workers` at a time; seeds are independent). Results go to
    `output/recruit/recruit_<key>.pkl`, keyed by the seed, the data files and the
    recruitment parameters, so reopening reuses them.
-4. **Loci.** A finished seed gets `locus_id(segments, reads)`; seeds with the same
-   id are one locus, one table row, listing its seeds. Rows appear as seeds finish.
+4. **Loci.** Seeds that recruit the same read set are one locus, one table row,
+   listing its seeds, even when their segments' ends differ (a seed's own
+   coordinates, or an edge stopped by `ext_max`, can move an end with no read past
+   it). The row keeps the segments of the seed that made it -- the first in project
+   order when reopened -- and is named `locus_id(segments, reads)` from those. Rows
+   appear as seeds finish. On HG002 (459 seeds) this makes 333 rows, where matching
+   segments too made 352.
 5. **Scoring queue.** Each distinct locus is scored once, automatically, through
    `phmm_likelihood_report(cache_dir=output/loci)` -- the cache the notebooks use,
    so loci the batch already scored arrive with Delta S at once. Scoring runs in a
@@ -794,6 +808,15 @@ since it knows everything except the seeds.
   own minimum sizes is the figure larger than its cell, and then the cell
   scrolls. With reads shown, the alignment strip is capped at 60% of the
   window's height and scrolls both ways, opening on the sequence rows.
+- **Adding a seed.** "+" beside the table's filter opens a form: an assembly, a
+  region as `contig:start-end` (1-based and inclusive, as the page shows
+  coordinates; commas allowed) and an optional name (default
+  `<contig>_<start>_<end>`, 0-based like BED). It is checked against the FASTA
+  (contig, length) and the project's seeds (same region, name taken), saved to
+  `<output>/qaview_seeds.json` -- not the project file -- which `load_project`
+  reads as one more seed source every time, and recruited at once with the
+  project's parameters; its locus is scored next and opens when it appears.
+  `POST /api/seeds`.
 - **Recruitment** (left sidebar) shows the open locus's seeds, each with its
   interval, and the parameters they were recruited with, editable; a value unlike
   the project file's is highlighted, with the file's value in its tooltip.
@@ -805,6 +828,74 @@ since it knows everything except the seeds.
   its own is marked `*` in the table. The plotting controls' display pid, plen
   and best_pid_delta are separate from these: they filter what is drawn, not
   what is recruited.
+- **k-mer similarity background** (`src/qaview/similarity.py`). For every pair
+  of bins -- asm1 bin a (y), asm2 bin b (x) -- the share of a's distinct canonical
+  21-mers also found in b estimates their identity, p_hat = share^(1/21) (a
+  substitution kills about 21 k-mers). The share is taken both ways and the
+  smaller counts (min-containment): one way only, a bin of few distinct k-mers --
+  a uniform stretch of a centromeric satellite -- is contained in every bin
+  holding its unit and lit a whole row (ptg000114l_translocation_001: 209 of
+  1,000 rows lit across more than 40% of the columns; none now, the diagonals
+  kept). Jaccard was considered: on equal-size bins it gives the same identity,
+  but its union would count a cell's two-bin window, halving a split diagonal.
+  Cells are drawn from the locus's recruitment pid up -- its own if its seeds
+  were re-recruited with one, else the project's -- light at that floor, dark at
+  100%: only sequence close enough for the recruitment to follow reads across,
+  the diagonal and every repeat copy that near. The display pid does not move it:
+  lowering that to see more reads used to lower the background's floor too, and
+  flooded it. Bins are a regular grid along each
+  axis (about 1,000 on the longer one), so the background is one image and costs
+  the same to draw however many cells light up. The grids of the two candidates
+  do not line up, so a cell is scored against the other axis's bin plus its
+  better neighbour, in both directions. No k-mer is dropped for being frequent: past 200 million bin-pair
+  counts, k-mers are hash-sampled (FracMinHash), which keeps the share unbiased.
+  Computed in the background when a locus is first viewed (0.3 s on a 0.27 Mb
+  locus, 9 s and 1.2 GB on the largest, 29 Mb), cached in `<output>/similarity/`;
+  the page redraws when it arrives. In a satellite array every bin holds the same
+  k-mer set, so the whole block is uniformly near 100%: true at this bin size,
+  but without structure. (A minimap2 alignment of the segments was tried first:
+  whole segments keep almost no repeat copies; 50 kb query windows keep them,
+  13 s on 32 threads for 4.5 Mb, but the picture was less clear.)
+- **Reads on hover.** "reads: on hover" (the default) draws no read line until
+  a marginal bin is hovered, then only that bin's reads, at all their
+  placements, a little thicker; "all" draws every read line as before. A frame
+  then costs the background alone: on a 15.6 Mb locus 104-163 ms against
+  240-485 ms with all 180,000 read lines (headless Chromium, canvas). The read
+  lines are still sent with the view; fetching a bin's reads on hover instead is
+  the next step for opening large loci faster.
+- **What a control costs.** Only pid, plen, best_pid_delta, pid_tie_eps and the
+  bin size change which reads are drawn; they, and a resize, ask the server for a
+  new view. Colouring, C, layers, the reads mode and the background toggle are
+  applied by the page to the plot it holds (`restyle` in `static/app.js`): the
+  line rows carry their layer, class colour and read, the read table
+  (`qv-reads`) each read's log-ratio, and both marginal stackings are drawn with
+  one shown (renderers tagged `stack:class` / `stack:ratio`, the hover reading the
+  hidden `qv-mode` Div). `lineStyle` mirrors `glyphs.line_style`, so a restyle
+  draws exactly what the server would (pixel-identical in the browser check), and
+  C also reworks the score card from the per-read log-ratios the view carries.
+  Every per-line column and callback index is a numpy array, which Bokeh sends as
+  one binary buffer: names, classes and contigs are integer codes resolved by the
+  tooltip (`CustomJSHover`), colours packed uint32. On a 70,000-line locus a view
+  of an already-built region went from about 6 s and 12 MB to 0.6 s and 2.1 MB.
+  Building a region for new thresholds (about 5 s on 6,000 reads) is what is left.
+- **Marginals on one scale.** As in `report_plot`, the two coverage marginals
+  are the same size and share one coverage range, 0 to the larger of their two
+  peaks (one `Range1d`, so zooming one zooms the other): equal coverage is
+  equally long on either, and the candidates compare at a glance.
+- **Resizing by the corner.** A grip at the dotplot's lower right corner
+  rescales the whole report in place: drag shows the new outline, release sets
+  the panels' sizes on the page (`resizeReport`, finding them by their `qv:`
+  tags), with no new view. The dotplot keeps its square pixels, the marginals
+  their size; the contig-end triangles read their bar's current length. A size
+  chosen this way is kept across views and loci until the grip is
+  double-clicked, which goes back to the size fitted to the window; while it is
+  kept, resizing the window does not refit the plot.
+- **One plot at a time.** A view embeds into a container of its own and is
+  numbered; one that finishes after a newer one was asked for removes itself, and
+  the newest leaves no other Bokeh document. Before, only the fetch was aborted: a
+  view still embedding when a newer one arrived stayed beside it, and two stacked
+  plots added their translucent lines up -- the plot brightened after changing
+  thresholds.
 - **Contig ends.** On the contig bars beside the dotplot, a black triangle marks a
   segment edge that is the start or the end of its contig, pointing into the
   segment. An edge within 1 kb of the contig's end counts (`CONTIG_END_TOL`):
@@ -836,7 +927,7 @@ FastAPI + uvicorn, one process, reached by ssh port-forwarding.
 Launch: `venv/bin/python -m qaview [project.toml] [--port 5006]`. Without a
 project file the page starts on a form in the left sidebar: the project file's
 path on the server (a browser upload would break the paths inside it, which are
-relative to the file), with the last ten projects opened one click away
+relative to the file), with the last thirty projects opened one click away
 (`~/.config/qaview/recent.json`). "change" beside the project name brings the
 form back; opening another project stops the current one's recruitment and
 scoring and reloads the page onto the new one (`POST /api/open`; everything

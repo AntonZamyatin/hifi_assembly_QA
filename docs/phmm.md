@@ -420,6 +420,15 @@ needs ~500 such lookups — seconds, and cacheable.
 `aln_type` values; a read whose only local placement is secondary still resolves;
 a missing primary raises rather than returning silently.
 
+**Reads without qualities.** Reads aligned from FASTA have `QUAL` `*` -- all of
+the root mPleAur1 data (`figure_for_anton`), aligned homopolymer-compressed.
+Such a read gets `reads.FALLBACK_QUAL` = Q39 on every base (the stage A
+calibration anchor) and is listed in `LocusScore.fixed_quality`; the score card
+counts them. It is an approximation: the emission parameters were set for raw
+HiFi with per-base qualities, and homopolymer compression removes the errors
+that low qualities mark. `ReadStore(fallback_qual=None)` refuses such reads
+instead.
+
 ### Stage I — The full locus score (M) — DONE
 
 Built as the whole score rather than the emission term alone, because an
@@ -453,7 +462,10 @@ window: its ratio is +/-inf and lands on the clamp, as for a read the recruiter
 would call one-sided. `prune` still trims placements far below the read's best,
 for speed. Without thresholds every alignment counts, as before.
 
-**Boundary reads.** The anchor extension seals an edge where the outermost
+**Boundary reads.** (Since anchor version 3 the recruiter passes none: its edges
+sit at anchor regions, which a read crossing in from outside cannot bridge, so
+such a read overlaps the locus only on shared sequence. The support below stays
+for recruitments that carry them.) The anchor extension sealed an edge where the outermost
 crossing read is common, so the sequence past the edge is shared by both
 candidates, and passes the reads crossing it as `boundary_reads`. They are
 scored with windows reaching past the edge (`build_windows(cross_edges=True)`,

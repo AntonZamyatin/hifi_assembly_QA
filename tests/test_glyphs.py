@@ -9,6 +9,8 @@ Run: venv/bin/python tests/test_glyphs.py
 
 import os
 import sys
+
+import numpy as np
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -233,16 +235,17 @@ def test_color_modes(tmp):
     from qaview.glyphs import SUPPLEMENTARY_COLOR
     from qatool.plotters.colors import SUPPORT_COLORS
 
-    from qaview.glyphs import LAYER_STYLE
-    allowed = ({c for c, _ in LAYER_STYLE.values() if c is not None}
-               | set(SUPPORT_COLORS.values()))
+    from qaview.glyphs import LAYER_STYLE, pack_rgba
+    # colours travel packed (0xRRGGBBAA), one binary array
+    allowed = {pack_rgba(c) for c in ({c for c, _ in LAYER_STYLE.values() if c is not None}
+                                      | set(SUPPORT_COLORS.values()))}
     by_class = dotplot_figure(rd, color_by="class").renderers[0].data_source.data["color"]
-    check(set(by_class) <= allowed,
-          f"class colours must come from the layer palette, got {set(by_class)}")
+    check(by_class.dtype == np.uint32 and set(by_class.tolist()) <= allowed,
+          f"class colours must come from the layer palette, got {set(by_class.tolist())}")
 
     by_block = dotplot_figure(rd, color_by="block").renderers[0].data_source.data["color"]
-    check(set(by_block) <= {"black", SUPPLEMENTARY_COLOR},
-          f"block mode is black + supplementary red, got {set(by_block)}")
+    check(set(by_block.tolist()) <= {pack_rgba("black"), pack_rgba(SUPPLEMENTARY_COLOR)},
+          f"block mode is black + supplementary red, got {set(by_block.tolist())}")
 
     try:
         dotplot_figure(rd, color_by="nonsense")
@@ -262,13 +265,30 @@ def test_save_html(tmp):
           "resources must be inline so the file works offline")
 
 
+def test_marginals_share_one_scale(tmp):
+    """As in report_plot: both coverage marginals are the same size on the same
+    scale, so equal coverage is equally long on either."""
+    rd = make_region_data(tmp, "ms")
+    p = _panels(report_layout(rd))
+    top, right = p["cov_top"], p["cov_right"]
+    peak = max(float(np.max(rd.cov1.total())), float(np.max(rd.cov2.total())))
+    check(top.y_range is right.x_range, "one range object: zoom one, the other follows")
+    check(abs(top.y_range.end - peak) < 1e-9 and top.y_range.start == 0,
+          f"from 0 to the larger peak: {top.y_range.end} vs {peak}")
+    check(top.height == right.width, f"same size: {top.height} vs {right.width}")
+    for name in ("cov_top", "cov_right"):
+        hit = p[name].renderers[-1].glyph
+        reach = hit.top if name == "cov_top" else hit.right
+        check(abs(reach - peak) < 1e-9, f"{name}: the hover target reaches the shared top ({reach})")
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="qaview_glyph_tests_")
     tests = [test_square_pixels, test_fit_main_stays_in_its_box, test_ranges_are_linked, test_shared_crosshair,
              test_wheel_zoom_on_dotplot_only, test_panel_proportions,
              test_coverage_areas_stack, test_coverage_has_no_bin_borders,
              test_contig_colors_and_bars, test_contig_end_marks,
-             test_color_modes, test_save_html]
+             test_color_modes, test_save_html, test_marginals_share_one_scale]
     for fn in tests:
         print(f"{fn.__name__} ...")
         fn(tmp)

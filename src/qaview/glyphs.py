@@ -18,7 +18,7 @@ from dataclasses import dataclass
 
 from bokeh.layouts import column, gridplot
 from bokeh.models import (
-    ColumnDataSource, CrosshairTool, CustomJS, Div, HoverTool, Quad, Range1d,
+    ColumnDataSource, CrosshairTool, CustomJS, CustomJSHover, Div, HoverTool, Quad, Range1d,
     Segment as SegmentGlyph, Spacer, Span, TapTool, WheelZoomTool,
 )
 from bokeh.plotting import figure
@@ -100,6 +100,91 @@ def ratio_color(t: float) -> str:
     return "#%02x%02x%02x" % tuple(rgb)
 
 
+# ---- line style as arrays ------------------------------------------------------------
+# Every per-line column goes to the browser as one binary array: Bokeh encodes a
+# Python list element by element, which on a 70,000-line locus was most of the
+# view's time and size. Colours are BokehJS's packed uint32, 0xRRGGBBAA, which a
+# ColorSpec takes as is. The page restyles lines itself (static/app.js
+# `lineStyle`, mirroring `line_style`), so a colouring change needs no server.
+
+LINE_ALPHA = 0.55
+
+
+def pack_rgba(color: str, alpha: int = 255) -> int:
+    r, g, b = _hex_rgb(color if color.startswith("#") else to_hex(color))
+    return (r << 24) | (g << 16) | (b << 8) | alpha
+
+
+def ratio_strengths(ratio, C: float) -> np.ndarray:
+    """`ratio_strength` over an array; NaN (not scored) gives 0."""
+    r = np.asarray(ratio, dtype=float)
+    with np.errstate(invalid="ignore"):
+        t = np.log1p(np.minimum(np.abs(r), C)) / math.log1p(C)
+    t = np.where(np.isnan(r), 0.0, t)
+    return np.where(r > 0, t, -t)
+
+
+def ratio_rgba(t) -> np.ndarray:
+    """`ratio_color` over an array, packed."""
+    t = np.asarray(t, dtype=float)
+    a = np.minimum(np.abs(t), 1.0)[:, None]
+    mid = np.array(RATIO_MID, float)
+    end = np.where((t > 0)[:, None], np.array(RATIO_POS, float), np.array(RATIO_NEG, float))
+    rgb = np.round(mid + (end - mid) * a).astype(np.uint32)
+    return (rgb[:, 0] << 24) | (rgb[:, 1] << 16) | (rgb[:, 2] << 8) | np.uint32(255)
+
+
+def line_style(color_by: str, layer, supp, cls_rgba, ratio, visible_layers=None,
+               line_alpha: float = LINE_ALPHA, C: float = 200.0) -> tuple:
+    """(colour uint32, width float32, alpha float32) per line.
+
+    `cls_rgba` is each line's support-class colour, `ratio` its read's log-ratio
+    (NaN: not scored). Hidden layers are drawn at alpha 0 rather than removed: the
+    hover/selection CSR indexes address rows by position.
+    """
+    layer = np.asarray(layer, dtype=np.int64)
+    base = np.array([pack_rgba(LAYER_STYLE[i][0]) if LAYER_STYLE[i][0] else 0 for i in range(4)],
+                    dtype=np.uint32)
+    has_base = np.array([LAYER_STYLE[i][0] is not None for i in range(4)])
+    lw = np.array([LAYER_STYLE[i][1] for i in range(4)], dtype=float)
+    if color_by == "class":
+        color = np.where(has_base[layer], base[layer], np.asarray(cls_rgba, dtype=np.uint32))
+        width = lw[layer]
+    elif color_by == "block":
+        # Convention inherited from reads_dotplot.py: black backbone, supplementary red.
+        color = np.where(np.asarray(supp, dtype=bool), np.uint32(pack_rgba(SUPPLEMENTARY_COLOR)),
+                         np.uint32(pack_rgba("black")))
+        width = lw[layer]
+    elif color_by == "log-ratio":
+        # Rows cannot be re-sorted to put decisive reads on top: the hover and
+        # selection callbacks index rows by position. Width and opacity carry the
+        # emphasis instead, so indifferent reads recede and decisive ones stand out.
+        ratio = np.asarray(ratio, dtype=float)
+        scored = ~np.isnan(ratio)
+        t = ratio_strengths(ratio, C)
+        color = np.where(scored, ratio_rgba(t), np.uint32(pack_rgba(UNSCORED_COLOR)))
+        width = np.where(scored, 1.0 + 2.5 * np.abs(t), 1.0)
+    else:
+        raise ValueError("color_by must be 'class', 'block' or 'log-ratio'")
+    shown = (np.ones(len(layer), bool) if visible_layers is None
+             else np.isin(layer, [int(x) for x in visible_layers]))
+    alpha = np.where(shown, line_alpha, 0.0)
+    if color_by == "log-ratio":
+        alpha = alpha * np.where(scored, 0.3 + 0.7 * np.abs(t), 0.3)
+    return (color.astype(np.uint32), width.astype(np.float32), alpha.astype(np.float32))
+
+
+def style_spec() -> dict:
+    """The constants `line_style` uses, for the page's own restyling."""
+    return {"layer_rgba": [pack_rgba(LAYER_STYLE[i][0]) if LAYER_STYLE[i][0] else None
+                           for i in range(4)],
+            "layer_width": [LAYER_STYLE[i][1] for i in range(4)],
+            "supp_rgba": pack_rgba(SUPPLEMENTARY_COLOR), "black_rgba": pack_rgba("black"),
+            "unscored_rgba": pack_rgba(UNSCORED_COLOR), "ratio_mid": list(RATIO_MID),
+            "ratio_pos": list(RATIO_POS), "ratio_neg": list(RATIO_NEG),
+            "line_alpha": LINE_ALPHA}
+
+
 def _ratio_text(name, ratios, dropped) -> str:
     if ratios is None:
         return "not scored yet"
@@ -177,63 +262,70 @@ def ratio_stacking(rd, ratios: dict) -> Stacking:
     return Stacking(keys, colors, series, read_band)
 
 
-def _line_source(rd, color_by: str, visible_layers=None,
-                 line_alpha: float = 0.55, ratios=None, dropped=None,
-                 C: float = 200.0) -> ColumnDataSource:
-    """One row per read-correspondence line segment.
+def _read_ratios(rd, ratios) -> np.ndarray:
+    """Each read's log-ratio, in `rd.read_names` order; NaN where not scored."""
+    if ratios is None:
+        return np.full(len(rd.read_names), np.nan)
+    return np.array([ratios.get(n, np.nan) for n in rd.read_names], dtype=float)
+
+
+def _line_sources(rd, color_by: str, visible_layers=None, line_alpha: float = LINE_ALPHA,
+                  ratios=None, dropped=None, C: float = 200.0) -> tuple:
+    """(lines, reads, tables): the line rows, a per-read table, and the names the
+    rows' integer codes stand for.
 
     `rd.lines` holds single segments (x0,y0)-(x1,y1), so the `segment` glyph fits
-    directly and hit-testing works per line — no MultiLine vertex bookkeeping.
-    Rows arrive already sorted back-to-front by `region._order_for_drawing`.
+    directly and hit-testing works per line -- no MultiLine vertex bookkeeping.
+    Rows arrive already sorted back-to-front by `region._order_for_drawing`. A row
+    names its read, class and contigs by index (`read` into the `reads` table,
+    `cls`, `c1`, `c2` into `tables`); the hover tooltip looks them up.
     """
-    names = [rd.read_names[i] for i in rd.lines.read_idx]
-    classes = [rd.read_class.get(n, "other") for n in names]
-    layers = list(rd.lines.layer)
-    if color_by == "class":
-        colors, widths = [], []
-        for cls, lay in zip(classes, layers):
-            base, w = LAYER_STYLE[int(lay)]
-            colors.append(base if base is not None
-                          else SUPPORT_COLORS.get(cls, SUPPORT_COLORS["other"]))
-            widths.append(w)
-    elif color_by == "block":
-        # Convention inherited from reads_dotplot.py: black backbone, supplementary red.
-        colors = [SUPPLEMENTARY_COLOR if s else "black" for s in rd.lines.supplementary]
-        widths = [LAYER_STYLE[int(lay)][1] for lay in layers]
-    elif color_by == "log-ratio":
-        # Rows cannot be re-sorted to put decisive reads on top: the hover and
-        # selection callbacks index rows by position. Width and opacity carry the
-        # emphasis instead, so indifferent reads recede and decisive ones stand out.
-        colors, widths = [], []
-        for n in names:
-            if ratios is None or n not in ratios:
-                colors.append(UNSCORED_COLOR)
-                widths.append(1.0)
-            else:
-                t = ratio_strength(ratios[n], C)
-                colors.append(ratio_color(t))
-                widths.append(1.0 + 2.5 * abs(t))
-    else:
-        raise ValueError("color_by must be 'class', 'block' or 'log-ratio'")
-    # Hidden layers are drawn at alpha 0 rather than removed: the hover/selection CSR
-    # indexes address rows by position, so dropping rows would silently misalign them.
-    alphas = [line_alpha if (visible_layers is None or int(lay) in visible_layers) else 0.0
-              for lay in layers]
-    if color_by == "log-ratio":
-        alphas = [a * (0.3 + 0.7 * abs(ratio_strength(ratios[n], C)))
-                  if (ratios is not None and n in ratios) else a * 0.3
-                  for a, n in zip(alphas, names)]
+    n = len(rd.lines)
+    read = np.asarray(rd.lines.read_idx, dtype=np.int32)
+    layer = np.asarray(rd.lines.layer, dtype=np.int32)
+    supp = np.asarray(rd.lines.supplementary, dtype=bool)
+    classes = [rd.read_class.get(nm, "other") for nm in rd.read_names]
+    cls_names = sorted(set(classes) | {"other"})
+    code = {c: i for i, c in enumerate(cls_names)}
+    read_cls = np.array([code[c] for c in classes], dtype=np.int32)
+    cls_rgba = np.array([pack_rgba(SUPPORT_COLORS.get(c, SUPPORT_COLORS["other"]))
+                         for c in cls_names], dtype=np.uint32)
+    cls = read_cls[read] if n else np.zeros(0, np.int32)
+    ratio = _read_ratios(rd, ratios)
+    color, width, alpha = line_style(color_by, layer, supp, cls_rgba[cls],
+                                     ratio[read] if n else np.zeros(0),
+                                     visible_layers, line_alpha, C)
 
-    return ColumnDataSource(dict(
-        x0=rd.lines.x0, y0=rd.lines.y0, x1=rd.lines.x1, y1=rd.lines.y1,
-        read_name=names, read_class=classes, color=colors, width=widths, alpha=alphas,
-        supplementary=["yes" if s else "no" for s in rd.lines.supplementary],
-        contig1=rd.lines.contig1, contig2=rd.lines.contig2,
-        ref1_0=rd.lines.ref1_0, ref1_1=rd.lines.ref1_1,
-        ref2_0=rd.lines.ref2_0, ref2_1=rd.lines.ref2_1,
-        pid1=rd.lines.pid1, pid2=rd.lines.pid2,
-        ratio_txt=[_ratio_text(n, ratios, dropped) for n in names],
-    ))
+    def codes(values):
+        if not n:
+            return [], np.zeros(0, np.int32)
+        names, inv = np.unique(np.asarray(values, dtype=object), return_inverse=True)
+        return [str(x) for x in names], inv.astype(np.int32)
+
+    c1_names, c1 = codes(rd.lines.contig1)
+    c2_names, c2 = codes(rd.lines.contig2)
+    i32 = lambda a: np.asarray(a, dtype=np.int32)
+    lines = ColumnDataSource(dict(
+        x0=np.asarray(rd.lines.x0, float), y0=np.asarray(rd.lines.y0, float),
+        x1=np.asarray(rd.lines.x1, float), y1=np.asarray(rd.lines.y1, float),
+        read=read, cls=cls, layer=layer, supp=supp.astype(np.int8), c1=c1, c2=c2,
+        ref1_0=i32(rd.lines.ref1_0), ref1_1=i32(rd.lines.ref1_1),
+        ref2_0=i32(rd.lines.ref2_0), ref2_1=i32(rd.lines.ref2_1),
+        pid1=np.asarray(rd.lines.pid1, np.float32), pid2=np.asarray(rd.lines.pid2, np.float32),
+        cls_color=cls_rgba[cls], color=color, width=width, alpha=alpha,
+        hover_width=(width * 1.5 + 1.5).astype(np.float32),
+    ), name="qv-lines")
+    reads = ColumnDataSource(dict(
+        name=list(rd.read_names), ratio=ratio,
+        ratio_txt=[_ratio_text(nm, ratios, dropped) for nm in rd.read_names],
+    ), name="qv-reads")
+    return lines, reads, {"classes": cls_names, "c1": c1_names, "c2": c2_names}
+
+
+def _line_source(rd, color_by: str, visible_layers=None, line_alpha: float = LINE_ALPHA,
+                 ratios=None, dropped=None, C: float = 200.0) -> ColumnDataSource:
+    """The line rows alone (see `_line_sources`)."""
+    return _line_sources(rd, color_by, visible_layers, line_alpha, ratios, dropped, C)[0]
 
 
 def line_renderer(fig):
@@ -246,13 +338,37 @@ def hit_renderer(fig):
     return fig.renderers[-1]
 
 
-def dotplot_figure(rd, color_by: str = "class", line_alpha: float = 0.55,
+# k-mer similarity background (qaview.similarity): one blue hue, light at the
+# display floor -- by default the recruitment's pid -- dark at 100%.
+BACKGROUND_COLORS = ("#c6dbef", "#08306b")
+
+
+def _draw_background(p, bg: dict, floor: float):
+    """The cells at or above `floor` as one image under the reads (level underlay):
+    one glyph, so drawing it costs the same however many cells light up."""
+    from qaview.similarity import image_rgba
+
+    img = image_rgba(bg, floor, BACKGROUND_COLORS)
+    bs = bg["binsize"]
+    return p.image_rgba(image=[img], x=0, y=0, dw=bg["n2"] * bs, dh=bg["n1"] * bs,
+                        level="underlay", name="qv-background")
+
+
+def dotplot_figure(rd, color_by: str = "class", line_alpha: float = LINE_ALPHA,
                    width: int = MAIN_WIDTH, height: int | None = None,
-                   visible_layers=None, ratios=None, dropped=None, C: float = 200.0):
+                   visible_layers=None, ratios=None, dropped=None, C: float = 200.0,
+                   background: dict | None = None, floor: float = 0.997,
+                   reads: str = "all"):
     """Read-correspondence dotplot: asm2 on X, asm1 on Y.
 
     Depth is conveyed by alpha overplotting rather than merged line width — merging
     is resolution-dependent and would have to be redone on every zoom.
+
+    `background` (qaview.similarity) draws the k-mer similarity of the segments
+    underneath, from `floor` (the locus's recruitment pid) up.
+    `reads="hover"` draws no read until reads are selected -- by hovering a
+    marginal bin or tapping -- so a frame costs the background alone; "all"
+    draws every read line, as before.
     """
     # bounds: zoom and pan stop at the locus edges -- there is nothing outside it.
     # The marginals and contig bars share these ranges, so they are bounded too.
@@ -265,10 +381,10 @@ def dotplot_figure(rd, color_by: str = "class", line_alpha: float = 0.55,
     # once there are more than 2000, so reads vanished mid-zoom and came back only
     # after 0.5 s of stillness. Every line is always drawn instead.
     p.lod_threshold = None
-    r = p.segment(x0="x0", y0="y0", x1="x1", y1="y1",
-                  source=_line_source(rd, color_by, visible_layers, line_alpha,
-                                      ratios=ratios, dropped=dropped, C=C),
-                  color="color", line_width="width", alpha="alpha")
+    lines, reads_src, tables = _line_sources(rd, color_by, visible_layers, line_alpha,
+                                             ratios=ratios, dropped=dropped, C=C)
+    r = p.segment(x0="x0", y0="y0", x1="x1", y1="y1", source=lines,
+                  color="color", line_width="width", alpha="alpha", name="qv-lines-glyph")
     # Selecting reads (by tap, or from a coverage bin) hides every other read outright,
     # so a hovered bin shows only the reads that pass through it.  The selected glyph
     # also honours `alpha`, so a hidden layer stays hidden even when it is selected.
@@ -277,17 +393,40 @@ def dotplot_figure(rd, color_by: str = "class", line_alpha: float = 0.55,
                                      line_alpha="alpha")
     r.nonselection_glyph = SegmentGlyph(x0="x0", y0="y0", x1="x1", y1="y1",
                                         line_color="color", line_width="width", line_alpha=0.0)
+    if reads == "hover":
+        # A scalar alpha of 0 is skipped outright when drawing, not stroked 180,000
+        # times; the selection glyph still draws the reads of a hovered bin -- a
+        # little thicker, as they stand alone over the genome alignment.
+        r.glyph.line_alpha = 0.0
+        r.selection_glyph.line_width = "hover_width"
+    if background is not None:
+        _draw_background(p, background, floor)
 
+    # Rows hold codes; the tooltip turns them back into names (the format names
+    # which table).
+    names = CustomJSHover(args=dict(reads=reads_src, classes=tables["classes"],
+                                    c1=tables["c1"], c2=tables["c2"]), code="""
+        switch (format) {
+            case "name": return reads.data["name"][value];
+            case "ratio": return reads.data["ratio_txt"][value];
+            case "class": return classes[value];
+            case "c1": return c1[value];
+            case "c2": return c2[value];
+            case "yesno": return value ? "yes" : "no";
+        }
+        return String(value);
+        """)
     p.add_tools(HoverTool(
         renderers=[r], line_policy="interp", attachment="vertical",
         tooltips=[
-            ("read", "@read_name"),
-            ("class", "@read_class"),
-            (rd.asm1, "@contig1 @ref1_0{0,0}-@ref1_1{0,0}  pid @pid1{0.0000}"),
-            (rd.asm2, "@contig2 @ref2_0{0,0}-@ref2_1{0,0}  pid @pid2{0.0000}"),
-            ("supplementary", "@supplementary"),
-            ("log-ratio", "@ratio_txt"),
-        ]))
+            ("read", "@read{name}"),
+            ("class", "@cls{class}"),
+            (rd.asm1, "@c1{c1} @ref1_0{0,0}-@ref1_1{0,0}  pid @pid1{0.0000}"),
+            (rd.asm2, "@c2{c2} @ref2_0{0,0}-@ref2_1{0,0}  pid @pid2{0.0000}"),
+            ("supplementary", "@supp{yesno}"),
+            ("log-ratio", "@read{ratio}"),
+        ],
+        formatters={"@read": names, "@cls": names, "@c1": names, "@c2": names, "@supp": names}))
 
     # Segment boundaries: pale for same-contig, full strength across contigs.
     for segs_info, dim in ((rd.asm2_segs_info, "height"), (rd.asm1_segs_info, "width")):
@@ -305,16 +444,25 @@ def dotplot_figure(rd, color_by: str = "class", line_alpha: float = 0.55,
 
 def coverage_figure(rd, assembly: str, orientation: str,
                     width: int = MAIN_WIDTH, height: int | None = None,
-                    stacking: "Stacking | None" = None, size: int = MARGIN_SIZE):
+                    stacking: "Stacking | None" = None, size: int = MARGIN_SIZE,
+                    stackings: dict | None = None, active: str | None = None,
+                    value_max: float | None = None):
     """Stacked marginal coverage for one assembly.
 
     Drawn as explicit quads rather than a stacked area: exact-bp bins have a short
     final bin per segment, which a uniform-width area glyph would misplace.
+
+    `stackings` (name -> Stacking) draws each, only `active` visible, tagged
+    `stack:<name>`, so the page can switch between them without the server; the
+    hit target carries each one's band tops as `cum_<name>_<i>`. Without it,
+    `stacking` (default: the support classes) is drawn alone, as "class".
+    `value_max` sets the coverage axis's top (default: this marginal's maximum).
     """
     cov = rd.cov1 if assembly == rd.asm1 else rd.cov2
     left, right = rd.bin_edges(assembly)
-    stacking = stacking or class_stacking(rd)
-    series, colors = stacking.series[assembly], stacking.colors
+    if stackings is None:
+        stackings, active = {"class": stacking or class_stacking(rd)}, "class"
+    active = active or next(iter(stackings))
 
     if orientation == "x":
         p = figure(width=width, height=size, x_range=Range1d(0, rd.plot_w),
@@ -336,19 +484,26 @@ def coverage_figure(rd, assembly: str, orientation: str,
         out[1::2] = vals
         return out
 
-    base = [0.0] * len(left)
-    cums = []                      # cumulative top of each band, per bin
-    for values, color in zip(series, colors):
-        top = [b + v for b, v in zip(base, values)]
-        lo, hi = _double(base), _double(top)
-        if orientation == "x":
-            p.varea(x=edges, y1=lo, y2=hi, fill_color=color, fill_alpha=1.0)
-        else:
-            p.harea(y=edges, x1=lo, x2=hi, fill_color=color, fill_alpha=1.0)
-        base = top
-        cums.append(list(top))
+    cums = {}                      # cumulative top of each band, per bin
+    totals = None
+    for name, st in stackings.items():
+        base = np.zeros(len(left))
+        for i, (values, color) in enumerate(zip(st.series[assembly], st.colors)):
+            top = base + np.asarray(values, dtype=float)
+            lo, hi = _double(base), _double(top)
+            kw = dict(fill_color=color, fill_alpha=1.0, visible=(name == active))
+            if orientation == "x":
+                r = p.varea(x=edges, y1=lo, y2=hi, **kw)
+            else:
+                r = p.harea(y=edges, x1=lo, x2=hi, **kw)
+            r.tags = [f"stack:{name}"]          # on the renderer: a glyph method gives it the glyph
+            base = top
+            cums[f"cum_{name}_{i}"] = top
+        if name == active:
+            totals = base               # every stacking sums to the same coverage
+    base = totals
 
-    m = max(base) if base else 1.0
+    m = value_max if value_max else (float(base.max()) if len(base) else 1.0)
     # Ticks by the marginal's size: a small one would otherwise run its labels together.
     n_ticks = max(2, size // 45)
     if orientation == "x":
@@ -364,13 +519,13 @@ def coverage_figure(rd, assembly: str, orientation: str,
     # Invisible full-height target, one quad per bin.  Hovering the stacked series
     # directly would miss any bucket that is empty at that bin; this always reports the
     # bin under the cursor, and its selection glyph doubles as the bin highlight.
-    n_reads = [int(cov.bin_offsets[i + 1] - cov.bin_offsets[i]) for i in range(len(left))]
+    n_reads = np.diff(np.asarray(cov.bin_offsets)).astype(np.int32)
     hit_src = ColumnDataSource(dict(
-        left=left, right=right, contig=cov.bin_contig,
-        bin_start=cov.bin_start, bin_end=cov.bin_end,
-        total=base, n_reads=n_reads, bin_index=list(range(len(left))),
-        # Band boundaries, so a hover can resolve which stacked class it is over.
-        **{f"cum{i}": c for i, c in enumerate(cums)},
+        left=np.asarray(left, float), right=np.asarray(right, float), contig=cov.bin_contig,
+        bin_start=np.asarray(cov.bin_start, np.int32), bin_end=np.asarray(cov.bin_end, np.int32),
+        total=base, n_reads=n_reads, bin_index=np.arange(len(left), dtype=np.int32),
+        # Band boundaries, so a hover can resolve which stacked band it is over.
+        **cums,
     ))
     if orientation == "x":
         hit = p.quad(left="left", right="right", bottom=0, top=m, source=hit_src,
@@ -450,7 +605,10 @@ def _draw_end_marks(p, rd, assembly: str, orientation: str, length_px: int):
     xy = dict(x="pos", y="mid") if orientation == "x" else dict(x="mid", y="pos")
     r = p.scatter(**xy, source=src, marker="triangle", size=END_MARK, angle="angle",
                   fill_color="#000000", line_color="#ffffff", line_width=1)
-    shift = CustomJS(args=dict(src=src, rng=rng, px=max(1, length_px), half=half), code="""
+    # The figure's own length, read when it runs: the page may resize the report.
+    shift = CustomJS(args=dict(src=src, rng=rng, fig=p, along_x=(orientation == "x"), half=half),
+                     code="""
+        const px = Math.max(1, along_x ? fig.width : fig.height);
         const per = (rng.end - rng.start) / px;
         const d = src.data;
         d.pos = d.base.map((b, i) => b + d.dir[i] * half * per);
@@ -458,6 +616,7 @@ def _draw_end_marks(p, rd, assembly: str, orientation: str, length_px: int):
     """)
     rng.js_on_change("start", shift)
     rng.js_on_change("end", shift)
+    p.js_on_change("width" if orientation == "x" else "height", shift)
     p.add_tools(HoverTool(renderers=[r], tooltips=[("contig", "@label")]))
     return r
 
@@ -526,37 +685,40 @@ def _read_bucket_index(rd) -> list:
 
 
 def _link_bins_to_reads(rd, cov_fig, cov, other_fig, other_cov, main, status, orientation,
-                        stacking: "Stacking | None" = None):
+                        stackings: dict | None = None, mode: Div | None = None):
     """Hover a coverage bin: stripe that bin, light the matching bins on the other
     assembly, and show only the reads passing through it.
 
-    The stack is per-class, so the cursor's position along the *value* axis says which
-    class is under it — the hover then narrows to that class alone.  Above the stack
-    there is no band, and the whole bin is shown.
+    The stack is per band, so the cursor's position along the *value* axis says
+    which band is under it -- the hover then narrows to that band alone. Above the
+    stack there is no band, and the whole bin is shown. `mode.text` names the
+    stacking on show ("class" or "ratio"), which the page may switch.
 
-    Pure client-side array lookups over precomputed indexes — bin -> reads and
-    read -> bins on each assembly, read -> line rows, and read -> band — so it stays
+    Pure client-side array lookups over precomputed indexes -- bin -> reads and
+    read -> bins on each assembly, read -> line rows, and read -> band -- so it stays
     instant over a remote connection.
     """
+    i32 = lambda a: np.asarray(a, dtype=np.int32)
     rl_off, rl_idx = rd.lines.by_read(len(rd.read_names))
     l2g, _ = _global_index(rd, cov)
     _, other_g2l = _global_index(rd, other_cov)
     other_off, other_bins = other_cov.by_read()
-    stacking = stacking or class_stacking(rd)
-    n_series = len(stacking.keys)
+    stackings = stackings or {"class": class_stacking(rd)}
+    mode = mode or Div(text=next(iter(stackings)), visible=False)
+    bands = {f"band_{k}": i32(st.read_band) for k, st in stackings.items()}
+    names = {f"names_{k}": list(st.keys) for k, st in stackings.items()}
 
     cb = CustomJS(
         args=dict(
             lines=line_renderer(main).data_source,
             hit=hit_renderer(cov_fig).data_source,
             other=hit_renderer(other_fig).data_source,
-            status=status,
-            bin_off=cov.bin_offsets.tolist(), bin_reads=cov.read_idx.tolist(),
-            l2g=l2g, other_g2l=other_g2l,
-            other_off=other_off.tolist(), other_bins=other_bins.tolist(),
-            read_off=rl_off.tolist(), read_lines=rl_idx.tolist(),
-            read_band=stacking.read_band, n_series=n_series,
-            band_names=list(stacking.keys),
+            status=status, mode=mode,
+            bin_off=i32(cov.bin_offsets), bin_reads=i32(cov.read_idx),
+            l2g=i32(l2g), other_g2l=i32(other_g2l),
+            other_off=i32(other_off), other_bins=i32(other_bins),
+            read_off=i32(rl_off), read_lines=i32(rl_idx),
+            bands=bands, names=names,
             vertical=(orientation == "x"), label=cov_fig.name or "",
         ),
         code="""
@@ -569,6 +731,9 @@ def _link_bins_to_reads(rd, cov_fig, cov, other_fig, other_cov, main, status, or
             return;
         }
         const b = hovered[0];
+        const m = mode.text;
+        const read_band = bands["band_" + m], band_names = names["names_" + m];
+        const n_series = band_names.length;
 
         // Which stacked band is the cursor in?  The hit target spans the full value
         // axis, so compare the cursor against this bin's cumulative band tops.
@@ -576,7 +741,7 @@ def _link_bins_to_reads(rd, cov_fig, cov, other_fig, other_cov, main, status, or
         const v = vertical ? geom.y : geom.x;
         let band = -1;
         for (let s = 0; s < n_series; s++) {
-            if (v <= hit.data['cum' + s][b]) { band = s; break; }
+            if (v <= hit.data['cum_' + m + '_' + s][b]) { band = s; break; }
         }
 
         const rows = [];
@@ -585,7 +750,7 @@ def _link_bins_to_reads(rd, cov_fig, cov, other_fig, other_cov, main, status, or
         for (let k = bin_off[b]; k < bin_off[b + 1]; k++) {
             const g = l2g[bin_reads[k]];
             if (g < 0) continue;
-            if (band >= 0 && read_band[g] !== band) continue;   // narrow to the class
+            if (band >= 0 && read_band[g] !== band) continue;   // narrow to the band
             n += 1;
             for (let j = read_off[g]; j < read_off[g + 1]; j++) rows.push(read_lines[j]);
             const ol = other_g2l[g];
@@ -600,7 +765,7 @@ def _link_bins_to_reads(rd, cov_fig, cov, other_fig, other_cov, main, status, or
         const where = hit.data['contig'][b] + ':'
                     + hit.data['bin_start'][b].toLocaleString() + '-'
                     + hit.data['bin_end'][b].toLocaleString();
-        const cls = band >= 0 ? band_names[band] : 'all classes';
+        const cls = band >= 0 ? band_names[band] : 'all bands';
         status.text = label + ' ' + where + ' &nbsp;·&nbsp; <b>' + cls
                     + '</b> &nbsp;·&nbsp; ' + n + ' reads';
         """)
@@ -611,36 +776,35 @@ def _link_bins_to_reads(rd, cov_fig, cov, other_fig, other_cov, main, status, or
 
 def _link_reads_to_bins(rd, main, cov_figs):
     """Tapping a read line highlights the coverage bins it contributes to."""
-    args = dict(lines=line_renderer(main).data_source)
+    lines = line_renderer(main).data_source
+    args = dict(lines=lines)
     code_parts = []
     for i, (cov_fig, cov) in enumerate(cov_figs):
+        l2g, _ = _global_index(rd, cov)
         args[f"hit{i}"] = hit_renderer(cov_fig).data_source
-        args[f"boff{i}"] = cov.bin_offsets.tolist()
-        args[f"breads{i}"] = cov.read_idx.tolist()
-        args[f"cnames{i}"] = cov.read_names
+        args[f"boff{i}"] = np.asarray(cov.bin_offsets, dtype=np.int32)
+        args[f"breads{i}"] = np.asarray(cov.read_idx, dtype=np.int32)
+        args[f"l2g{i}"] = np.asarray(l2g, dtype=np.int32)
         code_parts.append(f"""
         {{
-            const local = new Set();
-            for (let i = 0; i < cnames{i}.length; i++)
-                if (want.has(cnames{i}[i])) local.add(i);
             const bins = [];
             for (let b = 0; b + 1 < boff{i}.length; b++) {{
                 for (let k = boff{i}[b]; k < boff{i}[b + 1]; k++) {{
-                    if (local.has(breads{i}[k])) {{ bins.push(b); break; }}
+                    if (want.has(l2g{i}[breads{i}[k]])) {{ bins.push(b); break; }}
                 }}
             }}
             hit{i}.selected.indices = bins;
         }}""")
-    args["names"] = list(line_renderer(main).data_source.data["read_name"])
     cb = CustomJS(args=args, code="""
         const rows = lines.selected.indices;
+        const read = lines.data["read"];
         const want = new Set();
-        for (const r of rows) want.add(names[r]);
+        for (const r of rows) want.add(read[r]);
         if (want.size === 0) { """ + "".join(
             f"hit{i}.selected.indices = []; " for i in range(len(cov_figs))
         ) + """ return; }
     """ + "".join(code_parts))
-    line_renderer(main).data_source.selected.js_on_change("indices", cb)
+    lines.selected.js_on_change("indices", cb)
 
 
 def _coordinate_readout(rd, main):
@@ -689,7 +853,8 @@ def fit_main(rd, max_width: int = MAIN_WIDTH, max_height: int | None = None) -> 
 def report_layout(rd, color_by: str = "class", visible_layers=None,
                   ratios=None, dropped=None, C: float = 200.0,
                   max_width: int = MAIN_WIDTH, max_height: int | None = None,
-                  margin_size: int = MARGIN_SIZE):
+                  margin_size: int = MARGIN_SIZE, background: dict | None = None,
+                  floor: float = 0.997, reads: str = "all"):
     """Assemble the full interactive report.
 
     Layout mirrors report_plot: coverage above (asm2) and right (asm1), contig bars
@@ -703,16 +868,27 @@ def report_layout(rd, color_by: str = "class", visible_layers=None,
     w, h = fit_main(rd, max_width, max_height)
     main = dotplot_figure(rd, color_by=line_mode, width=w, height=h,
                           visible_layers=visible_layers,
-                          ratios=ratios, dropped=dropped, C=C)
+                          ratios=ratios, dropped=dropped, C=C, background=background,
+                          floor=floor, reads=reads)
     # The marginals follow the reads: log-ratio bands once a score exists, support
     # classes otherwise (including before scoring finishes, where every band would
     # otherwise read "not scored").
-    stacking = (ratio_stacking(rd, ratios) if color_by == "log-ratio" and ratios is not None
-                else class_stacking(rd))
-    cov_top = coverage_figure(rd, rd.asm2, "x", width=w, stacking=stacking,
-                              size=margin_size)
-    cov_right = coverage_figure(rd, rd.asm1, "y", width=w, height=h, stacking=stacking,
-                                size=margin_size)
+    # Both stackings are drawn, one shown, so the page can switch with the colouring.
+    stackings = {"class": class_stacking(rd)}
+    if ratios is not None:
+        stackings["ratio"] = ratio_stacking(rd, ratios)
+    active = "ratio" if color_by == "log-ratio" and ratios is not None else "class"
+    mode = Div(text=active, visible=False, name="qv-mode")
+    # One coverage scale for both marginals, as in report_plot: equal coverage is
+    # equally long on either, so the two candidates compare at a glance.
+    peak = max([float(np.max(c.total())) for c in (rd.cov1, rd.cov2) if len(c.bins)] + [1.0])
+    cov_top = coverage_figure(rd, rd.asm2, "x", width=w, size=margin_size,
+                              stackings=stackings, active=active, value_max=peak)
+    cov_right = coverage_figure(rd, rd.asm1, "y", width=w, height=h, size=margin_size,
+                                stackings=stackings, active=active, value_max=peak)
+    shared = Range1d(0, peak, bounds=(0, peak))
+    cov_top.y_range = shared
+    cov_right.x_range = shared
     xbar = contig_bar_figure(rd, rd.asm2, "x", colors, width=w, rng=main.x_range)
     ybar = contig_bar_figure(rd, rd.asm1, "y", colors, width=w, height=h, rng=main.y_range)
 
@@ -754,8 +930,8 @@ def report_layout(rd, color_by: str = "class", visible_layers=None,
     cov_right.name = rd.asm1
     status = Div(text="", styles={"font-family": "monospace", "font-size": "12px",
                                   "padding": "0 0 4px 0"})
-    _link_bins_to_reads(rd, cov_top, rd.cov2, cov_right, rd.cov1, main, status, "x", stacking)
-    _link_bins_to_reads(rd, cov_right, rd.cov1, cov_top, rd.cov2, main, status, "y", stacking)
+    _link_bins_to_reads(rd, cov_top, rd.cov2, cov_right, rd.cov1, main, status, "x", stackings, mode)
+    _link_bins_to_reads(rd, cov_right, rd.cov1, cov_top, rd.cov2, main, status, "y", stackings, mode)
     _link_reads_to_bins(rd, main, [(cov_top, rd.cov2), (cov_right, rd.cov1)])
     readout = _coordinate_readout(rd, main)
 
@@ -773,7 +949,15 @@ def report_layout(rd, color_by: str = "class", visible_layers=None,
     grid.toolbar_location = "right"
     # One line each, as wide as the plots: a wrapped line would make the report
     # taller than the cell it was sized for (server.PAD_H counts one line each).
+    # Tags the page finds the panels by, to resize the report in place
+    # (static/app.js `resizeReport`); `margin_size` and BAR_SIZE ride along.
+    main.tags = ["qv:main"]
+    cov_top.tags = ["qv:top"]
+    cov_right.tags = ["qv:right"]
+    xbar.tags = ["qv:xbar"]
+    ybar.tags = ["qv:ybar"]
     for div in (readout, status):
+        div.tags = ["qv:line", {"pad": BAR_SIZE + margin_size}]
         div.width = BAR_SIZE + w + margin_size
         div.styles = {**div.styles, "white-space": "nowrap", "overflow": "hidden",
                       "text-overflow": "ellipsis"}

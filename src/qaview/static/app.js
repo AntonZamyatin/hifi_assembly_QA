@@ -22,10 +22,15 @@ const state = {
   boxes: new Map(),         // id -> its BoxAnnotation on the current dotplot
   boxPlot: null,
   views: [],
+  viewGen: 0,               // bumped per loadView; an older one that finishes late discards itself
+  lastView: null,           // the view response on show: restyling reuses it
+  fit: null,                // the dotplot's size as the server fitted it to the cell
+  userWidth: null,          // a dotplot width chosen by dragging its corner, kept across views
   recruitSeeds: [],         // the open locus's seeds and their recruitment parameters
   recruitSeedsOf: null,
   recruitWatch: new Map(),  // seed being re-recruited -> {from: locus id, seq}
   seq: -1,                  // the server state the rows reflect
+  addedSeed: null,          // a seed just added: its locus opens when it appears
 };
 
 // ---- formatting --------------------------------------------------------------------
@@ -86,11 +91,18 @@ async function loadProject(p) {
   p.seed_sources.forEach((s, i) => { f[`seeds ${i + 1} (${s.format}, ${s.seeds})`] = s.path; });
   for (const [k, v] of Object.entries(f)) files.append(el("dt", k), el("dd", v));
 
+  const ramp = el("i");
+  ramp.className = "bg-ramp";
+  ramp.style.background = `linear-gradient(to right, ${p.background_colors[0]}, ${p.background_colors[1]})`;
+  const lo = el("span"); lo.id = "bg-floor";
+  $("#syn-legend").replaceChildren(lo, ramp, el("span", "100%"));
+  $("#syn-legend").title = "k-mer similarity of the two bins, estimated identity, from the locus's recruitment pid up";
+
   const layers = $("#layers");
   layers.replaceChildren();
   for (const name of p.layers) {
     const box = el("input"); box.type = "checkbox"; box.checked = true; box.value = name;
-    box.addEventListener("change", scheduleView);
+    box.addEventListener("change", restyle);
     const lab = el("label"); lab.append(box, name);
     layers.append(lab);
   }
@@ -193,6 +205,7 @@ function renderTable() {
 
 function onUpdate(d) {
   showProgress(d.progress, d.failed_seeds);
+  checkAddedSeed(d);
   let reload = false, gone = null, seedsChanged = false;
   if (d.seq !== undefined) state.seq = Math.max(state.seq, d.seq);
   for (const r of d.rows) {
@@ -203,6 +216,11 @@ function onUpdate(d) {
     }
     const old = state.rows.get(r.id);
     if (r.id === state.current && old && old.status !== "scored" && r.status === "scored") reload = true;
+    // the genome alignment arrived (or failed): redraw with it, or say why not
+    if (r.id === state.current && old && old.background !== r.background && $("#background").checked) {
+      if (r.background === "ready") reload = true;
+      else renderBackgroundStatus({ status: r.background, error: r.background_error });
+    }
     if (r.id === state.current && old &&
         String([old.seeds, old.recruiting]) !== String([r.seeds, r.recruiting])) seedsChanged = true;
     state.rows.set(r.id, r);
@@ -229,7 +247,17 @@ function params() {
     best_pid_delta: $("#best_pid_delta").value, pid_tie_eps: $("#pid_tie_eps").value,
     binsize: $("#binsize").value || 0,
     color_by: $("#color_by .on").dataset.v, C: $("#C").value, layers: layers.join(","),
+    reads: $("#reads_mode .on").dataset.v, background: $("#background").checked,
   });
+}
+
+// An error response's text: FastAPI's `detail`, a string or, for a request it
+// refused, a list of {loc, msg}.
+function errorDetail(text) {
+  let d;
+  try { d = JSON.parse(text).detail; } catch (_) { return text; }
+  if (Array.isArray(d)) return d.map((e) => `${(e.loc || []).slice(-1)[0]}: ${e.msg}`).join("; ");
+  return d || text;
 }
 
 function checkTie() {
@@ -245,13 +273,24 @@ function scheduleView() {
 
 // ---- the report -------------------------------------------------------------------
 
-function clearPlot() {
-  for (const v of state.views) { try { v.remove(); } catch (_) { /* already gone */ } }
-  state.views = [];
-  if (window.Bokeh && Bokeh.documents) {
-    for (const doc of Bokeh.documents) { try { doc.clear(); } catch (_) { /* ignore */ } }
-    Bokeh.documents.length = 0;
+// Remove embedded views and their documents (Bokeh keeps every document it
+// embedded in Bokeh.documents until told otherwise).
+function dropViews(views) {
+  for (const v of views || []) {
+    const doc = v.model && v.model.document;
+    try { v.remove(); } catch (_) { /* already gone */ }
+    if (doc) {
+      try { doc.clear(); } catch (_) { /* ignore */ }
+      const i = Bokeh.documents.indexOf(doc);
+      if (i >= 0) Bokeh.documents.splice(i, 1);
+    }
   }
+}
+
+function clearPlot() {
+  dropViews(state.views);
+  state.views = [];
+  state.lastView = null;
   $("#plot").replaceChildren();
 }
 
@@ -279,6 +318,7 @@ async function loadView() {
   if (state.viewAbort) state.viewAbort.abort();
   const ctl = new AbortController();
   state.viewAbort = ctl;
+  const gen = ++state.viewGen;
   $("#plot-status").textContent = "Loading…";
   let d;
   try {
@@ -290,12 +330,262 @@ async function loadView() {
     $("#plot-status").textContent = `Failed to load: ${e.message}`;
     return;
   }
-  if (id !== state.current) return;
+  if (id !== state.current || gen !== state.viewGen) return;
+  // Each load embeds into a container of its own. Embedding takes a while on a
+  // large locus, and only the fetch can be aborted: a newer load arriving
+  // meanwhile used to clear the plot, then this one landed beside it -- two
+  // plots stacked, their translucent lines adding up.
   clearPlot();
-  state.views = await Bokeh.embed.embed_item(d.item, "plot");
+  const host = el("div");
+  $("#plot").append(host);
+  let views;
+  try {
+    views = await Bokeh.embed.embed_item(d.item, host);
+  } catch (e) {
+    if (gen === state.viewGen) $("#plot-status").textContent = `Failed to draw: ${e.message}`;
+    return;
+  }
+  if (gen !== state.viewGen) {             // a newer view has replaced this one
+    dropViews(views);
+    host.remove();
+    return;
+  }
+  state.views = views;
+  state.lastView = d;
+  // The newest load: no document but this one should be left (a superseded
+  // load's can outlive its views).
+  const mine = viewDoc();
+  for (const doc of [...Bokeh.documents]) {
+    if (doc === mine) continue;
+    try { doc.clear(); } catch (_) { /* ignore */ }
+    Bokeh.documents.splice(Bokeh.documents.indexOf(doc), 1);
+  }
   $("#plot-status").textContent = "";
-  renderScore(d);
+  rememberFit();
+  if (state.userWidth) resizeReport(state.userWidth);
+  else placeGrip();
+  restyle();                               // controls changed while it was loading
+  renderBackgroundStatus(d.background);
   drawRects();
+}
+
+// ---- restyling on the page ----------------------------------------------------------
+// Colouring, C, layers, the reads mode and the background need no new view: the
+// plot holds every line's layer, class colour and read, and the read table its
+// log-ratio. This mirrors glyphs.line_style.
+
+function viewDoc() {
+  const v = state.views && state.views[Symbol.iterator] ? [...state.views][0] : null;
+  return v && v.model ? v.model.document : null;
+}
+
+function ratioRgba(st, t) {
+  const end = t > 0 ? st.ratio_pos : st.ratio_neg;
+  const a = Math.min(Math.abs(t), 1);
+  const [r, g, b] = st.ratio_mid.map((m, i) => Math.round(m + (end[i] - m) * a));
+  return ((r << 24) | (g << 16) | (b << 8) | 255) >>> 0;
+}
+
+function lineStyle(st, colorBy, shown, C, data, ratio) {
+  const n = data.layer.length;
+  const color = new Uint32Array(n), width = new Float32Array(n);
+  const alpha = new Float32Array(n), hover = new Float32Array(n);
+  const l1c = Math.log1p(C);
+  for (let i = 0; i < n; i++) {
+    const lay = data.layer[i];
+    let a = shown.has(lay) ? st.line_alpha : 0;
+    if (colorBy === "log-ratio") {
+      const r = ratio[data.read[i]];
+      if (Number.isNaN(r)) { color[i] = st.unscored_rgba; width[i] = 1; a *= 0.3; }
+      else {
+        let t = Math.log1p(Math.min(Math.abs(r), C)) / l1c;
+        if (!(r > 0)) t = -t;
+        color[i] = ratioRgba(st, t); width[i] = 1 + 2.5 * Math.abs(t); a *= 0.3 + 0.7 * Math.abs(t);
+      }
+    } else if (colorBy === "block") {
+      color[i] = data.supp[i] ? st.supp_rgba : st.black_rgba; width[i] = st.layer_width[lay];
+    } else {
+      const base = st.layer_rgba[lay];
+      color[i] = base === null ? data.cls_color[i] : base; width[i] = st.layer_width[lay];
+    }
+    alpha[i] = a;
+    hover[i] = width[i] * 1.5 + 1.5;
+  }
+  return { color, width, alpha, hover_width: hover };
+}
+
+// Delta S at another C, from the per-read log-ratios (score.py: clamp to +/-C).
+function scoreAt(s, C) {
+  let emission = 0, up = 0, down = 0;
+  for (const r of s.ratios) {
+    emission += Math.max(-C, Math.min(C, r));
+    if (r >= C) up += 1;
+    if (r <= -C) down += 1;
+  }
+  return { ...s, C, emission, delta_s: emission + s.exposure, at_plus_C: up, at_minus_C: down };
+}
+
+function restyle() {
+  const d = state.lastView, doc = viewDoc();
+  if (!d || !doc) return;
+  const st = d.style;
+  const C = parseFloat($("#C").value) || 200;
+  const want = $("#color_by .on").dataset.v;
+  // until a score exists, log-ratio draws the support classes, as the server does
+  const colorBy = want === "log-ratio" && !d.score ? "class" : want;
+  const shown = new Set([...document.querySelectorAll("#layers input:checked")]
+    .map((b) => st.layers[b.value]));
+  const src = doc.get_model_by_name("qv-lines");
+  const reads = doc.get_model_by_name("qv-reads");
+  const glyph = doc.get_model_by_name("qv-lines-glyph");
+  if (src && reads) {
+    const data = src.data;
+    src.data = { ...data, ...lineStyle(st, colorBy, shown, C, data, reads.data.ratio) };
+  }
+  if (glyph) {
+    const all = $("#reads_mode .on").dataset.v === "all";
+    glyph.glyph.line_alpha = all ? { field: "alpha" } : { value: 0 };
+    glyph.selection_glyph.line_width = { field: all ? "width" : "hover_width" };
+  }
+  // marginals: log-ratio bands once scored, support classes otherwise
+  const stack = want === "log-ratio" && d.score ? "ratio" : "class";
+  const mode = doc.get_model_by_name("qv-mode");
+  if (mode) mode.text = stack;
+  for (const m of doc.all_models) {
+    const tag = m.tags && m.tags[0];
+    if (typeof tag === "string" && tag.startsWith("stack:")) m.visible = tag === `stack:${stack}`;
+  }
+  const bg = doc.get_model_by_name("qv-background");
+  if (bg) bg.visible = $("#background").checked;
+  if (d.score) renderScore({ ...d, score: scoreAt(d.score, C) });
+  else renderScore(d);
+}
+
+// ---- resizing the report by its corner ------------------------------------------------
+// Dragging the grip at the dotplot's lower right corner rescales the whole report in
+// place -- the panels' sizes are set on the page, no new view. The dotplot keeps
+// its shape (square pixels); the marginals keep their size and follow its length.
+// Double-click the grip to go back to the size fitted to the window.
+
+function reportPanels() {
+  const doc = viewDoc();
+  const out = {};
+  if (!doc) return out;
+  for (const m of doc.all_models) {
+    const t = m.tags && m.tags[0];
+    if (typeof t === "string" && t.startsWith("qv:")) (out[t] = out[t] || []).push(m);
+  }
+  return out;
+}
+
+function findView(model) {
+  const stack = [...(state.views || [])];
+  while (stack.length) {
+    const v = stack.pop();
+    if (v.model === model) return v;
+    if (v.children_views) stack.push(...v.children_views());
+  }
+  return null;
+}
+
+function rememberFit() {
+  const main = (reportPanels()["qv:main"] || [])[0];
+  state.fit = main ? { w: main.width, h: main.height } : null;
+}
+
+function resizeReport(w) {
+  const p = reportPanels();
+  const main = (p["qv:main"] || [])[0];
+  if (!main || !state.fit) return;
+  w = Math.max(60, Math.round(w));
+  const h = Math.max(60, Math.round(w * state.fit.h / state.fit.w));
+  main.width = w; main.height = h;
+  for (const m of [...(p["qv:top"] || []), ...(p["qv:xbar"] || [])]) m.width = w;
+  for (const m of [...(p["qv:right"] || []), ...(p["qv:ybar"] || [])]) m.height = h;
+  for (const m of p["qv:line"] || []) m.width = w + (m.tags[1] ? m.tags[1].pad : 0);
+  requestAnimationFrame(() => requestAnimationFrame(placeGrip));
+}
+
+function mainRect() {
+  const main = (reportPanels()["qv:main"] || [])[0];
+  const v = main && findView(main);
+  if (!v || !v.el) return null;
+  const r = v.el.getBoundingClientRect(), c = $("#plot-cell").getBoundingClientRect();
+  if (!r.width) return null;
+  const cell = $("#plot-cell");
+  return { left: r.left - c.left + cell.scrollLeft, top: r.top - c.top + cell.scrollTop,
+           width: r.width, height: r.height };
+}
+
+function placeGrip() {
+  const g = $("#plot-grip"), r = mainRect();
+  g.hidden = !r;
+  if (!r) return;
+  g.style.left = `${r.left + r.width - 7}px`;
+  g.style.top = `${r.top + r.height - 7}px`;
+  g.title = "drag to resize the plot; double-click: fit to the window" +
+    (state.userWidth ? ` (now ${Math.round(r.width)} px wide)` : "");
+}
+
+function wireGrip() {
+  const g = $("#plot-grip"), ghost = $("#plot-ghost");
+  let start = null;
+  g.addEventListener("pointerdown", (e) => {
+    const r = mainRect();
+    if (!r || !state.fit) return;
+    start = { x: e.clientX, y: e.clientY, r, aspect: state.fit.h / state.fit.w };
+    g.setPointerCapture(e.pointerId);
+    Object.assign(ghost.style, { left: `${r.left}px`, top: `${r.top}px`,
+                                 width: `${r.width}px`, height: `${r.height}px` });
+    ghost.hidden = false;
+    e.preventDefault();
+  });
+  g.addEventListener("pointermove", (e) => {
+    if (!start) return;
+    const { r, aspect } = start;
+    // the larger of the two pulls wins; the shape stays the dotplot's
+    const s = Math.max((r.width + e.clientX - start.x) / r.width,
+                       (r.height + e.clientY - start.y) / r.height);
+    const w = Math.max(60, r.width * s);
+    ghost.style.width = `${w}px`;
+    ghost.style.height = `${w * aspect}px`;
+  });
+  g.addEventListener("pointerup", () => {
+    if (!start) return;
+    ghost.hidden = true;
+    const w = parseFloat(ghost.style.width);
+    start = null;
+    state.userWidth = w;
+    resizeReport(w);
+  });
+  g.addEventListener("dblclick", () => {
+    state.userWidth = null;
+    if (state.fit) resizeReport(state.fit.w);
+  });
+}
+
+// The background toggle restyles when the view already holds the background;
+// switched on without it, the server has to start (or send) it.
+function onBackgroundToggle() {
+  const doc = viewDoc();
+  if ($("#background").checked && !(doc && doc.get_model_by_name("qv-background"))) scheduleView();
+  else { restyle(); renderBackgroundStatus(state.lastView && state.lastView.background); }
+}
+
+function renderBackgroundStatus(bg) {
+  const out = $("#syn-status");
+  out.classList.remove("warn");
+  if (bg && bg.floor) $("#bg-floor").textContent = `${(100 * bg.floor).toFixed(2)}%`;
+  if (!$("#background").checked || !bg) { out.textContent = ""; return; }
+  if (bg.status === "running") out.textContent = "k-mer similarity: computing…";
+  else if (bg.status === "failed") {
+    out.textContent = `k-mer similarity failed: ${bg.error}`;
+    out.classList.add("warn");
+  } else if (bg.drawn) {
+    out.textContent = `k-mer similarity: ${bg.cells.toLocaleString()} of ${(bg.grid[0] * bg.grid[1]).toLocaleString()} ` +
+      `bin pairs ≥ the recruitment's pid, bins of ${bg.binsize.toLocaleString()} bp` +
+      (bg.sampling > 1 ? `, k-mers sampled 1 in ${bg.sampling}` : "");
+  } else out.textContent = "";
 }
 
 function renderScore(d) {
@@ -314,12 +604,15 @@ function renderScore(d) {
   const parts = el("span",
     `emission ${fmtDs(s.emission)} (${s.at_plus_C} at +C, ${s.at_minus_C} at −C)  ·  ` +
     `exposure ${fmtDs(s.exposure)}  ·  ${s.scored.toLocaleString()} scored, ${s.dropped} dropped` +
-    (s.boundary || s.dropped_boundary ? `  ·  boundary ${s.boundary} scored, ${s.dropped_boundary} dropped` : ""));
+    (s.boundary || s.dropped_boundary ? `  ·  boundary ${s.boundary} scored, ${s.dropped_boundary} dropped` : "") +
+    (s.fixed_quality ? `  ·  ${s.fixed_quality.toLocaleString()} at fixed Q${p.fallback_qual}` : ""));
   parts.className = "parts";
   parts.title = "scored: reads with a log-ratio (boundary reads included)\n" +
     "dropped: a placement passing the recruitment's pid/plen crosses a segment edge\n" +
     "boundary: reads crossing a sealed edge, scored with windows past it; dropped when " +
-    "they do not reach one candidate's segments";
+    "they do not reach one candidate's segments" +
+    (s.fixed_quality ? `\nfixed Q${p.fallback_qual}: reads stored without base qualities ` +
+     "(aligned from FASTA), every base given that quality" : "");
   const ramp = el("span"); ramp.className = "legend-ramp";
   const bar = el("i");
   bar.style.background = `linear-gradient(to right, ${p.colors.ratio_neg}, #d2d2ca, ${p.colors.ratio_pos})`;
@@ -355,6 +648,9 @@ async function alignRect(x0, x1, y0, y1) {
   state.lastRect = [x0, x1, y0, y1];
   const q = params();
   q.set("x0", x0); q.set("x1", x1); q.set("y0", y0); q.set("y1", y1);
+  // `reads` here asks for the reads under the alignment; the view's reads mode
+  // (hover/all) and background mean nothing to this endpoint.
+  q.delete("reads"); q.delete("background");
   if (state.showReads) q.set("reads", "1");
   $("#align-meta").textContent = state.showReads ? "Aligning and fetching reads\u2026" : "Aligning\u2026";
   let a;
@@ -362,7 +658,7 @@ async function alignRect(x0, x1, y0, y1) {
     const res = await fetch(`/api/loci/${id}/align?${q}`, { signal: ctl.signal });
     if (!res.ok) {
       let msg = await res.text();
-      try { msg = JSON.parse(msg).detail || msg; } catch (_) { /* plain text */ }
+      msg = errorDetail(msg);
       throw new Error(msg);
     }
     a = await res.json();
@@ -759,15 +1055,21 @@ function wire() {
     });
   }
   $("#filter").addEventListener("input", (e) => { state.filter = e.target.value; renderTable(); });
-  for (const id of ["pid", "plen", "best_pid_delta", "pid_tie_eps", "binsize", "C"]) {
+  // Thresholds and bin size change the reads drawn: a new view from the server.
+  // Everything else is restyled on the page.
+  for (const id of ["pid", "plen", "best_pid_delta", "pid_tie_eps", "binsize"]) {
     $(`#${id}`).addEventListener("change", scheduleView);
   }
-  for (const b of document.querySelectorAll("#color_by button")) {
-    b.addEventListener("click", () => {
-      document.querySelectorAll("#color_by button").forEach((x) => x.classList.toggle("on", x === b));
-      scheduleView();
-    });
+  $("#C").addEventListener("change", restyle);
+  for (const group of ["#color_by", "#reads_mode"]) {
+    for (const b of document.querySelectorAll(`${group} button`)) {
+      b.addEventListener("click", () => {
+        document.querySelectorAll(`${group} button`).forEach((x) => x.classList.toggle("on", x === b));
+        restyle();
+      });
+    }
   }
+  $("#background").addEventListener("change", onBackgroundToggle);
   $("#star-only").addEventListener("click", (e) => {
     state.starOnly = !state.starOnly;
     e.currentTarget.classList.toggle("on", state.starOnly);
@@ -776,9 +1078,11 @@ function wire() {
   restoreWidths();
   wireResizers();
   wireRectAlign();
+  wireGrip();
   $("#reads-toggle").addEventListener("click", toggleReads);
   $("#remember-toggle").addEventListener("click", toggleRemember);
   $("#recruit-run").addEventListener("click", runRecruit);
+  wireAddSeed();
   $("#recruit-reset").addEventListener("click", () => fillRecruitForm(state.project.recruitment));
   wireRects();
   for (const b of document.querySelectorAll(".collapse")) {
@@ -791,12 +1095,79 @@ function wire() {
   new ResizeObserver(() => {
     const cell = $("#plot-cell");
     const size = `${cell.clientWidth}x${cell.clientHeight}`;
-    if (size !== last) { last = size; scheduleView(); }
+    // a size chosen by dragging stays as it is; otherwise the plot is fitted again
+    if (size !== last) { last = size; if (state.userWidth) placeGrip(); else scheduleView(); }
   }).observe($("#plot-cell"));
 
   const es = new EventSource("/api/events");
   es.addEventListener("update", (e) => onUpdate(JSON.parse(e.data)));
   es.addEventListener("progress", (e) => showProgress(JSON.parse(e.data), null));
+}
+
+// ---- adding a seed ---------------------------------------------------------------
+
+function seedMsg(text, warn = false) {
+  const m = $("#seed-msg");
+  m.textContent = text || "";
+  m.classList.toggle("warn", warn);
+  m.hidden = !text;
+}
+
+async function addSeed() {
+  const body = { assembly: $("#seed-assembly").value, region: $("#seed-region").value,
+                 name: $("#seed-name").value };
+  const btn = $("#add-seed button[type=submit]");
+  btn.disabled = true;
+  try {
+    const res = await fetch("/api/seeds", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      let msg = await res.text();
+      msg = errorDetail(msg);
+      seedMsg(msg, true);
+      return;
+    }
+    const s = await res.json();
+    state.addedSeed = s.name;
+    seedMsg(`${s.name}: recruiting ${s.contig}:${(s.start + 1).toLocaleString()}-${s.end.toLocaleString()}` +
+            ` on ${s.assembly}… its locus opens when it is ready.`);
+    $("#seed-region").value = "";
+    $("#seed-name").value = "";
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// The seed just added: open its locus once a row lists it, or say why it failed.
+function checkAddedSeed(d) {
+  const name = state.addedSeed;
+  if (!name) return;
+  const failed = (d.failed_seeds || []).find((f) => f.seed === name);
+  if (failed) {
+    state.addedSeed = null;
+    seedMsg(`${name}: recruitment failed: ${failed.error}`, true);
+    return;
+  }
+  const row = (d.rows || []).find((r) => !r.removed && r.seeds.includes(name));
+  if (row) {
+    state.addedSeed = null;
+    seedMsg(`${name}: recruited, ${row.reads.toLocaleString()} reads.`);
+    state.rows.set(row.id, row);
+    openLocus(row.id, true);
+  }
+}
+
+function wireAddSeed() {
+  const sel = $("#seed-assembly");
+  sel.replaceChildren(...[state.project.asm1.name, state.project.asm2.name].map((n) => el("option", n)));
+  $("#add-seed-toggle").addEventListener("click", (e) => {
+    const form = $("#add-seed");
+    form.hidden = !form.hidden;
+    e.currentTarget.classList.toggle("on", !form.hidden);
+    if (!form.hidden) $("#seed-region").focus();
+  });
+  $("#add-seed").addEventListener("submit", (e) => { e.preventDefault(); addSeed(); });
 }
 
 // ---- recruitment -----------------------------------------------------------------
@@ -923,7 +1294,7 @@ async function runRecruit() {
     });
     if (!res.ok) {
       let msg = await res.text();
-      try { msg = JSON.parse(msg).detail || msg; } catch (_) { /* plain text */ }
+      msg = errorDetail(msg);
       recruitMsg(msg, true);
       return;
     }
@@ -1105,7 +1476,7 @@ async function openProject(path) {
     });
     if (!res.ok) {
       let msg = await res.text();
-      try { msg = JSON.parse(msg).detail || msg; } catch (_) { /* plain text */ }
+      msg = errorDetail(msg);
       throw new Error(msg);
     }
     // A fresh page for the new project: every table, view and stream starts clean.

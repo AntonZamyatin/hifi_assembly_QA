@@ -19,6 +19,10 @@ import numpy as np
 
 _COMP = str.maketrans("ACGTNacgtn", "TGCANtgcan")
 _PRIMARY = ("primary", "primary_wsup")
+# Every base's Phred quality for a read stored without any (QUAL '*'), as reads
+# aligned from FASTA are -- e.g. homopolymer-compressed ones. The calibration
+# anchor of docs/phmm.md stage A: the HiFi data there is mean Q39.
+FALLBACK_QUAL = 39
 
 
 def revcomp(seq: str) -> str:
@@ -31,19 +35,27 @@ class ReadStore:
     `bams` maps assembly name to BAM path. Any assembly will do, since every read
     is the same read whichever assembly it was aligned to; they are tried in the
     order given, and the first primary record carrying a sequence wins.
+
+    A primary with a sequence but no qualities gets `fallback_qual` on every base
+    (None refuses it instead), if no assembly has the read with qualities; such
+    reads are collected in `fixed_quality`.
     """
 
-    def __init__(self, db_path: str, bams: dict[str, str]):
+    def __init__(self, db_path: str, bams: dict[str, str],
+                 fallback_qual: int | None = FALLBACK_QUAL):
         import pysam
 
         self._db = sqlite3.connect(db_path)
         self._bams = {a: pysam.AlignmentFile(p, "rb") for a, p in bams.items()}
         self._cache: dict[str, tuple[str, np.ndarray]] = {}
+        self.fallback_qual = fallback_qual
+        self.fixed_quality: set[str] = set()
 
     def get(self, read_name: str) -> tuple[str, np.ndarray]:
         hit = self._cache.get(read_name)
         if hit is not None:
             return hit
+        no_qual = None
         for asm, bam in self._bams.items():
             row = self._db.execute(
                 "SELECT contig, start, strand, q_len FROM aln "
@@ -57,6 +69,8 @@ class ReadStore:
                         or rec.is_supplementary or rec.reference_start != start):
                     continue
                 seq, qual = rec.query_sequence, rec.query_qualities
+                if seq is not None and qual is None and no_qual is None:
+                    no_qual = (asm, seq if not rec.is_reverse else revcomp(seq), q_len)
                 if seq is None or qual is None:
                     continue
                 qual = np.asarray(qual, dtype=np.int64)
@@ -69,6 +83,22 @@ class ReadStore:
                         f"read is {q_len} bp; it is hard-clipped")
                 self._cache[read_name] = (seq, qual)
                 return seq, qual
+        if no_qual is not None:
+            # Reads aligned from FASTA (e.g. homopolymer-compressed) carry no QUAL;
+            # the pair HMM's emissions need per-base qualities.
+            asm, seq, q_len = no_qual
+            if self.fallback_qual is None:
+                raise ValueError(
+                    f"{read_name}: its primary record on {asm} has no base qualities "
+                    f"(QUAL '*'), which scoring needs; were the reads aligned from FASTA?")
+            if len(seq) != q_len:
+                raise ValueError(
+                    f"{read_name}: primary on {asm} stores {len(seq)} bp but the "
+                    f"read is {q_len} bp; it is hard-clipped")
+            qual = np.full(len(seq), self.fallback_qual, dtype=np.int64)
+            self.fixed_quality.add(read_name)
+            self._cache[read_name] = (seq, qual)
+            return seq, qual
         raise KeyError(f"no primary record with a stored sequence for {read_name}")
 
     def close(self) -> None:

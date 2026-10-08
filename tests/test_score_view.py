@@ -64,43 +64,67 @@ def test_strength_scale():
     check(ratio_color(0.0) == "#d2d2ca", "zero maps to the neutral grey")
 
 
+def _rgb(packed):
+    return (int(packed) >> 24) & 255, (int(packed) >> 16) & 255, (int(packed) >> 8) & 255
+
+
 def test_line_source_keeps_rows(tmp):
+    from qaview.glyphs import _line_sources, pack_rgba
+
     rd = make_region_data(tmp, "lr")
     base = _line_source(rd, "class")
     names = sorted(set(rd.read_names))
     ratios = {names[0]: -27.0, names[1]: 3.0}
-    src = _line_source(rd, "log-ratio", ratios=ratios, dropped={names[2]}, C=200)
+    src, reads, _ = _line_sources(rd, "log-ratio", ratios=ratios, dropped={names[2]}, C=200)
     n = len(base.data["x0"])
-    check(len(src.data["x0"]) == n and src.data["read_name"] == base.data["read_name"],
+    check(len(src.data["x0"]) == n and list(src.data["read"]) == list(base.data["read"]),
           "log-ratio mode must keep every row in the same order")
-    for name, colour, txt in zip(src.data["read_name"], src.data["color"],
-                                 src.data["ratio_txt"]):
+    for g, colour in zip(src.data["read"], src.data["color"]):
+        name, txt = reads.data["name"][g], reads.data["ratio_txt"][g]
         if name == names[0]:
-            r, g, b = (int(colour[i:i + 2], 16) for i in (1, 3, 5))
-            check(g > r, f"a read favouring asm2 must lean green, got {colour}")
+            r, gr, b = _rgb(colour)
+            check(gr > r, f"a read favouring asm2 must lean green, got {_rgb(colour)}")
             check(txt == "-27.00 nats", f"hover text {txt!r}")
         elif name == names[1]:
-            r, g, b = (int(colour[i:i + 2], 16) for i in (1, 3, 5))
-            check(r > g, f"a read favouring asm1 must lean red, got {colour}")
+            r, gr, b = _rgb(colour)
+            check(r > gr, f"a read favouring asm1 must lean red, got {_rgb(colour)}")
         elif name == names[2]:
-            check(colour == UNSCORED_COLOR and txt.startswith("dropped"),
-                  f"a dropped read must be grey and say so: {colour} {txt!r}")
+            check(colour == pack_rgba(UNSCORED_COLOR) and txt.startswith("dropped"),
+                  f"a dropped read must be grey and say so: {_rgb(colour)} {txt!r}")
+
+
+def test_packed_ratio_colours_match_ratio_color():
+    """The array path (and the page, which mirrors it) colours as ratio_color does."""
+    import numpy as np
+
+    from qaview.glyphs import pack_rgba, ratio_rgba, ratio_strengths
+
+    rs = [-math.inf, -1e4, -27.0, -3.0, -0.4, 0.0, 0.4, 3.0, 27.0, 1e4, math.inf, float("nan")]
+    for C in (50, 200, 1000):
+        ts = ratio_strengths(np.array(rs), C)
+        check(all(abs(t - ratio_strength(r, C)) < 1e-12 for t, r in zip(ts, rs)),
+              f"strengths at C={C}: {ts}")
+        got = ratio_rgba(ts)
+        check(all(int(p) == pack_rgba(ratio_color(ratio_strength(r, C))) for p, r in zip(got, rs)),
+              f"colours at C={C}")
 
 
 def test_hidden_layers_stay_hidden(tmp):
     rd = make_region_data(tmp, "hl")
     ratios = {n: -10.0 for n in rd.read_names}
     src = _line_source(rd, "log-ratio", visible_layers=set(), ratios=ratios)
-    check(all(a == 0.0 for a in src.data["alpha"]),
+    check(all(float(a) == 0.0 for a in src.data["alpha"]),
           "hiding every layer must hide every line in log-ratio mode too")
 
 
 def test_unscored_before_scoring(tmp):
     rd = make_region_data(tmp, "us")
-    src = _line_source(rd, "log-ratio", ratios=None)
-    check(all(c == UNSCORED_COLOR for c in src.data["color"]),
+    from qaview.glyphs import _line_sources, pack_rgba
+
+    src, reads, _ = _line_sources(rd, "log-ratio", ratios=None)
+    check(all(int(c) == pack_rgba(UNSCORED_COLOR) for c in src.data["color"]),
           "before scoring finishes every line is the unscored grey")
-    check(all(t == "not scored yet" for t in src.data["ratio_txt"]), "hover says so")
+    check(all(t == "not scored yet" for t in reads.data["ratio_txt"]), "hover says so")
     report_layout(rd, color_by="log-ratio")                 # must not raise
 
 
@@ -202,23 +226,41 @@ def test_layout_marginals_follow_colour(tmp):
     names = sorted(set(rd.read_names))
     ratios = {n: -12.0 for n in names}
 
-    def band_names(layout):
+    def shown(layout):
+        """The band names of the stacking on show, as the hover reads them."""
         from bokeh.models import CustomJS, HoverTool
         out = set()
         for m in layout.select({"type": HoverTool}):
-            if isinstance(m.callback, CustomJS) and "band_names" in m.callback.args:
-                out.add(tuple(m.callback.args["band_names"]))
+            if isinstance(m.callback, CustomJS) and "names" in m.callback.args:
+                a = m.callback.args
+                out.add(tuple(a["names"][f"names_{a['mode'].text}"]))
         return out
 
-    lr = band_names(report_layout(rd, color_by="log-ratio", ratios=ratios))
+    def drawn(layout):
+        """Stackings drawn, and which are visible (the page switches them)."""
+        from bokeh.models import GlyphRenderer
+        tags = {}
+        for r in layout.select({"type": GlyphRenderer}):
+            if r.tags and str(r.tags[0]).startswith("stack:"):
+                tags.setdefault(r.tags[0], set()).add(r.visible)
+        return tags
+
+    lay = report_layout(rd, color_by="log-ratio", ratios=ratios)
+    lr = shown(lay)
     check(len(lr) == 1 and "not scored" in next(iter(lr)),
           f"log-ratio colouring must stack the marginals by log-ratio band, got {lr}")
-    cl = band_names(report_layout(rd, color_by="class", ratios=ratios))
+    check(drawn(lay) == {"stack:ratio": {True}, "stack:class": {False}},
+          f"both stackings drawn, the ratio one shown: {drawn(lay)}")
+    lay = report_layout(rd, color_by="class", ratios=ratios)
+    cl = shown(lay)
     check(len(cl) == 1 and "unassigned" in next(iter(cl)),
           f"class colouring must keep the class stacking, got {cl}")
-    pre = band_names(report_layout(rd, color_by="log-ratio", ratios=None))
+    check(drawn(lay) == {"stack:ratio": {False}, "stack:class": {True}}, f"{drawn(lay)}")
+    lay = report_layout(rd, color_by="log-ratio", ratios=None)
+    pre = shown(lay)
     check(len(pre) == 1 and "unassigned" in next(iter(pre)),
           "before scoring, log-ratio mode falls back to class marginals")
+    check(drawn(lay) == {"stack:class": {True}}, f"no ratio stacking before scoring: {drawn(lay)}")
 
 
 def main():
@@ -228,7 +270,8 @@ def main():
              (test_score_cache_ignores_display, True), (test_score_job_reads_cache, True),
              (test_clamp_is_display_only, True),
              (test_rebucket_counts_repeated_placements, True), (test_ratio_bands, False),
-             (test_ratio_stacking_is_exact, True), (test_layout_marginals_follow_colour, True)]
+             (test_ratio_stacking_is_exact, True), (test_layout_marginals_follow_colour, True),
+             (test_packed_ratio_colours_match_ratio_color, False)]
     for fn, needs in tests:
         print(f"{fn.__name__} ...")
         fn(tmp) if needs else fn()

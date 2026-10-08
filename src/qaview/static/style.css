@@ -199,6 +199,19 @@ dl.files dd { font-family: ui-monospace, monospace; font-size: 11px; }
 #plot-cell { position: relative; flex: 1; min-height: 0; overflow: auto; padding: 8px 12px; }
 #topbar { flex: none; }
 #plot { width: 100%; height: 100%; }
+/* the dotplot's corner: drag to resize the report in place (app.js wireGrip) */
+#plot-grip {
+  position: absolute; width: 14px; height: 14px; z-index: 6; cursor: nwse-resize;
+  background: linear-gradient(135deg, transparent 45%, #7a7a72 45%, #7a7a72 55%, transparent 55%,
+                              transparent 70%, #7a7a72 70%, #7a7a72 80%, transparent 80%);
+  border-radius: 2px;
+}
+#plot-grip:hover { background-color: rgba(0, 0, 0, 0.08); }
+#plot-grip[hidden], #plot-ghost[hidden] { display: none; }
+#plot-ghost {
+  position: absolute; z-index: 5; pointer-events: none;
+  border: 1px dashed #444; background: rgba(120, 120, 110, 0.06);
+}
 #plot-status {
   position: absolute; left: 50%; top: 45%; transform: translate(-50%, -50%);
   pointer-events: none; text-align: center;
@@ -311,3 +324,17 @@ dl.files dd { font-family: ui-monospace, monospace; font-size: 11px; }
 .badge.busy { color: var(--muted); }
 #recruit-form .changed { border-color: var(--accent); background: var(--select); }
 #loci td .own { color: var(--accent); font-weight: 700; margin-left: 2px; }
+#syn-legend { align-items: center; }
+#syn-legend .bg-ramp { display: inline-block; width: 120px; height: 8px; border-radius: 2px; }
+
+/* ---- adding a seed ------------------------------------------------------------- */
+
+.add-seed { display: grid; gap: 6px; padding: 8px; border: 1px solid var(--line); border-radius: 3px; background: var(--bg); }
+.add-seed .row { display: flex; gap: 6px; min-width: 0; }
+.add-seed select, .add-seed input {
+  font: inherit; min-width: 0; padding: 2px 6px; border: 1px solid var(--line); border-radius: 3px; background: var(--panel);
+}
+.add-seed select { flex: 0 1 auto; }
+.add-seed input { flex: 1 1 auto; }
+#add-seed-toggle { font-weight: 600; }
+#add-seed-toggle.on { color: var(--accent); border-color: var(--accent); }

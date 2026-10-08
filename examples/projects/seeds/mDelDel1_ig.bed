@@ -1,0 +1,5 @@
+# mDelDel1: IG anomalies from anomaly_table.csv, on ref (make_projects.py)
+SUPER_13	24300817	24301183	IGL_001_SUPER_13_mismatch
+SUPER_13	24303812	24305901	IGL_002_SUPER_13_mismatch
+SUPER_13	24309842	24309843	IGL_003_SUPER_13_mismatch
+SUPER_13	24311324	24311325	IGL_004_SUPER_13_mismatch

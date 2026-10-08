@@ -189,12 +189,72 @@ def test_placements_follow_recruitment_thresholds():
         check(none == [], "nothing passing: no placement, so no window in that candidate")
 
 
+def test_reads_without_qualities_score_at_a_fixed_quality():
+    """Reads aligned from FASTA carry no QUAL: each base gets FALLBACK_QUAL, the read
+    is returned as sequenced on either strand, scored, and counted as such."""
+    import random
+    import tempfile
+
+    import pysam
+
+    from fixtures import write_db
+    from qamodel.phmm.reads import FALLBACK_QUAL, ReadStore, revcomp
+    from qamodel.score import score_locus
+
+    rng = random.Random(2)
+    ref = "".join(rng.choice("ACGT") for _ in range(6_000))
+    with tempfile.TemporaryDirectory() as tmp:
+        fa = os.path.join(tmp, "g.fa")
+        with open(fa, "w") as fh:
+            fh.write(f">c\n{ref}\n")
+        pysam.faidx(fa)
+        bam = os.path.join(tmp, "g.bam")
+        header = {"HD": {"VN": "1.6", "SO": "coordinate"}, "SQ": [{"SN": "c", "LN": len(ref)}]}
+        rows = []
+        with pysam.AlignmentFile(bam, "wb", header=header) as out:
+            for name, start, rev in (("fwd", 1_000, False), ("rev", 3_000, True)):
+                a = pysam.AlignedSegment()
+                a.query_name, a.reference_id, a.reference_start = name, 0, start
+                a.mapping_quality, a.cigartuples, a.flag = 60, [(0, 1_500)], 16 if rev else 0
+                a.query_sequence = ref[start:start + 1_500]       # stored on the reference strand
+                a.set_tag("NM", 0)
+                out.write(a)                                      # no qualities: QUAL '*'
+                for asm in ("A", "B"):
+                    rows.append({"assembly": asm, "read_name": name, "contig": "c", "start": start,
+                                 "end": start + 1_500, "strand": 0 if rev else 1, "q_len": 1_500,
+                                 "q_aln_len": 1_500})
+        pysam.index(bam)
+        db = write_db(os.path.join(tmp, "a.sqlite"), rows)
+
+        with ReadStore(db, {"A": bam}) as store:
+            seq, qual = store.get("rev")
+            check(seq == revcomp(ref[3_000:4_500]) and (qual == FALLBACK_QUAL).all() and len(qual) == 1_500,
+                  "a reverse read comes back as sequenced, every base at the fixed quality")
+            store.get("fwd")
+            check(store.fixed_quality == {"fwd", "rev"}, f"both noted: {store.fixed_quality}")
+        with ReadStore(db, {"A": bam}, fallback_qual=None) as store:
+            try:
+                store.get("fwd")
+                check(False, "without a fallback a read with no qualities is refused")
+            except ValueError as exc:
+                check("no base qualities" in str(exc), str(exc))
+
+        segs = [NS(assembly=a, contig="c", start=0, end=len(ref)) for a in ("A", "B")]
+        res = score_locus(["fwd", "rev"], segs, "A", "B", db_path=db, bams={"A": bam, "B": bam},
+                          fastas={"A": fa, "B": fa}, library=point_library(10_000, 1_000_000, 1_500),
+                          workers=1)
+        check(len(res.reads) == 2 and sorted(res.fixed_quality) == ["fwd", "rev"],
+              f"scored, and counted on the score: {res.fixed_quality}")
+        check(all(abs(r.ratio) < 1e-9 for r in res.reads), "identical candidates: ratio 0")
+
+
 def main():
     tests = [test_clamp_and_infinities, test_sweep_needs_no_rescoring,
              test_effective_length_exact_form, test_lambda_definition,
              test_false_duplication_end_to_end,
              test_boundary_read_scores_as_if_the_unit_held_the_flank,
-             test_placements_follow_recruitment_thresholds]
+             test_placements_follow_recruitment_thresholds,
+             test_reads_without_qualities_score_at_a_fixed_quality]
     for fn in tests:
         print(f"{fn.__name__} ...")
         fn()

@@ -227,8 +227,42 @@ def test_endpoints():
             check(r.status_code == 400, "no seeds")
 
 
+def test_same_reads_share_a_locus_whatever_the_segments():
+    """Seeds recruiting the same read set share a row although an end differs; the
+    row keeps the first seed's segments and id. A different read set is its own row,
+    and once the first seed moves away the row stays with the others."""
+    from qatool.plotters.likelihood import locus_id
+    from qatool.SegmentStorage import Segment
+    from qaview.pipeline import Pipeline
+    from qaview.project import load_project
+
+    with tempfile.TemporaryDirectory() as tmp:
+        project = load_project(make(tmp))
+        pipe = Pipeline(project)
+        put(pipe, "seed1", {}, 100, ["r1", "r2"])
+        put(pipe, "seed2", {}, 120, ["r2", "r1"])           # another end, the same reads
+        pipe._recruit_all()
+        lid = locus_of(pipe, "seed1")
+        check(locus_of(pipe, "seed2") == lid and len(pipe.loci) == 1, "one row for both")
+        segs = [Segment("A", "c1", 0, 100), Segment("B", "c9", 0, 100)]
+        check(lid == locus_id(segs, ["r1", "r2"], "A", "B"), "named by the first seed's content")
+        check(pipe.loci[lid].span == {"A": 100, "B": 100} and pipe.loci[lid].seeds == ["seed1", "seed2"],
+              f"with its segments: {pipe.loci[lid].span}")
+
+        put(pipe, "seed1", {"merge_gap": 1000}, 100, ["r1"])
+        pipe.rerecruit(["seed1"], {**project.recruitment, "merge_gap": 1000})
+        check(settle(pipe, ["seed1"]), "re-recruited")
+        check(locus_of(pipe, "seed1") != lid and pipe.loci[lid].seeds == ["seed2"],
+              "seed1 moved to a row of its own; seed2 keeps the old one")
+        put(pipe, "seed1", {"merge_gap": 2000}, 130, ["r1", "r2"])
+        pipe.rerecruit(["seed1"], {**project.recruitment, "merge_gap": 2000})
+        check(settle(pipe, ["seed1"]), "re-recruited again")
+        check(locus_of(pipe, "seed1") == lid and len(pipe.loci) == 1,
+              f"back to the same reads: it rejoins: {list(pipe.loci)}")
+
+
 def main():
-    tests = [test_rerecruit, test_failure_keeps_the_seed, test_endpoints]
+    tests = [test_rerecruit, test_failure_keeps_the_seed, test_endpoints, test_same_reads_share_a_locus_whatever_the_segments]
     for fn in tests:
         print(f"{fn.__name__} ...")
         fn()

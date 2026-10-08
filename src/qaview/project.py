@@ -7,12 +7,17 @@ whole of the user's setup.
 
 Seeds are source-neutral: each `[[seeds]]` entry is read by the loader for its
 `format` into `Seed` records, and a new source is a new loader in `LOADERS`.
+Seeds added from the page are kept in `<output>/qaview_seeds.json`, not in the
+project file, and read with the rest every time the project is opened.
 """
 
 from __future__ import annotations
 
 import csv
+import datetime
+import json
 import os
+import re
 import tomllib
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -268,11 +273,98 @@ def load_project(path: str, check_files: bool = True) -> Project:
                             "seeds": len(got)})
     if problems:
         raise ProjectError("\n".join(problems))
+    added = load_added_seeds(output_dir, (asm1.name, asm2.name))
+    if added:
+        seeds += added
+        source_info.append({"format": "added in qaview", "path": added_seeds_path(output_dir),
+                            "assembly": ", ".join(sorted({x.assembly for x in added})),
+                            "seeds": len(added)})
 
     return Project(path=path, name=t.get("name", os.path.splitext(os.path.basename(path))[0]),
                    asm1=asm1, asm2=asm2, db=db, library_assembly=library,
                    seeds=_dedupe(seeds), recruitment=recruitment, resources=resources,
                    output_dir=output_dir, seed_sources=source_info)
+
+
+# ---- seeds added from the page -----------------------------------------------------
+
+ADDED_SEEDS = "qaview_seeds.json"
+_REGION = re.compile(r"^\s*([^:\s]+)\s*:\s*([\d,]+)\s*(?:[-\u2013]\s*([\d,]+))?\s*$")
+
+
+def added_seeds_path(output_dir: str) -> str:
+    return os.path.join(output_dir, ADDED_SEEDS)
+
+
+def load_added_seeds(output_dir: str, assemblies) -> list[Seed]:
+    """Seeds added from the page; an entry that does not parse is skipped."""
+    try:
+        with open(added_seeds_path(output_dir)) as fh:
+            rows = json.load(fh).get("seeds", [])
+    except (OSError, ValueError):
+        return []
+    out = []
+    for r in rows:
+        try:
+            if r["assembly"] in assemblies and int(r["end"]) > int(r["start"]) >= 0:
+                out.append(Seed(str(r["name"]), "added", r["assembly"], str(r["contig"]),
+                                int(r["start"]), int(r["end"]), {"added": r.get("added", "")}))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+def parse_region(text: str) -> tuple[str, int, int]:
+    """`contig:start-end`, 1-based and inclusive as the page shows coordinates
+    (commas allowed; `contig:pos` is one base) -> (contig, 0-based start, end)."""
+    m = _REGION.match(text or "")
+    if not m:
+        raise ValueError(f"expected contig:start-end, e.g. h1tg000146l:58,730-98,730 -- got {text!r}")
+    start = int(m.group(2).replace(",", ""))
+    end = int((m.group(3) or m.group(2)).replace(",", ""))
+    if start < 1 or end < start:
+        raise ValueError(f"start must be at least 1 and no more than end: {text!r}")
+    return m.group(1), start - 1, end
+
+
+def new_seed(project: "Project", assembly: str, region: str, name: str = "") -> Seed:
+    """A seed for `region` on `assembly`, checked against the FASTA and the project's
+    seeds. Raises ValueError saying what is wrong."""
+    import pysam
+
+    if assembly not in (project.asm1.name, project.asm2.name):
+        raise ValueError(f"assembly must be {project.asm1.name} or {project.asm2.name}")
+    contig, start, end = parse_region(region)
+    with pysam.FastaFile(project.candidate(assembly).fasta) as fa:
+        if contig not in fa.references:
+            raise ValueError(f"no contig {contig!r} in {assembly}")
+        length = fa.get_reference_length(contig)
+    if end > length:
+        raise ValueError(f"{contig} is {length:,} bp long; the region ends at {end:,}")
+    name = re.sub(r"\s+", "_", (name or "").strip()) or f"{contig}_{start}_{end}"
+    for s in project.seeds:
+        if s.interval == (assembly, contig, start, end):
+            raise ValueError(f"already a seed: {s.name}")
+        if s.name == name:
+            raise ValueError(f"the name {name!r} is taken")
+    return Seed(name, "added", assembly, contig, start, end,
+                {"added": datetime.datetime.now().isoformat(timespec="seconds")})
+
+
+def save_added_seed(output_dir: str, seed: Seed) -> None:
+    path = added_seeds_path(output_dir)
+    try:
+        with open(path) as fh:
+            rows = json.load(fh).get("seeds", [])
+    except (OSError, ValueError):
+        rows = []
+    rows.append({"name": seed.name, "assembly": seed.assembly, "contig": seed.contig,
+                 "start": seed.start, "end": seed.end, "added": seed.meta.get("added", "")})
+    os.makedirs(output_dir, exist_ok=True)
+    tmp = f"{path}.tmp"
+    with open(tmp, "w") as fh:
+        json.dump({"seeds": rows}, fh, indent=1)
+    os.replace(tmp, path)
 
 
 def _dedupe(seeds: list[Seed]) -> list[Seed]:

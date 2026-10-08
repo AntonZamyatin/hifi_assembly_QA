@@ -110,7 +110,9 @@ def test_hover_tools_wired(tmp):
     main_hovers = [t for t in p["main"].tools if isinstance(t, HoverTool)]
     check(len(main_hovers) == 1, f"dotplot needs one HoverTool, got {len(main_hovers)}")
     fields = {f for _, f in main_hovers[0].tooltips}
-    check(any("read_name" in f for f in fields), "read tooltip must name the read")
+    check(any("@read{name}" in f for f in fields), "read tooltip must name the read")
+    check(set(main_hovers[0].formatters) >= {"@read", "@cls", "@c1", "@c2", "@supp"},
+          "the codes the rows hold are turned back into names")
     check(any("pid1" in f for f in fields) and any("pid2" in f for f in fields),
           "read tooltip must show pid on both assemblies")
     check(main_hovers[0] not in (p["main"].toolbar.active_inspect or []),
@@ -238,14 +240,14 @@ def test_band_detection_data(tmp):
         p = coverage_figure(rd, asm, orient)
         data = hit_renderer(p).data_source.data
         for s in range(n_series):
-            check(f"cum{s}" in data, f"{orient}: missing band top cum{s}")
-            check(len(data[f"cum{s}"]) == len(cov.bins),
-                  f"{orient}: cum{s} must have one value per bin")
+            check(f"cum_class_{s}" in data, f"{orient}: missing band top cum_class_{s}")
+            check(len(data[f"cum_class_{s}"]) == len(cov.bins),
+                  f"{orient}: cum_class_{s} must have one value per bin")
         # Bands must be non-decreasing and end at the total.
         for i in range(len(cov.bins)):
-            tops = [data[f"cum{s}"][i] for s in range(n_series)]
+            tops = [data[f"cum_class_{s}"][i] for s in range(n_series)]
             check(tops == sorted(tops), f"{orient}: bin {i} band tops not monotonic: {tops}")
-        check([round(v, 9) for v in data[f"cum{n_series - 1}"]] ==
+        check([round(v, 9) for v in data[f"cum_class_{n_series - 1}"]] ==
               [round(v, 9) for v in cov.total()],
               f"{orient}: last band must close at the total coverage")
 
@@ -262,9 +264,10 @@ def test_band_detection_data(tmp):
     # which is exactly what the band index assumes.
     p = _panels(report_layout(rd))
     args = next(t for t in p["cov_top"].tools if isinstance(t, HoverTool)).callback.args
-    check(args["band_names"] == list(rd.bucket_keys) + ["unassigned"],
-          f"band names must mirror the stack order, got {args['band_names']}")
-    check(args["n_series"] == n_series, "n_series must match the number of stacked bands")
+    check(args["names"]["names_class"] == list(rd.bucket_keys) + ["unassigned"],
+          f"band names must mirror the stack order, got {args['names']}")
+    check(list(args["bands"]["band_class"]) == band, "the read -> band map the hover uses")
+    check(args["mode"].text == "class", "unscored: the support classes are on show")
     check(args["vertical"] is True, "top marginal stacks along y, so the cursor's y picks the band")
     args_r = next(t for t in p["cov_right"].tools if isinstance(t, HoverTool)).callback.args
     check(args_r["vertical"] is False, "right marginal stacks along x")
