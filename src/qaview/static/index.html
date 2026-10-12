@@ -88,6 +88,9 @@
         <div class="form">
           <label>display pid <input id="pid" type="number" step="0.0005" min="0.9" max="1" value="0.997"></label>
           <label>plen <input id="plen" type="number" step="0.0005" min="0.9" max="1" value="0.999"></label>
+          <label title="a read only one candidate holds whole may be a breakpoint read: hovering it also shows, in orange, its partial alignments in the other candidate inside the locus -- at the display pid, plen from this up to below plen">partial plen <input id="supp_plen" type="number" step="0.05" min="0" max="1" value="0.3"></label>
+          <label title="the pid those alignments need -- separate from the display pid: a piece ending at a breakpoint overruns it before the aligner clips, and loses a few tenths of a percent">partial pid <input id="partial_pid" type="number" step="0.001" min="0.9" max="1" value="0.99"></label>
+          <label title="indels at least this long (bp) inside those alignments are marked with a cross on hover: an SV the aligner kept inside one alignment rather than split">min indel <input id="min_indel" type="number" step="10" min="1" value="50"></label>
           <label>best_pid_delta <input id="best_pid_delta" type="number" step="0.0001" min="0" value="0.001"></label>
           <label>pid_tie_eps <input id="pid_tie_eps" type="number" step="0.0001" min="0" value="0.0001"></label>
           <div id="tie-warning" class="warn small" hidden>pid_tie_eps &ge; best_pid_delta: no read can be called asm1_best or asm2_best.</div>
@@ -147,7 +150,6 @@
     </div>
     <div id="plot-cell">
       <div id="plot"></div>
-      <div id="plot-grip" hidden></div>
       <div id="plot-ghost" hidden></div>
       <div id="plot-status" class="muted"></div>
       <div id="rect-tip" hidden></div>

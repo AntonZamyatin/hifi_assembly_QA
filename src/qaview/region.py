@@ -21,11 +21,11 @@ import pysam
 from qatool.plotters.axis import _build_axis_map, plot_to_genome
 from qatool.plotters.classify import _classify_reads_for_support_colors
 from qatool.plotters.colors import BEST_PID_DELTA_DEFAULT, PID_TIE_EPS_DEFAULT
-from qatool.plotters.coverage import CoverageBins, compute_coverage_bins
+from qatool.plotters.coverage import CoverageBins
 from qatool.plotters.db import _collect_bam_read_names, _fetch_aln_from_db
 from qatool.plotters.reads_dotplot import (
-    _build_lookup, _fetch_aln_blocks, _map_in_segment, _read_span, _read_to_ref,
-    _visible_read_span,
+    _BLOCK_COLS, _build_lookup, _fetch_aln_blocks, _map_in_segment, _map_point, _read_span,
+    _read_to_ref, _visible_read_span,
 )
 
 # Bucket order used for the stacked marginal coverage plots; mirrors report.py so the
@@ -36,6 +36,9 @@ SUPPORT_BUCKET_KEYS = ["asm1_only", "asm2_only", "asm1_best", "asm2_best", "comm
 # single glyph renderer draws them back-to-front — which keeps line row indices
 # consistent with the CSR highlight indexes, unlike splitting into four renderers.
 LAYER_COMMON, LAYER_OTHER, LAYER_SUPPORT, LAYER_SUPPLEMENTARY = 0, 1, 2, 3
+# A one-sided read's partial alignments in the other candidate: never drawn but for
+# the reads a hover or a tap selects (`_partial_lines`).
+LAYER_PARTIAL = 4
 
 _SUPPORT_CLASSES = {"asm1_only", "asm2_only", "asm1_best", "asm2_best"}
 
@@ -79,6 +82,9 @@ class ReadLines:
     ref2_1: np.ndarray
     pid1: np.ndarray
     pid2: np.ndarray
+    # per row, what a partial line is ("partial supplementary in curated, ..."); "" for
+    # an ordinary row; empty when there are no partial rows
+    part: list = field(default_factory=list)
 
     def __len__(self) -> int:
         return len(self.x0)
@@ -121,6 +127,10 @@ class RegionData:
     # assembly -> {contig: length} for the contigs in `segments`, from the BAM
     # headers: which segment edges are contig ends (glyphs.contig_bar_figure).
     contig_lengths: dict = field(default_factory=dict)
+    # rows of `lines` that are partial alignments (LAYER_PARTIAL), for counting
+    n_partial: int = 0
+    # large indels on those rows, shown with them: x, y, read (index), text
+    indels: dict = field(default_factory=dict)
 
     def segs_info(self, assembly: str) -> list:
         if assembly == self.asm1:
@@ -157,7 +167,10 @@ class RegionData:
               pid_threshold: float = 0.99, plen_threshold: float = 0.99,
               binsize: int | None = None,
               best_pid_delta: float = BEST_PID_DELTA_DEFAULT,
-              pid_tie_eps: float = PID_TIE_EPS_DEFAULT) -> "RegionData":
+              pid_tie_eps: float = PID_TIE_EPS_DEFAULT,
+              supp_plen_threshold: float | None = None,
+              partial_pid_threshold: float | None = None,
+              min_indel: int = 50) -> "RegionData":
         """Assemble a RegionData from a recruited SegmentCollection and read set.
 
         binsize=None auto-sizes to ~1000 bins on the longer axis, the same rule
@@ -200,24 +213,36 @@ class RegionData:
         read_pos = {n: i for i, n in enumerate(read_names_l)}
         read_class = {n: k for k in SUPPORT_BUCKET_KEYS for n in read_classes[k]}
 
-        # A read that votes for one assembly is drawn only at its best placements,
-        # in both assemblies: in each marginal its weight of 1 is split evenly
-        # across its tied best placements there, and in the dotplot it runs only
-        # between them -- not at every copy it also aligns to.
-        voters = (read_classes["asm1_only"] | read_classes["asm1_best"]
-                  | read_classes["asm2_only"] | read_classes["asm2_best"])
-        lines = _compute_lines(aln_blocks, read_names_l, read_pos,
-                               asm1_segs_info, asm2_segs_info, asm1, asm2,
-                               best_only=voters, best_tol=pid_tie_eps)
+        # Every read is shown at its best placements only, whatever its class:
+        # in the dotplot it runs between its best placements in the two
+        # assemblies, and in each marginal its weight of 1 is split evenly over
+        # its best placements in that assembly, counted over the whole assembly
+        # (`_best_placements`). The aln rows are fetched by read name, genome-wide.
+        best = {asm: _best_by_read(aln_blocks[asm], best_pid_delta) for asm in (asm1, asm2)}
+        lines = _compute_lines(best, read_names_l, read_pos,
+                               asm1_segs_info, asm2_segs_info, asm1, asm2)
         lines = _order_for_drawing(lines, read_names_l, read_class)
 
+        # A read only one candidate holds whole may be a breakpoint read: its
+        # partial alignments in the other candidate inside the locus are added as
+        # hidden rows, drawn when a hover or a tap selects the read. They change
+        # nothing else -- not its class, the marginals, or the default view.
+        n_partial, indels = 0, {}
+        if supp_plen_threshold is not None:
+            only = {asm1: read_classes["asm2_only"], asm2: read_classes["asm1_only"]}
+            lengths = {asm1: _all_contig_lengths(asm1_bam), asm2: _all_contig_lengths(asm2_bam)}
+            ppid = pid_threshold if partial_pid_threshold is None else partial_pid_threshold
+            pieces = _partial_alignments(db_path, only, pid_threshold, plen_threshold,
+                                         supp_plen_threshold, lengths, ppid, min_indel,
+                                         best_pid_delta)
+            plines, indels = _partial_lines(pieces, best, read_pos, asm1_segs_info,
+                                            asm2_segs_info, asm1, asm2)
+            n_partial = len(plines)
+            lines = _concat_lines(lines, plines)
+
         buckets = [read_classes[k] for k in SUPPORT_BUCKET_KEYS]
-        cov1 = compute_coverage_bins(asm1_bam, asm1_segs, pid_threshold, plen_threshold,
-                                     binsize, buckets, best_pid_delta,
-                                     best_only=voters, best_tol=pid_tie_eps)
-        cov2 = compute_coverage_bins(asm2_bam, asm2_segs, pid_threshold, plen_threshold,
-                                     binsize, buckets, best_pid_delta,
-                                     best_only=voters, best_tol=pid_tie_eps)
+        cov1 = _coverage_at_best(best[asm1], asm1_segs, binsize, buckets)
+        cov2 = _coverage_at_best(best[asm2], asm2_segs, binsize, buckets)
 
         return cls(asm1=asm1, asm2=asm2, binsize=binsize, segments=sc_sorted,
                    asm1_segs_info=asm1_segs_info, asm2_segs_info=asm2_segs_info,
@@ -225,7 +250,8 @@ class RegionData:
                    read_names=read_names_l, read_class=read_class, lines=lines,
                    cov1=cov1, cov2=cov2, bucket_keys=list(SUPPORT_BUCKET_KEYS),
                    contig_lengths={asm1: _contig_lengths(asm1_bam, asm1_segs),
-                                   asm2: _contig_lengths(asm2_bam, asm2_segs)})
+                                   asm2: _contig_lengths(asm2_bam, asm2_segs)},
+                   n_partial=n_partial, indels=indels)
 
 
 def _contig_lengths(bam_path: str, segs) -> dict:
@@ -256,45 +282,272 @@ def _classify_support(db_path, all_reads, pid_threshold, plen_threshold,
             fa2.close()
 
 
-def _best_blocks(blocks: list, tol: float) -> list:
-    """A read's blocks at its best placement: pid within `tol` of its best, plus
-    supplementary pieces (they belong to the primary chain, at lower pid)."""
+_PRIMARY = ("primary", "primary_wsup")
+
+
+# A partial alignment whose clipped side ends this close to its contig's end runs
+# off the contig: a contig break rather than a breakpoint inside it.
+CLIP_END_TOL = 1000
+_PARTIAL_KIND = {"primary": "primary, clipped", "primary_wsup": "primary, split",
+                 "supplementary": "supplementary", "secondary": "secondary"}
+
+
+def _all_contig_lengths(bam_path: str) -> dict:
+    with pysam.AlignmentFile(bam_path, "rb") as bam:
+        return dict(zip(bam.references, bam.lengths))
+
+
+_CIGAR = __import__("re").compile(r"(\d+)([MIDNSHP=X])")
+# At most this many of a read's other alignments are kept: in a repeat a read can
+# have dozens tied at its best, each drawn against each of its whole placements.
+PARTIAL_MAX_PER_READ = 5
+
+
+def _large_indels(cigar: str, start: int, min_len: int) -> list:
+    """(reference position, "insertion" | "deletion", length) for each indel of at
+    least `min_len` bp in an alignment starting at `start`; a deletion is placed at
+    the middle of the reference it skips, an insertion where it occurs."""
+    out, ref = [], start
+    for n, op in _CIGAR.findall(cigar or ""):
+        n = int(n)
+        if op == "D" and n >= min_len:
+            out.append((ref + n // 2, "deletion", n))
+        elif op == "I" and n >= min_len:
+            out.append((ref, "insertion", n))
+        if op in "MD=XN":
+            ref += n
+    return out
+
+
+def _partial_alignments(db_path: str, reads_by_asm: dict, pid: float, plen: float,
+                        min_plen: float, lengths: dict, partial_pid: float | None = None,
+                        min_indel: int = 50, best_pid_delta: float = BEST_PID_DELTA_DEFAULT,
+                        chunk: int = 800) -> dict:
+    """assembly -> {read: [(row, label, indels)]}: the reads' alignments there that do
+    not qualify at the display pid and plen, but reach `partial_pid` (default the
+    display pid) with plen at least `min_plen` -- partial ones of any type, and
+    whole-length ones short of the display pid that hold an indel of `min_indel` bp
+    or more: an SV kept inside one alignment as a single long gap (one without is
+    divergence, not an SV, and is left out). `indels` are those of at least `min_indel` bp (`_large_indels`).
+    Only a read's best of these are kept, as for placements: non-supplementary ones
+    within `best_pid_delta` of its best pid among them (at most
+    PARTIAL_MAX_PER_READ), and the supplementary pieces of a kept primary -- a split
+    read keeps its pieces, a read in a repeat not every copy.
+    Rows as _fetch_aln_blocks (sl, sr, hl, hr at 5-8)."""
+    ppid = pid if partial_pid is None else partial_pid
+    out: dict = {}
+    con = sqlite3.connect(db_path)
+    try:
+        for asm, reads in reads_by_asm.items():
+            reads = list(reads)
+            got: dict = {}
+            for i in range(0, len(reads), chunk):
+                c = reads[i:i + chunk]
+                rows = con.execute(
+                    f"SELECT {_BLOCK_COLS}, plen, cigar FROM aln WHERE assembly = ? "
+                    f"AND contig IS NOT NULL AND pid >= ? AND plen >= ? "
+                    f"AND NOT (pid >= ? AND plen >= ?) "
+                    f"AND read_name IN ({','.join('?' * len(c))})",
+                    [asm, ppid, min_plen, pid, plen, *c])
+                for r in rows:
+                    n = lengths[asm].get(r[1], 0)
+                    at_end = ((r[5] + r[7] > 0 and r[2] <= CLIP_END_TOL)
+                              or (r[6] + r[8] > 0 and r[3] >= n - CLIP_END_TOL))
+                    whole = r[12] >= plen
+                    big = _large_indels(r[13], r[2], min_indel)
+                    if whole and not big:
+                        continue      # short of the pid throughout: divergence, not an SV
+                    kind = "whole-length" if whole else "partial " + _PARTIAL_KIND.get(r[10], r[10])
+                    label = (f"{kind} in {asm}, pid {r[11]:.4f}, plen {r[12]:.2f}"
+                             + ("" if whole else f", {'at a contig end' if at_end else 'inside a contig'}"))
+                    if big:
+                        label += "; " + ", ".join(f"{ln:,} bp {k} at {r[1]}:{pos + 1:,}"
+                                                  for pos, k, ln in big[:3])
+                        if len(big) > 3:
+                            label += f" (+{len(big) - 3} more)"
+                    got.setdefault(r[0], []).append((r[:12], label, big))
+            out[asm] = {rn: _best_partials(items, best_pid_delta) for rn, items in got.items()}
+    finally:
+        con.close()
+    return out
+
+
+def _best_partials(items: list, tol: float) -> list:
+    """A read's best other alignments (see `_partial_alignments`): rows are
+    (row, label, indels), row[10] the type and row[11] the pid."""
+    main = sorted((x for x in items if x[0][10] != "supplementary"), key=lambda x: -x[0][11])
+    if not main:
+        return []
+    kept = [x for x in main if x[0][11] + tol >= main[0][0][11]][:PARTIAL_MAX_PER_READ]
+    if any(x[0][10] in _PRIMARY for x in kept):
+        kept += [x for x in items if x[0][10] == "supplementary"]
+    return kept
+
+
+def _partial_lines(pieces: dict, best: dict, read_pos: dict, asm1_segs_info, asm2_segs_info,
+                   asm1: str, asm2: str) -> tuple:
+    """(lines, indels): lines from each one-sided read's best placements in the
+    candidate holding it whole to each of its other alignments in the other one,
+    LAYER_PARTIAL, labelled per row; and a point on those lines for each large indel
+    -- x, y, read (index into the region's reads), text."""
+    parts = []
+    marks = {"x": [], "y": [], "read": [], "text": []}
+    lookup = {asm1: _build_lookup(asm1_segs_info), asm2: _build_lookup(asm2_segs_info)}
+    for asm, by_read in pieces.items():
+        whole = asm2 if asm == asm1 else asm1
+        for rn, items in sorted(by_read.items()):
+            full = best[whole].get(rn)
+            if not full or not full[1]:
+                continue
+            for row, label, big in items:
+                side = {whole: {rn: full}, asm: {rn: ([row], 1)}}
+                ln = _compute_lines(side, [rn], read_pos, asm1_segs_info, asm2_segs_info, asm1, asm2)
+                if not len(ln):
+                    continue
+                ln.layer = np.full(len(ln), LAYER_PARTIAL, dtype=np.int8)
+                ln.part = [label] * len(ln)
+                parts.append(ln)
+                for pos, k, n in big:
+                    pt = _map_point(lookup[asm], row[1], pos, pos, pos)
+                    if pt is None:
+                        continue
+                    for i in range(len(ln)):
+                        a0, a1 = (ln.x0[i], ln.x1[i]) if asm == asm2 else (ln.y0[i], ln.y1[i])
+                        if a0 == a1 or not min(a0, a1) <= pt <= max(a0, a1):
+                            continue
+                        t = (pt - a0) / (a1 - a0)
+                        marks["x"].append(float(ln.x0[i] + t * (ln.x1[i] - ln.x0[i])))
+                        marks["y"].append(float(ln.y0[i] + t * (ln.y1[i] - ln.y0[i])))
+                        marks["read"].append(read_pos[rn])
+                        marks["text"].append(f"{n:,} bp {k} in {asm} at {row[1]}:{pos + 1:,}")
+    out = _compute_lines({asm1: {}, asm2: {}}, [], read_pos, asm1_segs_info, asm2_segs_info,
+                         asm1, asm2)
+    for ln in parts:
+        out = _concat_lines(out, ln)
+    return out, (marks if marks["x"] else {})
+
+
+def _concat_lines(a: "ReadLines", b: "ReadLines") -> "ReadLines":
+    """Rows of `a` then `b`; `part` filled with "" where a side has none."""
+    if not len(b):
+        return a
+    cat = lambda x, y: np.concatenate([x, y])
+    return ReadLines(
+        x0=cat(a.x0, b.x0), y0=cat(a.y0, b.y0), x1=cat(a.x1, b.x1), y1=cat(a.y1, b.y1),
+        read_idx=cat(a.read_idx, b.read_idx).astype(np.int32),
+        supplementary=cat(a.supplementary, b.supplementary).astype(bool),
+        n_dropped=a.n_dropped + b.n_dropped, layer=cat(a.layer, b.layer).astype(np.int8),
+        contig1=list(a.contig1) + list(b.contig1), contig2=list(a.contig2) + list(b.contig2),
+        ref1_0=cat(a.ref1_0, b.ref1_0), ref1_1=cat(a.ref1_1, b.ref1_1),
+        ref2_0=cat(a.ref2_0, b.ref2_0), ref2_1=cat(a.ref2_1, b.ref2_1),
+        pid1=cat(a.pid1, b.pid1), pid2=cat(a.pid2, b.pid2),
+        part=(list(a.part) or [""] * len(a)) + (list(b.part) or [""] * len(b)),
+    )
+
+
+def _best_placements(blocks: list, tol: float) -> tuple:
+    """(kept, n): a read's alignments at its best placements in one assembly.
+
+    Its non-supplementary alignments within `tol` (best_pid_delta) of its best pid
+    there, plus the supplementary pieces of a best primary (they belong to it, at
+    lower pid); `n` counts the non-supplementary ones -- the placements its weight
+    of 1 is split over. `blocks` are all its qualifying alignments in the assembly,
+    genome-wide; a read with only supplementary ones there has none.
+    """
     main = [b for b in blocks if b[10] != "supplementary"]
     if not main:
-        return blocks
+        return [], 0
     best = max(b[11] for b in main)
-    return [b for b in blocks if b[10] == "supplementary" or b[11] + tol >= best]
+    kept = [b for b in main if b[11] + tol >= best]
+    if any(b[10] in _PRIMARY for b in kept):
+        kept += [b for b in blocks if b[10] == "supplementary"]
+    return kept, sum(b[10] != "supplementary" for b in kept)
 
 
-def _compute_lines(aln_blocks, read_names, read_pos,
-                   asm1_segs_info, asm2_segs_info, asm1, asm2,
-                   best_only=None, best_tol: float = 0.0) -> ReadLines:
-    """Thread each read through its asm1 and asm2 blocks into plot-space line segments.
+def _best_by_read(blocks: list, tol: float) -> dict:
+    """read -> (best placements, n) over one assembly's aln rows (`_best_placements`)."""
+    by_read: dict = {}
+    for b in blocks:
+        by_read.setdefault(b[0], []).append(b)
+    return {rn: _best_placements(bl, tol) for rn, bl in by_read.items()}
+
+
+def _coverage_at_best(best: dict, segments: list, binsize: int, read_buckets) -> CoverageBins:
+    """Marginal coverage: each read adds 1/n to the bins under each of its n best
+    placements in this assembly (a supplementary piece of a best primary adds its
+    primary's share), whichever of them lie in `segments`.
+
+    Bins as `compute_coverage_bins` lays them out -- per segment, in (contig, start)
+    order, the last of a segment cut short -- so bin i here is bin i of
+    RegionData.bin_edges. Built from the aln rows already fetched, no BAM scan.
+    """
+    segments = sorted(segments, key=lambda s: (s.contig, s.start, s.end))
+    bin_contig, bin_start, bin_end = [], [], []
+    by_contig: dict = {}
+    first = 0
+    for seg in segments:
+        n = math.ceil((seg.end - seg.start) / binsize)
+        by_contig.setdefault(seg.contig, []).append((seg.start, seg.end, first))
+        for j in range(n):
+            gs = seg.start + j * binsize
+            bin_contig.append(seg.contig)
+            bin_start.append(gs)
+            bin_end.append(min(seg.end, gs + binsize))
+        first += n
+    n_bins = len(bin_contig)
+    name_to_bucket = {nm: i for i, bucket in enumerate(read_buckets) for nm in bucket}
+    bins = [0.0] * n_bins
+    bucket_bins = [[0.0] * n_bins for _ in read_buckets]
+    bin_reads: list = [dict() for _ in range(n_bins)]
+    read_names: list = []
+    for rn, (kept, n) in best.items():
+        if not n:
+            continue
+        w = 1.0 / n
+        bi = name_to_bucket.get(rn)
+        target = bucket_bins[bi] if bi is not None else bins
+        ri = None
+        for b in kept:
+            for s0, s1, b0 in by_contig.get(b[1], ()):
+                lo, hi = max(b[2], s0), min(b[3], s1)
+                if lo >= hi:
+                    continue
+                if ri is None:
+                    ri = len(read_names)
+                    read_names.append(rn)
+                for i in range(b0 + (lo - s0) // binsize, b0 + math.ceil((hi - s0) / binsize)):
+                    target[i] += w
+                    bin_reads[i][ri] = bin_reads[i].get(ri, 0.0) + w
+    bin_offsets = np.zeros(n_bins + 1, dtype=np.int64)
+    np.cumsum([len(s) for s in bin_reads], out=bin_offsets[1:])
+    read_idx = np.fromiter((ri for s in bin_reads for ri in sorted(s)),
+                           dtype=np.int32, count=int(bin_offsets[-1]))
+    read_w = np.fromiter((s[ri] for s in bin_reads for ri in sorted(s)),
+                         dtype=np.float64, count=int(bin_offsets[-1]))
+    return CoverageBins(bins=bins, bucket_bins=bucket_bins, bin_contig=bin_contig,
+                        bin_start=bin_start, bin_end=bin_end, bin_offsets=bin_offsets,
+                        read_idx=read_idx, read_names=read_names, read_w=read_w)
+
+
+def _compute_lines(best, read_names, read_pos,
+                   asm1_segs_info, asm2_segs_info, asm1, asm2) -> ReadLines:
+    """Thread each read between its best placements in asm1 and asm2 into plot-space
+    line segments. `best[asm][read]` is `(placements, n)` from `_best_by_read`.
 
     Geometry helpers are reused verbatim from `qatool.plotters.reads_dotplot`; only
-    the merging and matplotlib drawing are left behind. Reads in `best_only` are
-    threaded through their best placement in each assembly only.
+    the merging and matplotlib drawing are left behind.
     """
-    best_only = best_only or set()
     y_lookup = _build_lookup(asm1_segs_info)   # asm1 -> Y
     x_lookup = _build_lookup(asm2_segs_info)   # asm2 -> X
-
-    by_read: dict = {}
-    for asm, blocks in aln_blocks.items():
-        for b in blocks:
-            by_read.setdefault(b[0], {}).setdefault(asm, []).append(b)
 
     x0s, y0s, x1s, y1s, idxs, supps = [], [], [], [], [], []
     ct1s, ct2s, r1_0, r1_1, r2_0, r2_1, p1s, p2s = [], [], [], [], [], [], [], []
     n_dropped = 0
     for rn in read_names:
-        per = by_read.get(rn, {})
-        a1 = per.get(asm1, [])
-        a2 = per.get(asm2, [])
+        a1 = best[asm1].get(rn, ([], 0))[0]
+        a2 = best[asm2].get(rn, ([], 0))[0]
         if not a1 or not a2:
             continue
-        if rn in best_only:
-            a1, a2 = _best_blocks(a1, best_tol), _best_blocks(a2, best_tol)
         ri = read_pos[rn]
         for (_, c1, s1, e1, st1, sl1, sr1, hl1, hr1, q1, t1, pid1) in a1:
             r0a, r1a = _read_span(st1, sl1, sr1, hl1, hr1, q1)

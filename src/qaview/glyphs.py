@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from bokeh.layouts import column, gridplot
 from bokeh.models import (
     ColumnDataSource, CrosshairTool, CustomJS, CustomJSHover, Div, HoverTool, Quad, Range1d,
-    Segment as SegmentGlyph, Spacer, Span, TapTool, WheelZoomTool,
+    Scatter, Segment as SegmentGlyph, Spacer, Span, TapTool, WheelZoomTool,
 )
 from bokeh.plotting import figure
 
@@ -27,6 +27,12 @@ from qatool.plotters.axis import contig_runs
 from qatool.plotters.colors import SUPPORT_COLORS
 
 SUPPLEMENTARY_COLOR = "#d62728"
+# A one-sided read's partial alignments in the other candidate (region.LAYER_PARTIAL):
+# drawn only when a hover or a tap selects the read, in their own colour.
+PARTIAL_COLOR = "#ff7f0e"
+PARTIAL_ALPHA = 0.9
+# A large indel on a partial row: a cross on its line, with it on selection only.
+INDEL_COLOR = "#4a148c"
 
 # Panel sizes in px.  The matplotlib report uses a 16in figure with 2in marginals and
 # 0.15in contig bars; at 100 px/in those become the values below.
@@ -62,6 +68,7 @@ LAYER_STYLE = {
     1: ("black", 2.0),                   # unclassified ("other")
     2: (None, 1.5),                      # support — coloured by class
     3: (SUPPLEMENTARY_COLOR, 1.5),       # supplementary — top
+    4: (PARTIAL_COLOR, 1.5),             # partial: a one-sided read's partial alignments, on selection only
 }
 
 
@@ -136,17 +143,19 @@ def ratio_rgba(t) -> np.ndarray:
 
 def line_style(color_by: str, layer, supp, cls_rgba, ratio, visible_layers=None,
                line_alpha: float = LINE_ALPHA, C: float = 200.0) -> tuple:
-    """(colour uint32, width float32, alpha float32) per line.
+    """(colour uint32, width float32, alpha float32, selected alpha float32) per line.
 
     `cls_rgba` is each line's support-class colour, `ratio` its read's log-ratio
     (NaN: not scored). Hidden layers are drawn at alpha 0 rather than removed: the
-    hover/selection CSR indexes address rows by position.
+    hover/selection CSR indexes address rows by position. Partial rows
+    (LAYER_PARTIAL) are never drawn unselected, and orange in every mode.
     """
     layer = np.asarray(layer, dtype=np.int64)
-    base = np.array([pack_rgba(LAYER_STYLE[i][0]) if LAYER_STYLE[i][0] else 0 for i in range(4)],
+    nl = len(LAYER_STYLE)
+    base = np.array([pack_rgba(LAYER_STYLE[i][0]) if LAYER_STYLE[i][0] else 0 for i in range(nl)],
                     dtype=np.uint32)
-    has_base = np.array([LAYER_STYLE[i][0] is not None for i in range(4)])
-    lw = np.array([LAYER_STYLE[i][1] for i in range(4)], dtype=float)
+    has_base = np.array([LAYER_STYLE[i][0] is not None for i in range(nl)])
+    lw = np.array([LAYER_STYLE[i][1] for i in range(nl)], dtype=float)
     if color_by == "class":
         color = np.where(has_base[layer], base[layer], np.asarray(cls_rgba, dtype=np.uint32))
         width = lw[layer]
@@ -171,14 +180,22 @@ def line_style(color_by: str, layer, supp, cls_rgba, ratio, visible_layers=None,
     alpha = np.where(shown, line_alpha, 0.0)
     if color_by == "log-ratio":
         alpha = alpha * np.where(scored, 0.3 + 0.7 * np.abs(t), 0.3)
-    return (color.astype(np.uint32), width.astype(np.float32), alpha.astype(np.float32))
+    part = layer == 4
+    color = np.where(part, np.uint32(pack_rgba(PARTIAL_COLOR)), color)
+    width = np.where(part, LAYER_STYLE[4][1], width)
+    sel_alpha = np.where(part, np.where(shown, PARTIAL_ALPHA, 0.0), alpha)
+    alpha = np.where(part, 0.0, alpha)
+    return (color.astype(np.uint32), width.astype(np.float32), alpha.astype(np.float32),
+            sel_alpha.astype(np.float32))
 
 
 def style_spec() -> dict:
     """The constants `line_style` uses, for the page's own restyling."""
     return {"layer_rgba": [pack_rgba(LAYER_STYLE[i][0]) if LAYER_STYLE[i][0] else None
-                           for i in range(4)],
-            "layer_width": [LAYER_STYLE[i][1] for i in range(4)],
+                           for i in range(len(LAYER_STYLE))],
+            "layer_width": [LAYER_STYLE[i][1] for i in range(len(LAYER_STYLE))],
+            "partial_layer": 4, "partial_rgba": pack_rgba(PARTIAL_COLOR),
+            "partial_alpha": PARTIAL_ALPHA,
             "supp_rgba": pack_rgba(SUPPLEMENTARY_COLOR), "black_rgba": pack_rgba("black"),
             "unscored_rgba": pack_rgba(UNSCORED_COLOR), "ratio_mid": list(RATIO_MID),
             "ratio_pos": list(RATIO_POS), "ratio_neg": list(RATIO_NEG),
@@ -292,9 +309,15 @@ def _line_sources(rd, color_by: str, visible_layers=None, line_alpha: float = LI
                          for c in cls_names], dtype=np.uint32)
     cls = read_cls[read] if n else np.zeros(0, np.int32)
     ratio = _read_ratios(rd, ratios)
-    color, width, alpha = line_style(color_by, layer, supp, cls_rgba[cls],
-                                     ratio[read] if n else np.zeros(0),
-                                     visible_layers, line_alpha, C)
+    color, width, alpha, sel_alpha = line_style(color_by, layer, supp, cls_rgba[cls],
+                                                ratio[read] if n else np.zeros(0),
+                                                visible_layers, line_alpha, C)
+    # what each row is: a full-length placement, or which partial alignment
+    labels = list(getattr(rd.lines, "part", None) or [])
+    part_names = ["full-length"] + sorted({x for x in labels if x})
+    pcode = {x: i for i, x in enumerate(part_names)}
+    part = (np.array([pcode[x] if x else 0 for x in labels], dtype=np.int32) if labels
+            else np.zeros(n, np.int32))
 
     def codes(values):
         if not n:
@@ -312,14 +335,14 @@ def _line_sources(rd, color_by: str, visible_layers=None, line_alpha: float = LI
         ref1_0=i32(rd.lines.ref1_0), ref1_1=i32(rd.lines.ref1_1),
         ref2_0=i32(rd.lines.ref2_0), ref2_1=i32(rd.lines.ref2_1),
         pid1=np.asarray(rd.lines.pid1, np.float32), pid2=np.asarray(rd.lines.pid2, np.float32),
-        cls_color=cls_rgba[cls], color=color, width=width, alpha=alpha,
-        hover_width=(width * 1.5 + 1.5).astype(np.float32),
+        cls_color=cls_rgba[cls], color=color, width=width, alpha=alpha, sel_alpha=sel_alpha,
+        part=part, hover_width=(width * 1.5 + 1.5).astype(np.float32),
     ), name="qv-lines")
     reads = ColumnDataSource(dict(
         name=list(rd.read_names), ratio=ratio,
         ratio_txt=[_ratio_text(nm, ratios, dropped) for nm in rd.read_names],
     ), name="qv-reads")
-    return lines, reads, {"classes": cls_names, "c1": c1_names, "c2": c2_names}
+    return lines, reads, {"classes": cls_names, "c1": c1_names, "c2": c2_names, "parts": part_names}
 
 
 def _line_source(rd, color_by: str, visible_layers=None, line_alpha: float = LINE_ALPHA,
@@ -352,6 +375,32 @@ def _draw_background(p, bg: dict, floor: float):
     bs = bg["binsize"]
     return p.image_rgba(image=[img], x=0, y=0, dw=bg["n2"] * bs, dh=bg["n1"] * bs,
                         level="underlay", name="qv-background")
+
+
+def _draw_indels(p, rd, lines):
+    """Large indels on one-sided reads' partial rows (RegionData.indels): crosses
+    drawn only while their read is selected -- a hover over its marginal bin or a
+    tap -- like the rows they sit on. Their text is in the row's tooltip."""
+    ind = getattr(rd, "indels", None) or {}
+    if not ind.get("x"):
+        return None
+    src = ColumnDataSource(dict(x=np.asarray(ind["x"], float), y=np.asarray(ind["y"], float),
+                                read=np.asarray(ind["read"], np.int32), text=list(ind["text"])),
+                           name="qv-indels")
+    mark = dict(x="x", y="y", marker="x", size=12, line_color=INDEL_COLOR, line_width=2.5)
+    r = p.scatter(source=src, name="qv-indels-glyph", line_alpha=0.0, **{k: v for k, v in mark.items()
+                                                                         if k not in ("x", "y")},
+                  x="x", y="y")
+    r.selection_glyph = Scatter(**mark, line_alpha=1.0)
+    r.nonselection_glyph = Scatter(**mark, line_alpha=0.0)
+    lines.selected.js_on_change("indices", CustomJS(args=dict(lines=lines, marks=src), code="""
+        const read = lines.data["read"], want = new Set();
+        for (const i of lines.selected.indices) want.add(read[i]);
+        const mr = marks.data["read"], sel = [];
+        for (let j = 0; j < mr.length; j++) if (want.has(mr[j])) sel.push(j);
+        marks.selected.indices = sel;
+    """))
+    return r
 
 
 def dotplot_figure(rd, color_by: str = "class", line_alpha: float = LINE_ALPHA,
@@ -387,10 +436,11 @@ def dotplot_figure(rd, color_by: str = "class", line_alpha: float = LINE_ALPHA,
                   color="color", line_width="width", alpha="alpha", name="qv-lines-glyph")
     # Selecting reads (by tap, or from a coverage bin) hides every other read outright,
     # so a hovered bin shows only the reads that pass through it.  The selected glyph
-    # also honours `alpha`, so a hidden layer stays hidden even when it is selected.
+    # honours `sel_alpha` -- a row's alpha, so a hidden layer stays hidden even when
+    # selected, except partial rows, which only a selection shows.
     r.selection_glyph = SegmentGlyph(x0="x0", y0="y0", x1="x1", y1="y1",
                                      line_color="color", line_width="width",
-                                     line_alpha="alpha")
+                                     line_alpha="sel_alpha")
     r.nonselection_glyph = SegmentGlyph(x0="x0", y0="y0", x1="x1", y1="y1",
                                         line_color="color", line_width="width", line_alpha=0.0)
     if reads == "hover":
@@ -401,11 +451,17 @@ def dotplot_figure(rd, color_by: str = "class", line_alpha: float = LINE_ALPHA,
         r.selection_glyph.line_width = "hover_width"
     if background is not None:
         _draw_background(p, background, floor)
+    _draw_indels(p, rd, lines)
+    # Tapping picks reads: only the read lines answer it, not the hidden indel marks.
+    for tool in p.tools:
+        if isinstance(tool, TapTool):
+            tool.renderers = [r]
 
     # Rows hold codes; the tooltip turns them back into names (the format names
     # which table).
     names = CustomJSHover(args=dict(reads=reads_src, classes=tables["classes"],
-                                    c1=tables["c1"], c2=tables["c2"]), code="""
+                                    c1=tables["c1"], c2=tables["c2"], parts=tables["parts"]),
+                          code="""
         switch (format) {
             case "name": return reads.data["name"][value];
             case "ratio": return reads.data["ratio_txt"][value];
@@ -413,6 +469,7 @@ def dotplot_figure(rd, color_by: str = "class", line_alpha: float = LINE_ALPHA,
             case "c1": return c1[value];
             case "c2": return c2[value];
             case "yesno": return value ? "yes" : "no";
+            case "part": return parts[value];
         }
         return String(value);
         """)
@@ -425,8 +482,10 @@ def dotplot_figure(rd, color_by: str = "class", line_alpha: float = LINE_ALPHA,
             (rd.asm2, "@c2{c2} @ref2_0{0,0}-@ref2_1{0,0}  pid @pid2{0.0000}"),
             ("supplementary", "@supp{yesno}"),
             ("log-ratio", "@read{ratio}"),
+            ("alignment", "@part{part}"),
         ],
-        formatters={"@read": names, "@cls": names, "@c1": names, "@c2": names, "@supp": names}))
+        formatters={"@read": names, "@cls": names, "@c1": names, "@c2": names, "@supp": names,
+                    "@part": names}))
 
     # Segment boundaries: pale for same-contig, full strength across contigs.
     for segs_info, dim in ((rd.asm2_segs_info, "height"), (rd.asm1_segs_info, "width")):
@@ -911,13 +970,19 @@ def report_layout(rd, color_by: str = "class", visible_layers=None,
     # It stays in the dotplot's toolbar, one click away.
     main.toolbar.active_inspect = [crosshair]
 
-    # Wheel zoom on the dotplot only, so scrolling a marginal cannot desync the axes.
-    # maintain_focus=False: once one edge reaches its bound, zooming out keeps
-    # widening the other side instead of stopping, so the full locus is always
+    # Wheel zoom on the dotplot zooms both axes. On a marginal it zooms that
+    # marginal's genome axis alone -- the top one X, the right one Y, ranges the
+    # dotplot shares -- never its coverage axis, which both marginals share as one
+    # scale. maintain_focus=False: once one edge reaches its bound, zooming out
+    # keeps widening the other side instead of stopping, so the full locus is always
     # reachable again. With the default the view stuck wherever the first edge hit.
     wheel = WheelZoomTool(maintain_focus=False)
     main.add_tools(wheel)
     main.toolbar.active_scroll = wheel
+    for fig, dim in ((cov_top, "width"), (cov_right, "height")):
+        axis_wheel = WheelZoomTool(dimensions=dim, maintain_focus=False)
+        fig.add_tools(axis_wheel)
+        fig.toolbar.active_scroll = axis_wheel
 
     # Only the dotplot keeps a toolbar.  Merging them instead would make bokeh pick a
     # single active drag/scroll tool across panels with different ones, which both
@@ -935,8 +1000,9 @@ def report_layout(rd, color_by: str = "class", visible_layers=None,
     _link_reads_to_bins(rd, main, [(cov_top, rd.cov2), (cov_right, rd.cov1)])
     readout = _coordinate_readout(rd, main)
 
+    corner = Spacer(width=BAR_SIZE, height=margin_size, tags=["qv:corner"])
     grid = gridplot(
-        [[Spacer(width=BAR_SIZE, height=margin_size), cov_top, None],
+        [[corner, cov_top, None],
          [ybar,                                       main,    cov_right],
          [None,                                       xbar,    None]],
         toolbar_location=None, merge_tools=False,
@@ -949,15 +1015,15 @@ def report_layout(rd, color_by: str = "class", visible_layers=None,
     grid.toolbar_location = "right"
     # One line each, as wide as the plots: a wrapped line would make the report
     # taller than the cell it was sized for (server.PAD_H counts one line each).
-    # Tags the page finds the panels by, to resize the report in place
-    # (static/app.js `resizeReport`); `margin_size` and BAR_SIZE ride along.
+    # Tags the page finds the panels by, to resize each in place by its borders
+    # (static/app.js `applySizes`); the divs carry what lies beside the dotplot.
     main.tags = ["qv:main"]
     cov_top.tags = ["qv:top"]
     cov_right.tags = ["qv:right"]
     xbar.tags = ["qv:xbar"]
     ybar.tags = ["qv:ybar"]
     for div in (readout, status):
-        div.tags = ["qv:line", {"pad": BAR_SIZE + margin_size}]
+        div.tags = ["qv:line", {"bar": BAR_SIZE}]
         div.width = BAR_SIZE + w + margin_size
         div.styles = {**div.styles, "white-space": "nowrap", "overflow": "hidden",
                       "text-overflow": "ellipsis"}

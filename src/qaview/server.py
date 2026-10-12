@@ -32,13 +32,14 @@ from qaview.similarity import FLOOR as SIM_FLOOR
 from qaview.pipeline import Pipeline
 from qaview.project import (RECRUITMENT_CHOICES, RECRUITMENT_RANGES, Project, ProjectError,
                             load_project)
-from qaview.region import (LAYER_COMMON, LAYER_OTHER, LAYER_SUPPLEMENTARY, LAYER_SUPPORT,
-                           RegionData)
+from qaview.region import (LAYER_COMMON, LAYER_OTHER, LAYER_PARTIAL, LAYER_SUPPLEMENTARY,
+                           LAYER_SUPPORT, RegionData)
 
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
 LAYERS = {"common": LAYER_COMMON, "unclassified": LAYER_OTHER,
-          "support": LAYER_SUPPORT, "supplementary": LAYER_SUPPLEMENTARY}
+          "support": LAYER_SUPPORT, "supplementary": LAYER_SUPPLEMENTARY,
+          "partial": LAYER_PARTIAL}
 
 # Pixels of the report that are not the dotplot: the y contig bar and right
 # marginal across, the top marginal and x contig bar down, plus the readout and
@@ -395,7 +396,8 @@ def create_app(project: Project | None = None, pipeline: Pipeline | None = None,
         return {"ok": True}
 
     def region(s: Session, lid: str, pid: float, plen: float, best_pid_delta: float,
-               pid_tie_eps: float, binsize: int) -> RegionData:
+               pid_tie_eps: float, binsize: int, supp_plen: float | None = None,
+               partial_pid: float | None = None, min_indel: int = 50) -> RegionData:
         """The locus reduced to arrays for these fetch/classify settings (cached)."""
         p = s.project
 
@@ -406,14 +408,18 @@ def create_app(project: Project | None = None, pipeline: Pipeline | None = None,
                 asm1_fasta=p.asm1.fasta, asm2_fasta=p.asm2.fasta,
                 asm1=p.asm1.name, asm2=p.asm2.name,
                 pid_threshold=pid, plen_threshold=plen, binsize=binsize or None,
-                best_pid_delta=best_pid_delta, pid_tie_eps=pid_tie_eps)
+                best_pid_delta=best_pid_delta, pid_tie_eps=pid_tie_eps,
+                supp_plen_threshold=supp_plen, partial_pid_threshold=partial_pid,
+                min_indel=min_indel)
 
-        return s.regions.get((lid, pid, plen, best_pid_delta, pid_tie_eps, binsize), build)
+        return s.regions.get((lid, pid, plen, best_pid_delta, pid_tie_eps, binsize, supp_plen,
+                              partial_pid, min_indel), build)
 
     @app.get("/api/loci/{lid}/align")
     def align(lid: str, x0: float, x1: float, y0: float, y1: float,
               pid: float = 0.997, plen: float = 0.999, best_pid_delta: float = 0.001,
               pid_tie_eps: float = 0.0001, binsize: int = 0, reads: bool = False,
+              supp_plen: float = 0.3, partial_pid: float = 0.99, min_indel: int = 50,
               color_by: str = "log-ratio"):
         """Align the stretches under a rectangle on the dotplot (docs/qaview.md §13.4).
 
@@ -430,7 +436,8 @@ def create_app(project: Project | None = None, pipeline: Pipeline | None = None,
         loc = s.pipe.loci.get(lid)
         if loc is None:
             raise HTTPException(404, f"no locus {lid}")
-        rd = region(s, lid, pid, plen, best_pid_delta, pid_tie_eps, binsize)
+        rd = region(s, lid, pid, plen, best_pid_delta, pid_tie_eps, binsize, supp_plen,
+                    partial_pid, min_indel)
         p = s.project
         with pysam.FastaFile(p.asm1.fasta) as f1, pysam.FastaFile(p.asm2.fasta) as f2:
             try:
@@ -452,7 +459,8 @@ def create_app(project: Project | None = None, pipeline: Pipeline | None = None,
              pid: float = 0.997, plen: float = 0.999,
              best_pid_delta: float = 0.001, pid_tie_eps: float = 0.0001,
              binsize: int = 0, color_by: str = "log-ratio", C: float = 200.0,
-             layers: str = ",".join(LAYERS), reads: str = "hover", background: bool = True):
+             layers: str = ",".join(LAYERS), reads: str = "hover", background: bool = True,
+             supp_plen: float = 0.3, partial_pid: float = 0.99, min_indel: int = 50):
         """The report for one locus, sized to a w x h cell, as a Bokeh json_item.
 
         `reads`: "all" draws every read line, "hover" only the reads of a hovered
@@ -479,7 +487,8 @@ def create_app(project: Project | None = None, pipeline: Pipeline | None = None,
         # see more reads must not flood the background). The cache keeps cells
         # from similarity.FLOOR up, so a lower recruitment pid draws from there.
         bg_floor = max((loc.params or s.project.recruitment)["pid_threshold"], SIM_FLOOR)
-        rd = region(s, lid, pid, plen, best_pid_delta, pid_tie_eps, binsize)
+        rd = region(s, lid, pid, plen, best_pid_delta, pid_tie_eps, binsize, supp_plen,
+                    partial_pid, min_indel)
         score = loc.score
         ratios = {r.name: r.ratio for r in score.reads} if score is not None else None
         dropped = set(score.dropped) if score is not None else None

@@ -545,16 +545,20 @@ along its contig. Two strategies, chosen per project or per seed:
   - Seals are positions, (assembly, contig, side), so they survive merges and
     rounds. The phase repeats until no edge is open, each edge position moving
     once per phase.
-  - Common reads are recruited but add no segments: they lie the same in both
-    candidates and add nothing to Delta S wherever placed; anchors' copies bring
-    the segments that matter. Non-common reads add every qualifying alignment, as
-    in legacy.
+  - Recruited reads add every qualifying alignment as a segment, common reads
+    included, as in legacy: HiFi-quality alignments are what tie related
+    segments together, and the scorer must see each read's placements in both
+    candidates. (Version 3 added none for common reads: on
+    ptg000022l_28073999_28773000, 264 common reads whose curated copies were
+    left outside the locus scored +C, and Delta S read +53.3k nats. Version 4
+    added only their best placements: +721. Version 5, every alignment: 2.54 /
+    2.52 Mb, 3,750 reads, 7 at +C, Delta S +785.)
   - `Recruiter.edge_log` records each edge decision (round, from, to, why: anchor,
     copy, contig_end, limit; and the anchor read) to compare strategies; it is
     saved as `edge_log` in the recruitment pickle. `extension_window` and
     `extension_k` are not used.
   - Anchor recruitments carry `extension_version` in their cache key
-    (`pipeline.ANCHOR_VERSION`, 3 since this rule), so a change to this strategy
+    (`pipeline.ANCHOR_VERSION`, 5 since common reads bring every qualifying alignment), so a change to this strategy
     redoes them without touching legacy ones.
 
 The legacy strategy's cache key is the one it had before the option existed, so
@@ -776,7 +780,7 @@ since it knows everything except the seeds.
   indel, which would change the alignment) and placed on the alignment's gap
   columns when it can be, else at the leftmost, where the alignment's own gaps
   are left-aligned. The placements are exactly the ones the marginals count
-  (display pid/plen, best_pid_delta, voting reads at their best placements),
+  (every read at its best placements, display pid/plen, best_pid_delta),
   coloured and banded as the marginals are for the current colour mode, with
   band 0 next to the sequence on both sides. BAM records here carry no MD tag
   and secondaries no SEQ, so a read's sequence comes from its primary record;
@@ -863,7 +867,59 @@ since it knows everything except the seeds.
   240-485 ms with all 180,000 read lines (headless Chromium, canvas). The read
   lines are still sent with the view; fetching a bin's reads on hover instead is
   the next step for opening large loci faster.
-- **What a control costs.** Only pid, plen, best_pid_delta, pid_tie_eps and the
+- **Reads at their best placements.** Every read, whatever its class, is shown
+  at its best placements only: in each assembly, its non-supplementary
+  alignments passing the display pid/plen and within best_pid_delta of its best
+  pid there -- over the whole assembly, not only the locus -- plus the
+  supplementary pieces of a best primary (`region._best_placements`). The
+  dotplot runs a read between its best placements in the two assemblies (a
+  repeat read with k1 and k2 best copies draws k1 x k2 lines, its ambiguity);
+  each marginal splits the read's weight of 1 over its n best placements in that
+  assembly, a supplementary piece adding its primary's share, so a best copy
+  outside the locus still takes 1/n and coverage reads as expected depth: a
+  collapse doubles, a false duplication halves. The pileup under a rectangle
+  alignment follows the same rule. Coverage is built from the aln rows already
+  fetched, not a BAM scan. (Before, only reads voting for one assembly were drawn
+  at their best placements, within pid_tie_eps; the others drew every pair of
+  qualifying alignments, and n counted only the copies inside the locus.) On a
+  6,000-read HG002 locus: 70,343 lines became 14,575, and building the region
+  3.1 s became 1.7 s. pid_tie_eps now only splits asm1_best from asm2_best.
+- **Partial alignments of one-sided reads.** Split and clipped alignments take
+  no part in recruitment (supplementary records never recruit a read nor become
+  segments: letting their pieces do so tied in unrelated regions through random
+  partial alignments), nor in the default view. A read that only one candidate
+  holds whole (asm1_only / asm2_only) may be a breakpoint read, so its other
+  alignments in the other candidate are kept as hidden rows (`region.LAYER_PARTIAL`,
+  `_partial_alignments`, `_partial_lines`): those that do not qualify at the
+  display pid and plen but reach "partial pid" (default 0.99) with plen from
+  "partial plen" (default 0.3) -- partial ones of any type (a clipped or split
+  primary, a supplementary, a secondary), and whole-length ones short of the
+  display pid that hold an indel of at least "min indel" (one without is
+  divergence, not an SV) -- inside the locus, each a line from the read's whole
+  placement. Only a read's best of them are kept, as for placements: those within
+  best_pid_delta of its best pid there (at most 5), with the supplementary pieces
+  of a kept primary; without that, a read in a repeat brought every copy
+  (atg003038l_translocation_002: 471,930 rows and a 575 s build at partial pid
+  0.99; 13,076 rows and 46 s now, against 44 s without them).
+  They are never drawn unselected; when a marginal-bin hover or a tap selects the
+  read they show in orange (`sel_alpha`). The tooltip says what the alignment is,
+  its pid and plen, whether a clip runs off a contig end (within 1 kb,
+  `CLIP_END_TOL`) or lies inside a contig, and its indels of at least "min indel"
+  (default 50 bp), each also marked with a cross on the line, shown with it
+  (`RegionData.indels`, `glyphs._draw_indels`). The read keeps its class, the
+  marginals do not count these alignments, and the "partial" layer checkbox
+  switches them and their crosses off.
+
+  Why a separate pid and the indels: of the one-sided reads that had no partial
+  row at the display pid, most had alignments in the other candidate short of it.
+  A piece ending at a breakpoint runs past it before the aligner clips, which
+  costs a few tenths of a percent of pid (ptg000114l_translocation_001: median
+  0.988); and an SV of a few hundred bp is often kept inside one whole-length
+  alignment as a single long gap (atg003038l_translocation_002: 23% of such
+  alignments hold an indel of at least 50 bp, 9% one of 500 bp). Pieces that are
+  divergent throughout -- a paralog hit where the read's own sequence is missing,
+  median pid 0.945 on atg004724l_translocation_001 -- stay below 0.99.
+- **What a control costs.** Only pid, plen, partial plen, partial pid, min indel, best_pid_delta, pid_tie_eps and the
   bin size change which reads are drawn; they, and a resize, ask the server for a
   new view. Colouring, C, layers, the reads mode and the background toggle are
   applied by the page to the plot it holds (`restyle` in `static/app.js`): the
@@ -878,18 +934,25 @@ since it knows everything except the seeds.
   tooltip (`CustomJSHover`), colours packed uint32. On a 70,000-line locus a view
   of an already-built region went from about 6 s and 12 MB to 0.6 s and 2.1 MB.
   Building a region for new thresholds (about 5 s on 6,000 reads) is what is left.
+- **Zooming one axis.** The wheel over the dotplot zooms both axes; over a
+  marginal it zooms that marginal's genome axis alone -- the top one X, the right
+  one Y -- which the dotplot shares, so the dotplot follows on that axis only. The
+  marginals' coverage axis, one scale for both, is never zoomed by the wheel.
 - **Marginals on one scale.** As in `report_plot`, the two coverage marginals
   are the same size and share one coverage range, 0 to the larger of their two
   peaks (one `Range1d`, so zooming one zooms the other): equal coverage is
   equally long on either, and the candidates compare at a glance.
-- **Resizing by the corner.** A grip at the dotplot's lower right corner
-  rescales the whole report in place: drag shows the new outline, release sets
-  the panels' sizes on the page (`resizeReport`, finding them by their `qv:`
-  tags), with no new view. The dotplot keeps its square pixels, the marginals
-  their size; the contig-end triangles read their bar's current length. A size
-  chosen this way is kept across views and loci until the grip is
-  double-clicked, which goes back to the size fitted to the window; while it is
-  kept, resizing the window does not refit the plot.
+- **Resizing by the borders.** Four handles on panel borders resize panels in
+  place -- sizes set on the page (`applySizes`, finding panels by their `qv:`
+  tags), no new view: the dotplot's right border sets its width and its bottom
+  border its height (independently, so its pixels need no longer be square); the
+  border between the top marginal and the dotplot, and the right marginal's outer
+  edge, set the marginals' size -- both together, so their shared coverage scale
+  stays comparable. A drag shows the border moving and applies on release, so a
+  large locus is not redrawn on every mouse move. The contig-end triangles read
+  their bar's current length. Sizes chosen this way are kept across views and
+  loci until a handle is double-clicked, which goes back to the sizes fitted to
+  the window; while they are kept, resizing the window does not refit the plot.
 - **One plot at a time.** A view embeds into a container of its own and is
   numbered; one that finishes after a newer one was asked for removes itself, and
   the newest leaves no other Bokeh document. Before, only the fetch was aborted: a

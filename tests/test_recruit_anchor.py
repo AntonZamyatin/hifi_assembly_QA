@@ -75,18 +75,34 @@ def tile(n, blocks=(), c1="c1", c2="c2"):
     return out
 
 
+def _aln_type(flag, extra):
+    if flag & 2048:
+        return "supplementary"
+    if flag & 256:
+        return "secondary"
+    return "primary_wsup" if "SA" in extra.get("tags", {}) else "primary"
+
+
 def make_data(tmp, alns, contigs1, contigs2, extra_rows=()):
     """FASTAs, BAMs and the aln table for alignments (name, asm, contig, start, length,
-    nm, flag); flag 16 = reverse strand, 256 = secondary. `extra_rows` go to the
-    table only."""
+    nm, flag[, extra]); flag 16 = reverse strand, 256 = secondary, 2048 =
+    supplementary; `extra` as fixtures.write_bam takes it (clips for a split piece,
+    an SA tag on the primary it belongs to). `extra_rows` go to the table only."""
     fa1 = write_fasta(os.path.join(tmp, "a1.fa"), contigs1)
     fa2 = write_fasta(os.path.join(tmp, "a2.fa"), contigs2)
-    rows = [{"assembly": asm, "read_name": name, "contig": contig, "start": start,
-             "end": start + length, "pid": 1 - nm / length, "strand": 0 if flag & 16 else 1,
-             "aln_type": "secondary" if flag & 256 else "primary"}
-            for name, asm, contig, start, length, nm, flag in alns]
+    rows = []
+    for name, asm, contig, start, length, nm, flag, *rest in alns:
+        extra = rest[0] if rest else {}
+        clip = sum(extra.get("clip", (0, 0)))
+        rows.append({"assembly": asm, "read_name": name, "contig": contig, "start": start,
+                     "end": start + length, "pid": 1 - nm / length,
+                     "strand": 0 if flag & 16 else 1, "aln_type": _aln_type(flag, extra),
+                     "plen": length / (length + clip), "q_len": length + clip,
+                     "hard_left": extra.get("clip", (0, 0))[0],
+                     "hard_right": extra.get("clip", (0, 0))[1]})
     bam = {asm: write_bam(os.path.join(tmp, f"{asm}.bam"),
-                          [(n, c, s, ln, nm, f) for n, a, c, s, ln, nm, f in alns if a == asm],
+                          [(n, c, s, ln, nm, f, *rest) for n, a, c, s, ln, nm, f, *rest in alns
+                           if a == asm],
                           {c: len(s) for c, s in contigs.items()})
            for asm, contigs in (("A", contigs1), ("B", contigs2))}
     db = write_db(os.path.join(tmp, "aln.sqlite"), rows + list(extra_rows))
@@ -94,10 +110,10 @@ def make_data(tmp, alns, contigs1, contigs2, extra_rows=()):
                 asm1_fasta_path=fa1, asm2_fasta_path=fa2)
 
 
-def recruiter(files, extension="anchor", merge_gap=1_000):
+def recruiter(files, extension="anchor", merge_gap=1_000, plen=0.5):
     from qatool.SRRecruiter import Recruiter
 
-    return Recruiter(**files, pid_threshold=0.99, plen_threshold=0.5, best_pid_delta=0.001,
+    return Recruiter(**files, pid_threshold=0.99, plen_threshold=plen, best_pid_delta=0.001,
                      merge_gap=merge_gap, extension_window=100, ext_max=300_000,
                      ext_rounds=100, max_rounds=100, out_dir=None, verbose=False,
                      extension=extension)
@@ -113,7 +129,8 @@ def test_edges_move_to_the_nearest_anchors():
     rng = random.Random(7)
     seq = "".join(rng.choice("ACGT") for _ in range(L))
     n = (L - READ) // 1000 + 1
-    # r20 also aligns at 50-55 kb in both, below its best: not a segment, r20 being common
+    # r20 also aligns at 50-55 kb in both, below its best but above the thresholds:
+    # a segment, as every qualifying alignment of a recruited read is
     far = [{"assembly": asm, "read_name": "r20", "contig": c, "start": 50_000, "end": 55_000,
             "pid": 0.995} for asm, c in (("A", "c1"), ("B", "c2"))]
     with tempfile.TemporaryDirectory() as tmp:
@@ -121,17 +138,20 @@ def test_edges_move_to_the_nearest_anchors():
         r = recruiter(files)
         sc, reads, _ = r.run([Segment("A", "c1", 28_000, 32_000)])
         # r21..r34 overlap the block; r20 (20-25 kb) and r35 (35-40 kb) are the anchors
-        check(spans(sc, "A") == [("c1", 20_000, 40_000)], f"asm1 takes in its anchors: {spans(sc, 'A')}")
-        check(spans(sc, "B") == [("c2", 20_000, 40_000)], f"asm2 from the anchors' copies: {spans(sc, 'B')}")
-        check(reads == {f"r{i}" for i in range(20, 36)}, f"reads inside, anchors too: {sorted(reads)}")
+        check(spans(sc, "A")[0] == ("c1", 20_000, 40_000), f"asm1 takes in its anchors: {spans(sc, 'A')}")
+        check(spans(sc, "B")[0] == ("c2", 20_000, 40_000), f"asm2 from the anchors' copies: {spans(sc, 'B')}")
+        for asm in ("A", "B"):
+            check(any(s <= 50_000 and e >= 55_000 for _, s, e in spans(sc, asm)[1:]),
+                  f"{asm}: r20's other qualifying alignment is a segment too: {spans(sc, asm)}")
+        check(reads >= {f"r{i}" for i in range(20, 36)}, f"reads inside, anchors too: {sorted(reads)}")
         check(r.boundary_reads == set(), "no boundary reads")
         log = [(e["assembly"], e["side"], e["from"], e["to"], e["why"], e["read"]) for e in r.edge_log]
         check(("A", "L", 28_000, 20_000, "anchor", "r20") in log
               and ("A", "R", 32_000, 40_000, "anchor", "r35") in log, f"asm1's edges: {log}")
         check(("B", "L", None, 20_000, "copy", "r20") in log
               and ("B", "R", None, 40_000, "copy", "r35") in log, f"their copies in asm2: {log}")
-        check(r._edge_seals.get(("B", "c2", "L")) == {20_000}
-              and r._edge_seals.get(("B", "c2", "R")) == {40_000}, f"asm2's seals: {r._edge_seals}")
+        check(20_000 in r._edge_seals.get(("B", "c2", "L"), ())
+              and 40_000 in r._edge_seals.get(("B", "c2", "R"), ()), f"asm2's seals: {r._edge_seals}")
 
         old = recruiter(files, "legacy")
         sc, _, _ = old.run([Segment("A", "c1", 28_000, 32_000)])
@@ -263,10 +283,65 @@ def test_qaview_legacy_key_unchanged():
         check("one of legacy, anchor" in str(exc), str(exc))
 
 
+def test_common_read_brings_its_other_copies():
+    """x is common: identical at 20.5-24.5 kb, inside the locus, and at 50-54 kb, far
+    outside it, in both assemblies. Its other copy must become a segment in both,
+    or the scorer would see it in one candidate only (+/-C)."""
+    from qatool.SegmentStorage import Segment
+
+    rng = random.Random(7)
+    seq = "".join(rng.choice("ACGT") for _ in range(L))
+    seq = seq[:50_000] + seq[20_500:24_500] + seq[54_000:]      # the copy
+    n = (L - READ) // 1000 + 1
+    alns = tile(n, [BLOCK])
+    for asm, c in (("A", "c1"), ("B", "c2")):
+        alns += [("x", asm, c, 20_500, 4_000, 0, 0), ("x", asm, c, 50_000, 4_000, 0, 256)]
+    with tempfile.TemporaryDirectory() as tmp:
+        files = make_data(tmp, alns, {"c1": seq}, {"c2": with_blocks(seq, [BLOCK])})
+        r = recruiter(files)
+        sc, reads, _ = r.run([Segment("A", "c1", 28_000, 32_000)])
+        for asm in ("A", "B"):
+            sp = spans(sc, asm)
+            check(any(s <= 50_000 and e >= 54_000 for _, s, e in sp),
+                  f"{asm}: x's copy at 50-54 kb is a segment: {sp}")
+        check("x" in reads, "x is a locus read")
+
+
+def test_split_alignments_take_no_part_in_recruitment():
+    """Reads split by a supplementary alignment, whole alignments at plen 0.999:
+    s is whole in A inside the locus, split in B into 26-28.5 kb and 52-54.5 kb;
+    t is split in A itself, a piece inside the locus (33-35.5 kb) and one at
+    56-58.5 kb. Partial alignments recruit nothing -- random ones would tie in
+    unrelated regions: s is recruited whole and brings no piece, t not at all."""
+    from qatool.SegmentStorage import Segment
+
+    rng = random.Random(7)
+    seq = "".join(rng.choice("ACGT") for _ in range(L))
+    n = (L - READ) // 1000 + 1
+    half = {"clip": (0, 2_500)}, {"clip": (2_500, 0)}
+    sa = {"tags": {"SA": "x,1,+,1M,60,0;"}}
+    alns = tile(n, [BLOCK]) + [
+        ("s", "A", "c1", 26_000, 5_000, 0, 0),
+        ("s", "B", "c2", 26_000, 2_500, 0, 0, {**half[0], **sa}),
+        ("s", "B", "c2", 52_000, 2_500, 0, 2048, half[1]),
+        ("t", "A", "c1", 33_000, 2_500, 0, 0, {**half[0], **sa}),
+        ("t", "A", "c1", 56_000, 2_500, 0, 2048, half[1]),
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        files = make_data(tmp, alns, {"c1": seq}, {"c2": with_blocks(seq, [BLOCK])})
+        sc, reads, _ = recruiter(files, plen=0.999).run([Segment("A", "c1", 28_000, 32_000)])
+    covers = lambda asm, lo, hi: any(s < hi and e > lo for _, s, e in spans(sc, asm))
+    check("s" in reads and "t" not in reads, f"s whole, t only split: {sorted(reads & {'s', 't'})}")
+    check(not covers("B", 52_000, 54_500) and not covers("A", 56_000, 58_500),
+          f"no piece brings a segment: {spans(sc, 'A')} {spans(sc, 'B')}")
+
+
 def main():
     tests = [test_edges_move_to_the_nearest_anchors, test_anchor_bridged_in_the_other_assembly_is_not_one,
              test_repeat_copies_get_segments, test_merged_loci_recruit_every_read_inside,
-             test_gap_is_crossed_to_the_nearest_anchor, test_qaview_legacy_key_unchanged]
+             test_gap_is_crossed_to_the_nearest_anchor, test_common_read_brings_its_other_copies,
+             test_split_alignments_take_no_part_in_recruitment,
+             test_qaview_legacy_key_unchanged]
     for fn in tests:
         print(f"{fn.__name__} ...")
         fn()

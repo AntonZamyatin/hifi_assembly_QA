@@ -114,14 +114,20 @@ def test_shared_crosshair(tmp):
     check({s.dimension for s in spans} == {"width", "height"}, "need both ruler directions")
 
 
-def test_wheel_zoom_on_dotplot_only(tmp):
+def test_wheel_zoom_on_marginals_zooms_one_axis(tmp):
+    """The dotplot's wheel zooms both axes; a marginal's only its genome axis -- the
+    one it shares with the dotplot -- never the shared coverage scale."""
     rd = make_region_data(tmp, "wz")
     p = _panels(report_layout(rd))
-    check(isinstance(p["main"].toolbar.active_scroll, WheelZoomTool),
-          "wheel zoom must be active on the dotplot")
-    for name in ("cov_top", "cov_right"):
+    w = p["main"].toolbar.active_scroll
+    check(isinstance(w, WheelZoomTool) and w.dimensions == "both",
+          "wheel zoom must be active on the dotplot, both axes")
+    for name, dim, shared in (("cov_top", "width", "x_range"), ("cov_right", "height", "y_range")):
         wheels = [t for t in p[name].tools if isinstance(t, WheelZoomTool)]
-        check(not wheels, f"{name} must not have wheel zoom; it would desync the axes")
+        check(len(wheels) == 1 and wheels[0].dimensions == dim and p[name].toolbar.active_scroll is wheels[0],
+              f"{name}: one active wheel zoom on its genome axis ({dim})")
+        check(getattr(p[name], shared) is getattr(p["main"], shared),
+              f"{name}: that axis is the dotplot's, so the dotplot follows")
 
 
 def test_panel_proportions(tmp):
@@ -285,7 +291,7 @@ def test_marginals_share_one_scale(tmp):
 def main():
     tmp = tempfile.mkdtemp(prefix="qaview_glyph_tests_")
     tests = [test_square_pixels, test_fit_main_stays_in_its_box, test_ranges_are_linked, test_shared_crosshair,
-             test_wheel_zoom_on_dotplot_only, test_panel_proportions,
+             test_wheel_zoom_on_marginals_zooms_one_axis, test_panel_proportions,
              test_coverage_areas_stack, test_coverage_has_no_bin_borders,
              test_contig_colors_and_bars, test_contig_end_marks,
              test_color_modes, test_save_html, test_marginals_share_one_scale]

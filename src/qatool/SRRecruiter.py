@@ -37,7 +37,8 @@ from qatool.plotters import report_plot
 #             edge moves to the nearest anchor region, which the segment then contains,
 #             or to the contig end; every copy of that anchor (the read's other best
 #             loci, both assemblies) becomes a segment sealed on the same outer side
-#             and grows inward. Common reads add no segments otherwise. A read that
+#             and grows inward. Recruited reads add every qualifying alignment as a
+#             segment, as in legacy. A read that
 #             crosses such an edge overlaps the segment only within the anchor, the
 #             same sequence in both assemblies. See Recruiter._anchor_extension_phase.
 EXTENSIONS = ("legacy", "anchor")
@@ -617,9 +618,8 @@ class Recruiter:
                     continue
                 if any(s <= a_start and a_end <= e for s, e in done):
                     continue                # judged when that extent was scanned
-                #pid = calculate_pid(aln)
                 soft_left, soft_right, hard_left, hard_right, q_aln_len, q_len, plen, pid, _ = cigar_stats(aln)
-                if pid < self.pid_threshold or plen is None or plen < self.plen_threshold:
+                if not self._recruits(aln, pid, plen):
                     continue
                 reads.add(aln.query_name)
             scanned_now.append((key, (seg.start, seg.end)))
@@ -628,6 +628,14 @@ class Recruiter:
         for key, extent in scanned_now:
             self._scanned.setdefault(key, []).append(extent)
         return reads
+
+    def _recruits(self, aln, pid: float, plen) -> bool:
+        """Whether a BAM record recruits its read: pid and plen at the thresholds.
+        Supplementary records never do: partial alignments, they would tie in
+        unrelated regions (qaview classes split reads instead)."""
+        if aln.is_supplementary:
+            return False
+        return pid >= self.pid_threshold and plen is not None and plen >= self.plen_threshold
 
     def expand_reads_to_segments(self, reads: Set[str]):
         """
@@ -650,6 +658,7 @@ class Recruiter:
                       AND start IS NOT NULL
                       AND end IS NOT NULL
                       AND read_name IN ({{READS_IN}})
+                      AND aln_type != 'supplementary'
                       AND pid >= ?
                       AND plen >= ?
                     """
@@ -659,21 +668,12 @@ class Recruiter:
             sql = base_sql.replace("{READS_IN}", reads_in)
             params = list(self.bams.keys()) + chunk + tail_params
             rows = self.con.execute(sql, params).fetchall()
-            common: Set[str] = set()
-            if self.extension == "anchor":
-                # A common read lies the same in both assemblies and adds nothing to
-                # Delta S wherever it is placed: it stays a locus read but brings no
-                # segments; anchors' copies bring the ones that matter.
-                by_read: Dict[str, list] = {}
-                for read_name, asm, contig, start, end, pid, plen, ed, strand in rows:
-                    by_read.setdefault(read_name, []).append((asm, contig, start, end, pid, strand))
-                for read_name, alns in by_read.items():
-                    self._aln_cache.setdefault(read_name, alns)
-                    if self._read_is_common(read_name):
-                        common.add(read_name)
+            # Every qualifying alignment of every recruited read is a segment, common
+            # reads included: HiFi-quality alignments are what tie related segments
+            # together, and the scorer must see each read's placements in both
+            # candidates (a copy left out of one makes it look one-sided, +/-C).
             for read_name, asm, contig, start, end, pid, plen, ed, strand in rows:
-                if read_name not in common:
-                    new_segments.add(Segment(str(asm), str(contig), int(start), int(end)))
+                new_segments.add(Segment(str(asm), str(contig), int(start), int(end)))
                 aln_rows.append({"read_name": str(read_name), "asm": str(asm),
                                  "contig": str(contig), "start": int(start),
                                  "end": int(end), "pid": float(pid), "plen": float(plen)})

@@ -48,7 +48,10 @@ RECRUIT_VERSION = 1
 # 2: reads at a seal that a merge put inside a segment are recruited.
 # 3: edges move to the nearest anchor region; anchors' copies become segments;
 #    common reads add no segments; no boundary reads.
-ANCHOR_VERSION = 3
+# 4: common reads add segments at their best placements (a copy left outside the
+#    locus in one candidate made a common read score +/-C).
+# 5: common reads add every qualifying alignment, like any read.
+ANCHOR_VERSION = 5
 USER_WORKERS = 4            # re-recruitments the user asked for, at once
 
 

@@ -31,10 +31,10 @@ deletion over bases the other row lacks -- or else at the leftmost, which is
 where qaview.align left-aligns the alignment's own gaps.
 
 The placements are exactly the ones the marginal plots count
-(`compute_coverage_bins`): pid and plen at or above the display thresholds, and
-within best_pid_delta of the read's best pid in that assembly's segments -- or,
-for a read that votes for one assembly, within pid_tie_eps (plus supplementary
-pieces). Colour and band are the marginal's too.
+(`region._best_placements`): pid and plen at or above the display thresholds,
+and within best_pid_delta of the read's best pid in that assembly, genome-wide,
+for every class -- plus the supplementary pieces of a best primary. Colour and
+band are the marginal's too.
 
 BAM records here carry no MD tag, and secondaries no SEQ, so a read's sequence
 comes from its primary record (qamodel's ReadStore), is turned to the
@@ -48,7 +48,6 @@ import sqlite3
 from qamodel.phmm.reads import ReadStore, revcomp
 from qatool.aln_utils import cigar_stats
 
-_VOTES = ("asm1_only", "asm1_best", "asm2_only", "asm2_best")
 _M, _I, _D, _N, _S, _H, _EQ, _X = 0, 1, 2, 3, 4, 5, 7, 8
 
 
@@ -69,28 +68,29 @@ def _display(g: int, lo: int, hi: int, reverse: bool) -> int:
     return (hi - 1 - g) if reverse else (g - lo)
 
 
-def _best_pid(db, assembly: str, names, segments, pid: float, plen: float) -> dict:
-    """Each read's best pid over its qualifying alignments touching `segments`."""
-    by_contig = {}
-    for s in segments:
-        by_contig.setdefault(s.contig, []).append((s.start, s.end))
-    best: dict = {}
+def _best_info(db, assembly: str, names, pid: float, plen: float) -> dict:
+    """read -> (its best non-supplementary pid, its primary's pid or None) over its
+    qualifying alignments in `assembly`, genome-wide."""
+    out: dict = {}
     names = list(names)
     for i in range(0, len(names), 500):
         chunk = names[i:i + 500]
         rows = db.execute(
-            f"SELECT read_name, contig, start, end, pid FROM aln WHERE assembly = ? "
+            f"SELECT read_name, pid, aln_type FROM aln WHERE assembly = ? "
             f"AND pid >= ? AND plen >= ? AND read_name IN ({','.join('?' * len(chunk))})",
             [assembly, pid, plen, *chunk]).fetchall()
-        for name, contig, start, end, p in rows:
-            if any(start < e and end > s for s, e in by_contig.get(contig, ())):
-                best[name] = max(best.get(name, -1.0), p)
-    return best
+        for name, p, kind in rows:
+            if kind == "supplementary":
+                continue
+            best, prim = out.get(name, (-1.0, None))
+            out[name] = (max(best, p), p if kind in ("primary", "primary_wsup") else prim)
+    return out
 
 
 def placements(bam, db, rd, assembly: str, contig: str, lo: int, hi: int, *,
                pid: float, plen: float, best_pid_delta: float, pid_tie_eps: float) -> list:
-    """The alignments over [lo, hi) that the marginal for `assembly` counts."""
+    """The alignments over [lo, hi) that the marginal for `assembly` counts: a read's
+    best placements (`pid_tie_eps` is no longer used here; kept for callers)."""
     cand = []
     for a in bam.fetch(contig, lo, hi):
         if a.is_unmapped:
@@ -100,15 +100,16 @@ def placements(bam, db, rd, assembly: str, contig: str, lo: int, hi: int, *,
         if p < pid or pl is None or pl < plen:
             continue
         cand.append((a, p))
-    segs = [s for s in rd.segments if s.assembly == assembly]
-    best = _best_pid(db, assembly, {a.query_name for a, _ in cand}, segs, pid, plen)
+    info = _best_info(db, assembly, {a.query_name for a, _ in cand}, pid, plen)
     keep = []
     for a, p in cand:
-        b = best.get(a.query_name, p)
-        if rd.read_class.get(a.query_name) in _VOTES:
-            ok = a.is_supplementary or p + pid_tie_eps >= b
+        best, prim = info.get(a.query_name, (None, None))
+        if best is None:
+            continue
+        if a.is_supplementary:
+            ok = prim is not None and prim + best_pid_delta >= best
         else:
-            ok = p + best_pid_delta >= b
+            ok = p + best_pid_delta >= best
         if ok:
             keep.append((a, p))
     return keep

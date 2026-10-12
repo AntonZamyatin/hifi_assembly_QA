@@ -24,8 +24,8 @@ const state = {
   views: [],
   viewGen: 0,               // bumped per loadView; an older one that finishes late discards itself
   lastView: null,           // the view response on show: restyling reuses it
-  fit: null,                // the dotplot's size as the server fitted it to the cell
-  userWidth: null,          // a dotplot width chosen by dragging its corner, kept across views
+  fit: null,                // panel sizes as the server fitted them to the cell: {w, h, m}
+  userSizes: null,          // sizes chosen by dragging borders, kept across views
   recruitSeeds: [],         // the open locus's seeds and their recruitment parameters
   recruitSeedsOf: null,
   recruitWatch: new Map(),  // seed being re-recruited -> {from: locus id, seq}
@@ -243,7 +243,8 @@ function params() {
   const layers = [...document.querySelectorAll("#layers input:checked")].map((b) => b.value);
   return new URLSearchParams({
     w: Math.max(MIN_CELL, Math.floor(w)), h: Math.max(MIN_CELL, Math.floor(h)),
-    pid: $("#pid").value, plen: $("#plen").value,
+    pid: $("#pid").value, plen: $("#plen").value, supp_plen: $("#supp_plen").value,
+    partial_pid: $("#partial_pid").value, min_indel: $("#min_indel").value,
     best_pid_delta: $("#best_pid_delta").value, pid_tie_eps: $("#pid_tie_eps").value,
     binsize: $("#binsize").value || 0,
     color_by: $("#color_by .on").dataset.v, C: $("#C").value, layers: layers.join(","),
@@ -362,8 +363,8 @@ async function loadView() {
   }
   $("#plot-status").textContent = "";
   rememberFit();
-  if (state.userWidth) resizeReport(state.userWidth);
-  else placeGrip();
+  if (state.userSizes) applySizes(state.userSizes);
+  else requestAnimationFrame(() => requestAnimationFrame(placeHandles));
   restyle();                               // controls changed while it was loading
   renderBackgroundStatus(d.background);
   drawRects();
@@ -389,7 +390,7 @@ function ratioRgba(st, t) {
 function lineStyle(st, colorBy, shown, C, data, ratio) {
   const n = data.layer.length;
   const color = new Uint32Array(n), width = new Float32Array(n);
-  const alpha = new Float32Array(n), hover = new Float32Array(n);
+  const alpha = new Float32Array(n), hover = new Float32Array(n), sel = new Float32Array(n);
   const l1c = Math.log1p(C);
   for (let i = 0; i < n; i++) {
     const lay = data.layer[i];
@@ -408,10 +409,17 @@ function lineStyle(st, colorBy, shown, C, data, ratio) {
       const base = st.layer_rgba[lay];
       color[i] = base === null ? data.cls_color[i] : base; width[i] = st.layer_width[lay];
     }
-    alpha[i] = a;
+    if (lay === st.partial_layer) {        // a one-sided read's partial alignment: on selection only
+      color[i] = st.partial_rgba; width[i] = st.layer_width[lay];
+      sel[i] = shown.has(lay) ? st.partial_alpha : 0;
+      alpha[i] = 0;
+    } else {
+      alpha[i] = a;
+      sel[i] = a;
+    }
     hover[i] = width[i] * 1.5 + 1.5;
   }
-  return { color, width, alpha, hover_width: hover };
+  return { color, width, alpha, sel_alpha: sel, hover_width: hover };
 }
 
 // Delta S at another C, from the per-read log-ratios (score.py: clamp to +/-C).
@@ -455,17 +463,29 @@ function restyle() {
     const tag = m.tags && m.tags[0];
     if (typeof tag === "string" && tag.startsWith("stack:")) m.visible = tag === `stack:${stack}`;
   }
+  const indels = doc.get_model_by_name("qv-indels-glyph");
+  if (indels) indels.visible = shown.has(st.partial_layer);
   const bg = doc.get_model_by_name("qv-background");
   if (bg) bg.visible = $("#background").checked;
   if (d.score) renderScore({ ...d, score: scoreAt(d.score, C) });
   else renderScore(d);
 }
 
-// ---- resizing the report by its corner ------------------------------------------------
-// Dragging the grip at the dotplot's lower right corner rescales the whole report in
-// place -- the panels' sizes are set on the page, no new view. The dotplot keeps
-// its shape (square pixels); the marginals keep their size and follow its length.
-// Double-click the grip to go back to the size fitted to the window.
+// ---- resizing the panels by their borders ---------------------------------------------
+// Handles on four borders resize panels in place -- sizes set on the page, no new
+// view: the dotplot's right border its width, its bottom border its height; the
+// border between the top marginal and the dotplot, and the right marginal's outer
+// edge, the marginals' size -- both marginals together, so their shared coverage
+// scale stays comparable. A drag applies on release. Double-click any handle to go
+// back to the sizes fitted to the window. Width and height are free, so the
+// dotplot's pixels need no longer be square.
+
+const HANDLES = [
+  { id: "w", cursor: "ew-resize", tip: "drag: the dotplot's width" },
+  { id: "h", cursor: "ns-resize", tip: "drag: the dotplot's height" },
+  { id: "mt", cursor: "ns-resize", tip: "drag: the marginals' size" },
+  { id: "mr", cursor: "ew-resize", tip: "drag: the marginals' size" },
+];
 
 function reportPanels() {
   const doc = viewDoc();
@@ -489,79 +509,101 @@ function findView(model) {
 }
 
 function rememberFit() {
-  const main = (reportPanels()["qv:main"] || [])[0];
-  state.fit = main ? { w: main.width, h: main.height } : null;
-}
-
-function resizeReport(w) {
   const p = reportPanels();
-  const main = (p["qv:main"] || [])[0];
-  if (!main || !state.fit) return;
-  w = Math.max(60, Math.round(w));
-  const h = Math.max(60, Math.round(w * state.fit.h / state.fit.w));
-  main.width = w; main.height = h;
-  for (const m of [...(p["qv:top"] || []), ...(p["qv:xbar"] || [])]) m.width = w;
-  for (const m of [...(p["qv:right"] || []), ...(p["qv:ybar"] || [])]) m.height = h;
-  for (const m of p["qv:line"] || []) m.width = w + (m.tags[1] ? m.tags[1].pad : 0);
-  requestAnimationFrame(() => requestAnimationFrame(placeGrip));
+  const main = (p["qv:main"] || [])[0], top = (p["qv:top"] || [])[0];
+  state.fit = main && top ? { w: main.width, h: main.height, m: top.height } : null;
 }
 
-function mainRect() {
-  const main = (reportPanels()["qv:main"] || [])[0];
-  const v = main && findView(main);
+function applySizes(s) {
+  const p = reportPanels();
+  const one = (t) => p[t] || [];
+  if (!one("qv:main").length) return;
+  const w = Math.max(60, Math.round(s.w)), h = Math.max(60, Math.round(s.h));
+  const m = Math.max(40, Math.round(s.m));
+  for (const x of one("qv:main")) { x.width = w; x.height = h; }
+  for (const x of one("qv:xbar")) x.width = w;
+  for (const x of one("qv:ybar")) x.height = h;
+  for (const x of one("qv:top")) { x.width = w; x.height = m; }
+  for (const x of one("qv:right")) { x.width = m; x.height = h; }
+  for (const x of one("qv:corner")) x.height = m;
+  // ticks by the marginals' size, as the server does
+  for (const x of one("qv:top")) for (const ax of x.left || []) if (ax.ticker) ax.ticker.desired_num_ticks = Math.max(2, Math.floor(m / 45));
+  for (const x of one("qv:right")) for (const ax of x.below || []) if (ax.ticker) ax.ticker.desired_num_ticks = Math.max(2, Math.floor(m / 45));
+  for (const x of one("qv:line")) x.width = (x.tags[1] ? x.tags[1].bar : 0) + w + m;
+  requestAnimationFrame(() => requestAnimationFrame(placeHandles));
+}
+
+function panelRect(tag) {
+  const model = (reportPanels()[tag] || [])[0];
+  const v = model && findView(model);
   if (!v || !v.el) return null;
-  const r = v.el.getBoundingClientRect(), c = $("#plot-cell").getBoundingClientRect();
+  const r = v.el.getBoundingClientRect();
   if (!r.width) return null;
-  const cell = $("#plot-cell");
+  const cell = $("#plot-cell"), c = cell.getBoundingClientRect();
   return { left: r.left - c.left + cell.scrollLeft, top: r.top - c.top + cell.scrollTop,
            width: r.width, height: r.height };
 }
 
-function placeGrip() {
-  const g = $("#plot-grip"), r = mainRect();
-  g.hidden = !r;
-  if (!r) return;
-  g.style.left = `${r.left + r.width - 7}px`;
-  g.style.top = `${r.top + r.height - 7}px`;
-  g.title = "drag to resize the plot; double-click: fit to the window" +
-    (state.userWidth ? ` (now ${Math.round(r.width)} px wide)` : "");
+function placeHandles() {
+  const R = panelRect("qv:main"), T = panelRect("qv:top"), M = panelRect("qv:right");
+  const ok = R && T && M;
+  for (const { id } of HANDLES) {
+    const el = $(`#grip-${id}`);
+    el.hidden = !ok;
+    if (!ok) continue;
+    const box = {
+      w: { left: R.left + R.width - 3, top: R.top, width: 6, height: R.height },
+      h: { left: R.left, top: R.top + R.height - 3, width: R.width, height: 6 },
+      mt: { left: T.left, top: R.top - 3, width: T.width, height: 6 },
+      mr: { left: M.left + M.width - 3, top: M.top, width: 6, height: M.height },
+    }[id];
+    for (const k of Object.keys(box)) el.style[k] = `${box[k]}px`;
+  }
 }
 
-function wireGrip() {
-  const g = $("#plot-grip"), ghost = $("#plot-ghost");
-  let start = null;
-  g.addEventListener("pointerdown", (e) => {
-    const r = mainRect();
-    if (!r || !state.fit) return;
-    start = { x: e.clientX, y: e.clientY, r, aspect: state.fit.h / state.fit.w };
-    g.setPointerCapture(e.pointerId);
-    Object.assign(ghost.style, { left: `${r.left}px`, top: `${r.top}px`,
-                                 width: `${r.width}px`, height: `${r.height}px` });
-    ghost.hidden = false;
-    e.preventDefault();
-  });
-  g.addEventListener("pointermove", (e) => {
-    if (!start) return;
-    const { r, aspect } = start;
-    // the larger of the two pulls wins; the shape stays the dotplot's
-    const s = Math.max((r.width + e.clientX - start.x) / r.width,
-                       (r.height + e.clientY - start.y) / r.height);
-    const w = Math.max(60, r.width * s);
-    ghost.style.width = `${w}px`;
-    ghost.style.height = `${w * aspect}px`;
-  });
-  g.addEventListener("pointerup", () => {
-    if (!start) return;
-    ghost.hidden = true;
-    const w = parseFloat(ghost.style.width);
-    start = null;
-    state.userWidth = w;
-    resizeReport(w);
-  });
-  g.addEventListener("dblclick", () => {
-    state.userWidth = null;
-    if (state.fit) resizeReport(state.fit.w);
-  });
+function wireHandles() {
+  const ghost = $("#plot-ghost");
+  for (const { id, cursor, tip } of HANDLES) {
+    const g = document.createElement("div");
+    g.id = `grip-${id}`; g.className = "plot-grip"; g.hidden = true;
+    g.style.cursor = cursor;
+    g.title = `${tip}; double-click: fit to the window`;
+    $("#plot-cell").append(g);
+    let start = null;
+    const vertical = cursor === "ew-resize";
+    g.addEventListener("pointerdown", (e) => {
+      const p = reportPanels(), main = (p["qv:main"] || [])[0], top = (p["qv:top"] || [])[0];
+      if (!main || !top) return;
+      start = { x: e.clientX, y: e.clientY, s: { w: main.width, h: main.height, m: top.height },
+                left: parseFloat(g.style.left), top: parseFloat(g.style.top) };
+      g.setPointerCapture(e.pointerId);
+      Object.assign(ghost.style, { left: g.style.left, top: g.style.top,
+                                   width: g.style.width, height: g.style.height });
+      ghost.hidden = false;
+      e.preventDefault();
+    });
+    g.addEventListener("pointermove", (e) => {
+      if (!start) return;
+      if (vertical) ghost.style.left = `${start.left + e.clientX - start.x}px`;
+      else ghost.style.top = `${start.top + e.clientY - start.y}px`;
+    });
+    g.addEventListener("pointerup", (e) => {
+      if (!start) return;
+      ghost.hidden = true;
+      const d = vertical ? e.clientX - start.x : e.clientY - start.y;
+      const s = { ...start.s };
+      if (id === "w") s.w += d;
+      else if (id === "h") s.h += d;
+      else s.m += d;
+      start = null;
+      state.userSizes = s;
+      applySizes(s);
+    });
+    g.addEventListener("dblclick", () => {
+      state.userSizes = null;
+      if (state.fit) applySizes(state.fit);
+    });
+  }
 }
 
 // The background toggle restyles when the view already holds the background;
@@ -1057,7 +1099,8 @@ function wire() {
   $("#filter").addEventListener("input", (e) => { state.filter = e.target.value; renderTable(); });
   // Thresholds and bin size change the reads drawn: a new view from the server.
   // Everything else is restyled on the page.
-  for (const id of ["pid", "plen", "best_pid_delta", "pid_tie_eps", "binsize"]) {
+  for (const id of ["pid", "plen", "supp_plen", "partial_pid", "min_indel", "best_pid_delta",
+                    "pid_tie_eps", "binsize"]) {
     $(`#${id}`).addEventListener("change", scheduleView);
   }
   $("#C").addEventListener("change", restyle);
@@ -1078,7 +1121,7 @@ function wire() {
   restoreWidths();
   wireResizers();
   wireRectAlign();
-  wireGrip();
+  wireHandles();
   $("#reads-toggle").addEventListener("click", toggleReads);
   $("#remember-toggle").addEventListener("click", toggleRemember);
   $("#recruit-run").addEventListener("click", runRecruit);
@@ -1096,7 +1139,7 @@ function wire() {
     const cell = $("#plot-cell");
     const size = `${cell.clientWidth}x${cell.clientHeight}`;
     // a size chosen by dragging stays as it is; otherwise the plot is fitted again
-    if (size !== last) { last = size; if (state.userWidth) placeGrip(); else scheduleView(); }
+    if (size !== last) { last = size; if (state.userSizes) placeHandles(); else scheduleView(); }
   }).observe($("#plot-cell"));
 
   const es = new EventSource("/api/events");

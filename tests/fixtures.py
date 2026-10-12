@@ -42,25 +42,31 @@ READS_B = [
 def write_bam(path: str, reads: list, contigs: dict = CONTIGS) -> str:
     """Write and index a BAM.
 
-    reads: list of (name, contig, start, length, nm, flag).  CIGAR is a plain
-    `<length>M`, so cigar_stats takes the NM branch and pid = 1 - nm/length.
+    reads: list of (name, contig, start, length, nm, flag[, extra]).  CIGAR is a
+    plain `<length>M`, so cigar_stats takes the NM branch and pid = 1 - nm/length.
+    `extra` (optional dict): "clip": (left, right) hard-clipped bases, for a piece of
+    a split read (plen = length / (length + clips)); "tags": more tags, e.g. SA.
     """
     header = {"HD": {"VN": "1.6", "SO": "coordinate"},
               "SQ": [{"SN": c, "LN": ln} for c, ln in contigs.items()]}
     order = {c: i for i, c in enumerate(contigs)}
     with pysam.AlignmentFile(path, "wb", header=header) as out:
-        for name, contig, start, length, nm, flag in sorted(
+        for name, contig, start, length, nm, flag, *rest in sorted(
                 reads, key=lambda r: (order[r[1]], r[2])):
+            extra = rest[0] if rest else {}
+            left, right = extra.get("clip", (0, 0))
             a = pysam.AlignedSegment()
             a.query_name = name
             a.reference_id = order[contig]
             a.reference_start = start
             a.mapping_quality = 60
-            a.cigartuples = [(0, length)]          # M
+            a.cigartuples = ([(5, left)] if left else []) + [(0, length)] + ([(5, right)] if right else [])
             a.flag = flag
             a.query_sequence = "A" * length
             a.query_qualities = pysam.qualitystring_to_array("I" * length)
             a.set_tag("NM", nm)
+            for k, v in extra.get("tags", {}).items():
+                a.set_tag(k, v)
             out.write(a)
     pysam.index(path)
     return path

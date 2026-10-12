@@ -136,8 +136,11 @@ def test_selection_glyphs(tmp):
     check(r.nonselection_glyph is not None, "unselected reads must dim")
     # Alpha is a per-row field so a layer hidden by a Tier-3 toggle stays hidden even
     # when selected; only the nonselection state is a hard zero.
-    check(r.glyph.line_alpha == "alpha" and r.selection_glyph.line_alpha == "alpha",
-          "base and selected glyphs must honour the per-row alpha field")
+    check(r.glyph.line_alpha == "alpha" and r.selection_glyph.line_alpha == "sel_alpha",
+          "base and selected glyphs must honour the per-row alpha fields")
+    src = r.data_source.data
+    check(all(float(a) == float(s) for a, s, lay in zip(src["alpha"], src["sel_alpha"], src["layer"])
+              if lay != 4), "an ordinary row's selected alpha is its alpha")
     check(r.nonselection_glyph.line_alpha == 0.0,
           "unselected reads must be fully hidden")
     check(any(isinstance(t, TapTool) for t in p["main"].tools),
