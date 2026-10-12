@@ -25,6 +25,7 @@ from bokeh.plotting import figure
 
 from qatool.plotters.axis import contig_runs
 from qatool.plotters.colors import SUPPORT_COLORS
+from qaview.region import MARGIN_BINS, coverage_gaps, marginal_bins
 
 SUPPLEMENTARY_COLOR = "#d62728"
 # A one-sided read's partial alignments in the other candidate (region.LAYER_PARTIAL):
@@ -33,6 +34,9 @@ PARTIAL_COLOR = "#ff7f0e"
 PARTIAL_ALPHA = 0.9
 # A large indel on a partial row: a cross on its line, with it on selection only.
 INDEL_COLOR = "#4a148c"
+# coverage dropouts on the marginals; drawn past any coverage, the axis clips them
+DROPOUT_COLOR = "#e41a1c"
+DROPOUT_TOP = 1e9
 
 # Panel sizes in px.  The matplotlib report uses a 16in figure with 2in marginals and
 # 0.15in contig bars; at 100 px/in those become the values below.
@@ -501,24 +505,46 @@ def dotplot_figure(rd, color_by: str = "class", line_alpha: float = LINE_ALPHA,
     return p
 
 
+def _area_columns(left, right, lo, hi) -> dict:
+    """A stacked band as one step-shaped area: each bin becomes two points, its
+    left and right edge. One area per band rather than one quad per bin: adjacent
+    sub-pixel quads leave visible seams between bins."""
+    e = np.empty(2 * len(left))
+    e[0::2], e[1::2] = left, right
+    return dict(e=e, lo=np.repeat(lo, 2), hi=np.repeat(hi, 2))
+
+
+def _hit_columns(bins: dict, stackings: dict, tops: dict, peak: float) -> dict:
+    """The hover target's rows: one per bin, with each band's top as
+    `cum_<stacking>_<i>` so a hover can tell which band is under the cursor."""
+    total = next(iter(tops.values()))[-1] if tops else np.zeros(len(bins["left"]))
+    cols = dict(left=bins["left"], right=bins["right"], seg=bins["seg"], contig=bins["contig"],
+                bin_start=bins["bin_start"], bin_end=bins["bin_end"], total=total,
+                top=np.full(len(bins["left"]), peak))
+    for name, t in tops.items():
+        for i, v in enumerate(t):
+            cols[f"cum_{name}_{i}"] = v
+    return cols
+
+
 def coverage_figure(rd, assembly: str, orientation: str,
                     width: int = MAIN_WIDTH, height: int | None = None,
                     stacking: "Stacking | None" = None, size: int = MARGIN_SIZE,
                     stackings: dict | None = None, active: str | None = None,
                     value_max: float | None = None):
-    """Stacked marginal coverage for one assembly.
+    """Stacked marginal coverage for one assembly, binned for the whole locus.
 
-    Drawn as explicit quads rather than a stacked area: exact-bp bins have a short
-    final bin per segment, which a uniform-width area glyph would misplace.
+    Drawn from `rd.placements`, which `report_layout` re-bins in the page for the
+    range in view (REBIN_JS), so zooming in shows finer bins; this draws the first
+    frame with the same rule (`region.marginal_bins`).
 
     `stackings` (name -> Stacking) draws each, only `active` visible, tagged
-    `stack:<name>`, so the page can switch between them without the server; the
-    hit target carries each one's band tops as `cum_<name>_<i>`. Without it,
-    `stacking` (default: the support classes) is drawn alone, as "class".
+    `stack:<name>`, so the page can switch between them without the server. Without
+    it, `stacking` (default: the support classes) is drawn alone, as "class".
     `value_max` sets the coverage axis's top (default: this marginal's maximum).
     """
-    cov = rd.cov1 if assembly == rd.asm1 else rd.cov2
-    left, right = rd.bin_edges(assembly)
+    segs = rd.segs_info(assembly)
+    extent = rd.plot_w if orientation == "x" else rd.plot_h
     if stackings is None:
         stackings, active = {"class": stacking or class_stacking(rd)}, "class"
     active = active or next(iter(stackings))
@@ -530,39 +556,24 @@ def coverage_figure(rd, assembly: str, orientation: str,
         p = figure(width=size, height=height or main_height(rd, width),
                    y_range=Range1d(0, rd.plot_h), tools="pan,box_zoom,reset")
 
-    # Each bin becomes two points (its left and right edge) so one filled area per
-    # bucket renders as a step.  Drawn as a single area rather than one quad per bin:
-    # adjacent sub-pixel quads leave visible seams between bins at this bin count.
-    edges = np.empty(2 * len(left), dtype=float)
-    edges[0::2] = left
-    edges[1::2] = right
-
-    def _double(vals):
-        out = np.empty(2 * len(vals), dtype=float)
-        out[0::2] = vals
-        out[1::2] = vals
-        return out
-
-    cums = {}                      # cumulative top of each band, per bin
-    totals = None
+    tops, bins = {}, None
     for name, st in stackings.items():
-        base = np.zeros(len(left))
-        for i, (values, color) in enumerate(zip(st.series[assembly], st.colors)):
-            top = base + np.asarray(values, dtype=float)
-            lo, hi = _double(base), _double(top)
-            kw = dict(fill_color=color, fill_alpha=1.0, visible=(name == active))
+        bins = marginal_bins(segs, rd.placements[assembly], st.read_band, len(st.keys), 0, extent)
+        cum = np.cumsum(bins["series"], axis=0)
+        tops[name] = list(cum)
+        base = np.zeros(len(bins["left"]))
+        for i, (top, color) in enumerate(zip(cum, st.colors)):
+            src = ColumnDataSource(_area_columns(bins["left"], bins["right"], base, top))
+            kw = dict(source=src, fill_color=color, fill_alpha=1.0, visible=(name == active))
             if orientation == "x":
-                r = p.varea(x=edges, y1=lo, y2=hi, **kw)
+                r = p.varea(x="e", y1="lo", y2="hi", **kw)
             else:
-                r = p.harea(y=edges, x1=lo, x2=hi, **kw)
+                r = p.harea(y="e", x1="lo", x2="hi", **kw)
             r.tags = [f"stack:{name}"]          # on the renderer: a glyph method gives it the glyph
             base = top
-            cums[f"cum_{name}_{i}"] = top
-        if name == active:
-            totals = base               # every stacking sums to the same coverage
-    base = totals
 
-    m = value_max if value_max else (float(base.max()) if len(base) else 1.0)
+    total = tops[active][-1] if len(bins["left"]) else np.zeros(0)
+    m = value_max if value_max else (float(total.max()) if len(total) else 1.0)
     # Ticks by the marginal's size: a small one would otherwise run its labels together.
     n_ticks = max(2, size // 45)
     if orientation == "x":
@@ -575,36 +586,32 @@ def coverage_figure(rd, assembly: str, orientation: str,
         p.xaxis.ticker.desired_num_ticks = n_ticks
     p.grid.visible = False
 
+    # Coverage dropouts: a thin red mark wherever no read lies, exact to the bp and
+    # drawn at least a pixel wide, so a gap narrower than a bin still shows.
+    gl, gr = coverage_gaps(segs, rd.placements[assembly])
+    gap = dict(fill_color=DROPOUT_COLOR, fill_alpha=0.35, line_color=DROPOUT_COLOR, line_width=1)
+    if orientation == "x":
+        p.quad(left=gl, right=gr, bottom=0, top=DROPOUT_TOP, **gap)
+    else:
+        p.quad(left=0, right=DROPOUT_TOP, bottom=gl, top=gr, **gap)
+
     # Invisible full-height target, one quad per bin.  Hovering the stacked series
     # directly would miss any bucket that is empty at that bin; this always reports the
     # bin under the cursor, and its selection glyph doubles as the bin highlight.
-    n_reads = np.diff(np.asarray(cov.bin_offsets)).astype(np.int32)
-    hit_src = ColumnDataSource(dict(
-        left=np.asarray(left, float), right=np.asarray(right, float), contig=cov.bin_contig,
-        bin_start=np.asarray(cov.bin_start, np.int32), bin_end=np.asarray(cov.bin_end, np.int32),
-        total=base, n_reads=n_reads, bin_index=np.arange(len(left), dtype=np.int32),
-        # Band boundaries, so a hover can resolve which stacked band it is over.
-        **cums,
-    ))
+    hit_src = ColumnDataSource(_hit_columns(bins, stackings, tops, m))
     if orientation == "x":
-        hit = p.quad(left="left", right="right", bottom=0, top=m, source=hit_src,
-                     fill_alpha=0.0, line_alpha=0.0, fill_color="#ffb300")
-        sel = Quad(left="left", right="right", bottom=0, top=m,
-                   fill_color="#ffb300", fill_alpha=0.30, line_alpha=0.0)
+        quad = dict(left="left", right="right", bottom=0, top="top")
+        none = dict(left="left", right="right", bottom=0, top=0)
     else:
-        hit = p.quad(left=0, right=m, bottom="left", top="right", source=hit_src,
-                     fill_alpha=0.0, line_alpha=0.0, fill_color="#ffb300")
-        sel = Quad(left=0, right=m, bottom="left", top="right",
-                   fill_color="#ffb300", fill_alpha=0.30, line_alpha=0.0)
-    hit.selection_glyph = sel
-    hit.nonselection_glyph = Quad(left="left", right="right", bottom=0, top=0,
-                                  fill_alpha=0.0, line_alpha=0.0) if orientation == "x" else \
-        Quad(left=0, right=0, bottom="left", top="right", fill_alpha=0.0, line_alpha=0.0)
+        quad = dict(left=0, right="top", bottom="left", top="right")
+        none = dict(left=0, right=0, bottom="left", top="right")
+    hit = p.quad(source=hit_src, fill_alpha=0.0, line_alpha=0.0, fill_color="#ffb300", **quad)
+    hit.selection_glyph = Quad(fill_color="#ffb300", fill_alpha=0.30, line_alpha=0.0, **quad)
+    hit.nonselection_glyph = Quad(fill_alpha=0.0, line_alpha=0.0, **none)
 
     p.add_tools(HoverTool(renderers=[hit], attachment="vertical", tooltips=[
         ("bin", "@contig:@bin_start{0,0}-@bin_end{0,0}"),
         ("coverage", "@total{0.0}"),
-        ("reads", "@n_reads"),
     ]))
     return p
 
@@ -743,8 +750,165 @@ def _read_bucket_index(rd) -> list:
     return [pos.get(rd.read_class.get(n, ""), unassigned) for n in rd.read_names]
 
 
-def _link_bins_to_reads(rd, cov_fig, cov, other_fig, other_cov, main, status, orientation,
-                        stackings: dict | None = None, mode: Div | None = None):
+# The marginals' page-side binning. `M` is one marginal: `iv` its placements
+# (region.Placements), `segs` its axis map, `hit` its hover target, `areas` its
+# band areas per stacking, `first`/`last` the columns of `reads` holding each
+# read's placement rows; `reads` also holds `band_<stacking>` per read.
+# qvRebin mirrors region.marginal_bins (tests/test_rebin.py runs both).
+REBIN_JS = """
+function qvNice(span, target) {
+    const raw = span / target;
+    if (raw <= 1) return 1;
+    let mag = 1;
+    while (mag * 10 <= raw) mag *= 10;
+    for (const f of [1, 2, 5, 10]) if (f * mag >= raw) return f * mag;
+}
+
+// Bin M's placements over [a, b]; set its areas and hover rows (all but `top`).
+// Returns the peak coverage of what was binned.
+function qvRebin(M, reads, a, b, target) {
+    const S = M.segs.data, I = M.iv.data;
+    const bin = qvNice(b - a, target);
+    const left = [], right = [], segk = [], contig = [], gs = [], ge = [];
+    const base = new Map();
+    for (let k = 0; k < S.off.length; k++) {
+        const off = S.off[k], len = S.len[k];
+        if (off >= b || off + len <= a) continue;
+        const j0 = Math.max(0, Math.floor((a - off) / bin));
+        const j1 = Math.min(Math.ceil(len / bin), Math.ceil((b - off) / bin));
+        base.set(k, [left.length - j0, j0, j1]);
+        for (let j = j0; j < j1; j++) {
+            const l = j * bin, r = Math.min(len, l + bin);
+            left.push(off + l); right.push(off + r); segk.push(k);
+            contig.push(S.contig[k]); gs.push(S.start[k] + l); ge.push(S.start[k] + r);
+        }
+    }
+    const nb = left.length, names = Object.keys(M.areas);
+    const diffs = names.map((n) => M.areas[n].map(() => new Float64Array(nb + 1)));
+    const bandOf = names.map((n) => reads.data["band_" + n]);
+    for (let i = 0; i < I.p0.length; i++) {
+        const h = base.get(I.seg[i]);
+        if (h === undefined) continue;
+        const off = S.off[I.seg[i]];
+        const lo = Math.max(h[1], Math.floor((I.p0[i] - off) / bin));
+        const hi = Math.min(h[2], Math.ceil((I.p1[i] - off) / bin));
+        if (lo >= hi) continue;
+        const w = I.w[i], g = I.read[i];
+        for (let s = 0; s < names.length; s++) {
+            const d = diffs[s][bandOf[s][g]];
+            d[h[0] + lo] += w;
+            d[h[0] + hi] -= w;
+        }
+    }
+    const e = new Float64Array(2 * nb);
+    for (let j = 0; j < nb; j++) { e[2 * j] = left[j]; e[2 * j + 1] = right[j]; }
+    const twice = (v) => { const o = new Float64Array(2 * nb); for (let j = 0; j < nb; j++) o[2 * j] = o[2 * j + 1] = v[j]; return o; };
+    const hit = {left: Float64Array.from(left), right: Float64Array.from(right),
+                 seg: Int32Array.from(segk), contig, bin_start: gs, bin_end: ge};
+    let total = new Float64Array(nb);
+    names.forEach((n, s) => {
+        let cum = new Float64Array(nb);
+        diffs[s].forEach((d, i) => {
+            const top = new Float64Array(nb);
+            let run = 0;
+            for (let j = 0; j < nb; j++) { run += d[j]; top[j] = cum[j] + (Math.abs(run) < 1e-9 ? 0 : run); }
+            M.areas[n][i].data = {e, lo: twice(cum), hi: twice(top)};
+            hit["cum_" + n + "_" + i] = top;
+            cum = top;
+        });
+        total = cum;
+    });
+    hit.total = total;
+    M.next = hit;
+    let peak = 0;
+    for (let j = 0; j < nb; j++) if (total[j] > peak) peak = total[j];
+    return peak;
+}
+
+// Indices of M's current bins that read set `gs` has a placement in.
+function qvBinsOf(M, reads, gs) {
+    const L = M.hit.data.left, R = M.hit.data.right, I = M.iv.data;
+    const first = reads.data[M.first], last = reads.data[M.last];
+    const out = new Set();
+    for (const g of gs) {
+        for (let i = first[g]; i < last[g]; i++) {
+            let lo = 0, hi = R.length;              // first bin ending past p0
+            while (lo < hi) { const mid = (lo + hi) >> 1; if (R[mid] > I.p0[i]) hi = mid; else lo = mid + 1; }
+            for (let j = lo; j < L.length && L[j] < I.p1[i]; j++) out.add(j);
+        }
+    }
+    return Array.from(out);
+}
+
+// The reads under the current selected line rows.
+function qvSelectedReads(lines) {
+    const read = lines.data["read"], gs = new Set();
+    for (const r of lines.selected.indices) gs.add(read[r]);
+    return gs;
+}
+"""
+
+
+def _marginal_model(rd, fig, assembly: str, axis: str) -> dict:
+    """The data REBIN_JS needs for one marginal (see its comment)."""
+    pl = rd.placements[assembly]
+    segs = rd.segs_info(assembly)
+    areas = {}
+    for r in fig.renderers:
+        tag = r.tags[0] if r.tags else ""
+        if isinstance(tag, str) and tag.startswith("stack:"):
+            areas.setdefault(tag.split(":", 1)[1], []).append(r.data_source)
+    return dict(
+        iv=ColumnDataSource(dict(p0=pl.p0, p1=pl.p1, w=pl.w, read=pl.read, seg=pl.seg)),
+        segs=ColumnDataSource(dict(off=np.array([x[3] for x in segs], float),
+                                   len=np.array([x[2] - x[1] for x in segs], float),
+                                   contig=[x[0] for x in segs],
+                                   start=np.array([x[1] for x in segs], float))),
+        hit=hit_renderer(fig).data_source, areas=areas,
+        first=f"first_{axis}", last=f"last_{axis}")
+
+
+def _reads_source(rd, stackings: dict) -> ColumnDataSource:
+    """Per read: its band in each stacking and its placement rows on each axis."""
+    p1, p2 = rd.placements[rd.asm1], rd.placements[rd.asm2]
+    return ColumnDataSource(dict(
+        first_x=p2.first, last_x=p2.last, first_y=p1.first, last_y=p1.last,
+        **{f"band_{k}": np.asarray(st.read_band, dtype=np.int32) for k, st in stackings.items()}))
+
+
+def _wire_rebin(rd, main, shared, lines, margs: list, reads):
+    """Re-bin both marginals for the dotplot's ranges on every zoom or pan, at most
+    once a frame, and rescale their shared coverage axis to the peak in view."""
+    cb = CustomJS(args=dict(xr=main.x_range, yr=main.y_range, shared=shared, lines=lines,
+                            mx=margs[0], my=margs[1], reads=reads,
+                            wx=float(rd.plot_w), wy=float(rd.plot_h), target=MARGIN_BINS),
+                  code=REBIN_JS + """
+        if (shared.__qvPending) return;
+        shared.__qvPending = true;
+        requestAnimationFrame(() => {
+            shared.__qvPending = false;
+            const px = qvRebin(mx, reads, Math.max(0, xr.start), Math.min(wx, xr.end), target);
+            const py = qvRebin(my, reads, Math.max(0, yr.start), Math.min(wy, yr.end), target);
+            const peak = Math.max(px, py) || 1;
+            for (const M of [mx, my]) {
+                M.next.top = new Float64Array(M.next.left.length).fill(peak);
+                M.hit.selected.indices = [];
+                M.hit.data = M.next;
+            }
+            shared.bounds = [0, peak];
+            shared.start = 0;
+            shared.end = peak;
+            const gs = qvSelectedReads(lines);       // keep a selected read's bins lit
+            if (gs.size) for (const M of [mx, my]) M.hit.selected.indices = qvBinsOf(M, reads, gs);
+        });
+        """)
+    for r in (main.x_range, main.y_range):
+        r.js_on_change("start", cb)
+        r.js_on_change("end", cb)
+
+
+def _link_bins_to_reads(rd, cov_fig, marg, other_marg, main, status, orientation,
+                        reads, stackings: dict, mode: Div):
     """Hover a coverage bin: stripe that bin, light the matching bins on the other
     assembly, and show only the reads passing through it.
 
@@ -753,34 +917,22 @@ def _link_bins_to_reads(rd, cov_fig, cov, other_fig, other_cov, main, status, or
     stack there is no band, and the whole bin is shown. `mode.text` names the
     stacking on show ("class" or "ratio"), which the page may switch.
 
-    Pure client-side array lookups over precomputed indexes -- bin -> reads and
-    read -> bins on each assembly, read -> line rows, and read -> band -- so it stays
-    instant over a remote connection.
+    The bins change with the zoom, so the reads under one are found by scanning the
+    placements (`marg`, see REBIN_JS) -- one pass, well under a frame.
     """
     i32 = lambda a: np.asarray(a, dtype=np.int32)
     rl_off, rl_idx = rd.lines.by_read(len(rd.read_names))
-    l2g, _ = _global_index(rd, cov)
-    _, other_g2l = _global_index(rd, other_cov)
-    other_off, other_bins = other_cov.by_read()
-    stackings = stackings or {"class": class_stacking(rd)}
-    mode = mode or Div(text=next(iter(stackings)), visible=False)
-    bands = {f"band_{k}": i32(st.read_band) for k, st in stackings.items()}
     names = {f"names_{k}": list(st.keys) for k, st in stackings.items()}
 
     cb = CustomJS(
         args=dict(
-            lines=line_renderer(main).data_source,
-            hit=hit_renderer(cov_fig).data_source,
-            other=hit_renderer(other_fig).data_source,
+            lines=line_renderer(main).data_source, M=marg, O=other_marg, reads=reads,
             status=status, mode=mode,
-            bin_off=i32(cov.bin_offsets), bin_reads=i32(cov.read_idx),
-            l2g=i32(l2g), other_g2l=i32(other_g2l),
-            other_off=i32(other_off), other_bins=i32(other_bins),
-            read_off=i32(rl_off), read_lines=i32(rl_idx),
-            bands=bands, names=names,
+            read_off=i32(rl_off), read_lines=i32(rl_idx), names=names,
             vertical=(orientation == "x"), label=cov_fig.name or "",
         ),
-        code="""
+        code=REBIN_JS + """
+        const hit = M.hit, other = O.hit;
         const hovered = cb_data.index.indices;
         if (!hovered || hovered.length === 0) {
             lines.selected.indices = [];
@@ -791,78 +943,53 @@ def _link_bins_to_reads(rd, cov_fig, cov, other_fig, other_cov, main, status, or
         }
         const b = hovered[0];
         const m = mode.text;
-        const read_band = bands["band_" + m], band_names = names["names_" + m];
-        const n_series = band_names.length;
+        const read_band = reads.data["band_" + m], band_names = names["names_" + m];
 
         // Which stacked band is the cursor in?  The hit target spans the full value
         // axis, so compare the cursor against this bin's cumulative band tops.
         const geom = cb_data.geometry;
         const v = vertical ? geom.y : geom.x;
-        let band = -1;
-        for (let s = 0; s < n_series; s++) {
-            if (v <= hit.data['cum_' + m + '_' + s][b]) { band = s; break; }
+        // Empty bands are skipped: at the axis (v <= 0) one would match.
+        let band = -1, below = 0;
+        for (let s = 0; s < band_names.length; s++) {
+            const top = hit.data['cum_' + m + '_' + s][b];
+            if (top > below && v <= top) { band = s; break; }
+            below = top;
         }
 
-        const rows = [];
-        const partner = new Set();
-        let n = 0;
-        for (let k = bin_off[b]; k < bin_off[b + 1]; k++) {
-            const g = l2g[bin_reads[k]];
-            if (g < 0) continue;
-            if (band >= 0 && read_band[g] !== band) continue;   // narrow to the band
-            n += 1;
-            for (let j = read_off[g]; j < read_off[g + 1]; j++) rows.push(read_lines[j]);
-            const ol = other_g2l[g];
-            if (ol >= 0)
-                for (let j = other_off[ol]; j < other_off[ol + 1]; j++)
-                    partner.add(other_bins[j]);
+        const lo = hit.data.left[b], hi = hit.data.right[b], k = hit.data.seg[b];
+        const I = M.iv.data, gs = new Set();
+        for (let i = 0; i < I.p0.length; i++) {
+            if (I.seg[i] !== k || I.p0[i] >= hi || I.p1[i] <= lo) continue;
+            const g = I.read[i];
+            if (band < 0 || read_band[g] === band) gs.add(g);   // narrow to the band
         }
+        const rows = [];
+        for (const g of gs)
+            for (let j = read_off[g]; j < read_off[g + 1]; j++) rows.push(read_lines[j]);
         lines.selected.indices = rows;
         hit.selected.indices = [b];
-        other.selected.indices = Array.from(partner);
+        other.selected.indices = qvBinsOf(O, reads, gs);
 
         const where = hit.data['contig'][b] + ':'
                     + hit.data['bin_start'][b].toLocaleString() + '-'
                     + hit.data['bin_end'][b].toLocaleString();
         const cls = band >= 0 ? band_names[band] : 'all bands';
         status.text = label + ' ' + where + ' &nbsp;·&nbsp; <b>' + cls
-                    + '</b> &nbsp;·&nbsp; ' + n + ' reads';
+                    + '</b> &nbsp;·&nbsp; ' + gs.size + ' reads';
         """)
     for tool in cov_fig.tools:
         if isinstance(tool, HoverTool):
             tool.callback = cb
 
 
-def _link_reads_to_bins(rd, main, cov_figs):
-    """Tapping a read line highlights the coverage bins it contributes to."""
+def _link_reads_to_bins(main, margs: list, reads):
+    """Selecting read lines (a tap) highlights the coverage bins they contribute to."""
     lines = line_renderer(main).data_source
-    args = dict(lines=lines)
-    code_parts = []
-    for i, (cov_fig, cov) in enumerate(cov_figs):
-        l2g, _ = _global_index(rd, cov)
-        args[f"hit{i}"] = hit_renderer(cov_fig).data_source
-        args[f"boff{i}"] = np.asarray(cov.bin_offsets, dtype=np.int32)
-        args[f"breads{i}"] = np.asarray(cov.read_idx, dtype=np.int32)
-        args[f"l2g{i}"] = np.asarray(l2g, dtype=np.int32)
-        code_parts.append(f"""
-        {{
-            const bins = [];
-            for (let b = 0; b + 1 < boff{i}.length; b++) {{
-                for (let k = boff{i}[b]; k < boff{i}[b + 1]; k++) {{
-                    if (want.has(l2g{i}[breads{i}[k]])) {{ bins.push(b); break; }}
-                }}
-            }}
-            hit{i}.selected.indices = bins;
-        }}""")
-    cb = CustomJS(args=args, code="""
-        const rows = lines.selected.indices;
-        const read = lines.data["read"];
-        const want = new Set();
-        for (const r of rows) want.add(read[r]);
-        if (want.size === 0) { """ + "".join(
-            f"hit{i}.selected.indices = []; " for i in range(len(cov_figs))
-        ) + """ return; }
-    """ + "".join(code_parts))
+    cb = CustomJS(args=dict(lines=lines, margs=margs, reads=reads), code=REBIN_JS + """
+        const gs = qvSelectedReads(lines);
+        for (const M of margs) M.hit.selected.indices = gs.size ? qvBinsOf(M, reads, gs) : [];
+    """)
     lines.selected.js_on_change("indices", cb)
 
 
@@ -939,12 +1066,17 @@ def report_layout(rd, color_by: str = "class", visible_layers=None,
     active = "ratio" if color_by == "log-ratio" and ratios is not None else "class"
     mode = Div(text=active, visible=False, name="qv-mode")
     # One coverage scale for both marginals, as in report_plot: equal coverage is
-    # equally long on either, so the two candidates compare at a glance.
-    peak = max([float(np.max(c.total())) for c in (rd.cov1, rd.cov2) if len(c.bins)] + [1.0])
+    # equally long on either, so the two candidates compare at a glance. The scale
+    # follows the zoom: the peak of what is in view (`_wire_rebin`).
     cov_top = coverage_figure(rd, rd.asm2, "x", width=w, size=margin_size,
-                              stackings=stackings, active=active, value_max=peak)
+                              stackings=stackings, active=active)
     cov_right = coverage_figure(rd, rd.asm1, "y", width=w, height=h, size=margin_size,
-                                stackings=stackings, active=active, value_max=peak)
+                                stackings=stackings, active=active)
+    peak = max([float(np.max(hit_renderer(f).data_source.data["total"], initial=0.0))
+                for f in (cov_top, cov_right)]) or 1.0
+    for f in (cov_top, cov_right):
+        src = hit_renderer(f).data_source
+        src.data["top"] = np.full(len(src.data["left"]), peak)
     shared = Range1d(0, peak, bounds=(0, peak))
     cov_top.y_range = shared
     cov_right.x_range = shared
@@ -995,9 +1127,13 @@ def report_layout(rd, color_by: str = "class", visible_layers=None,
     cov_right.name = rd.asm1
     status = Div(text="", styles={"font-family": "monospace", "font-size": "12px",
                                   "padding": "0 0 4px 0"})
-    _link_bins_to_reads(rd, cov_top, rd.cov2, cov_right, rd.cov1, main, status, "x", stackings, mode)
-    _link_bins_to_reads(rd, cov_right, rd.cov1, cov_top, rd.cov2, main, status, "y", stackings, mode)
-    _link_reads_to_bins(rd, main, [(cov_top, rd.cov2), (cov_right, rd.cov1)])
+    reads = _reads_source(rd, stackings)
+    mx = _marginal_model(rd, cov_top, rd.asm2, "x")
+    my = _marginal_model(rd, cov_right, rd.asm1, "y")
+    _link_bins_to_reads(rd, cov_top, mx, my, main, status, "x", reads, stackings, mode)
+    _link_bins_to_reads(rd, cov_right, my, mx, main, status, "y", reads, stackings, mode)
+    _link_reads_to_bins(main, [mx, my], reads)
+    _wire_rebin(rd, main, shared, line_renderer(main).data_source, [mx, my], reads)
     readout = _coordinate_readout(rd, main)
 
     corner = Spacer(width=BAR_SIZE, height=margin_size, tags=["qv:corner"])

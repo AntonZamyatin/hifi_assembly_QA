@@ -941,7 +941,26 @@ since it knows everything except the seeds.
 - **Marginals on one scale.** As in `report_plot`, the two coverage marginals
   are the same size and share one coverage range, 0 to the larger of their two
   peaks (one `Range1d`, so zooming one zooms the other): equal coverage is
-  equally long on either, and the candidates compare at a glance.
+  equally long on either, and the candidates compare at a glance. The peak is
+  of what is in view, so the scale follows the zoom.
+- **Marginals rebinned on zoom.** The view carries each read's best placements
+  as intervals on each axis (`RegionData.placements`), and the page bins them
+  afresh for the range in view on every zoom or pan, at most once a frame
+  (`glyphs.REBIN_JS`): about 1000 bins across the view, the bin size rounded up
+  to 1, 2 or 5 x 10^k bp, never below 1 bp, bins restarting at each segment.
+  A placement adds its weight to every bin it touches, by a difference array per
+  band, so a rebin is one pass over the placements -- about 11 ms for both
+  marginals on 200,000 placements; the dotplot's redraw costs far more. As bins
+  shrink a bar tends from "reads touching the bin" to depth. A hovered bin finds
+  its reads by scanning the placements, a selected read its bins by binary search,
+  so neither needs a stored bin index. `region.marginal_bins` is the Python twin,
+  drawing the first frame; `tests/test_rebin.py` runs both and checks them against
+  the server's fixed-size bins. The `binsize` control now sets only the stretch
+  a shift+click aligns.
+- **Coverage dropouts.** Each marginal marks in thin red every stretch of a
+  segment that no read's best placement covers (`region.coverage_gaps`), exact
+  to the bp and drawn at least a pixel wide, so a dropout narrower than a bin
+  still shows when zoomed out.
 - **Resizing by the borders.** Four handles on panel borders resize panels in
   place -- sizes set on the page (`applySizes`, finding panels by their `qv:`
   tags), no new view: the dotplot's right border sets its width and its bottom

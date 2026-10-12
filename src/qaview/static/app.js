@@ -1012,14 +1012,9 @@ function wireRects() {
 // ---- shift+drag a rectangle on the dotplot -----------------------------------------
 
 function dotplotView() {
-  if (!window.Bokeh) return null;
-  const views = [];
-  const walk = (v) => { if (!v) return; views.push(v); for (const c of (v.child_views || [])) walk(c); };
-  for (const v of Object.values(Bokeh.index)) walk(v);
-  // The dotplot is the figure owning the wheel zoom. The grid shows the same
-  // toolbar at its edge, so match figures only (they have a canvas view).
-  return views.find((v) => v.canvas_view && v.model && v.model.toolbar &&
-    v.model.toolbar.tools.some((t) => t.constructor.__name__ === "WheelZoomTool")) || null;
+  const main = (reportPanels()["qv:main"] || [])[0];
+  const v = main && findView(main);
+  return v && v.canvas_view ? v : null;
 }
 
 function wireRectAlign() {

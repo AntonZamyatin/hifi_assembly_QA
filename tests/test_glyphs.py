@@ -25,7 +25,9 @@ from fixtures import make_region_data
 from qaview.glyphs import (
     BAR_SIZE, MAIN_WIDTH, MARGIN_SIZE, contig_bar_figure, contig_colors,
     END_MARK, contig_end_marks, coverage_figure, dotplot_figure, fit_main, main_height, report_layout, save_html,
+    hit_renderer,
 )
+from qaview.region import marginal_bins
 
 _failures = []
 
@@ -151,22 +153,23 @@ def test_coverage_areas_stack(tmp):
     rd = make_region_data(tmp, "cq")
     p = coverage_figure(rd, rd.asm1, "y")
     n_series = len(rd.bucket_keys) + 1
-    # + 1 for the invisible per-bin hover target appended last.
-    check(len(p.renderers) == n_series + 1,
-          f"expected {n_series} stacked areas + 1 hit layer, got {len(p.renderers)}")
-    check(abs(p.x_range.end - float(rd.cov1.total().max())) < 1e-9,
-          f"value axis {p.x_range.end} should reach max total {rd.cov1.total().max()}")
+    # + the dropout marks and the invisible per-bin hover target, appended last.
+    check(len(p.renderers) == n_series + 2,
+          f"expected {n_series} stacked areas + dropouts + hit layer, got {len(p.renderers)}")
+    total = hit_renderer(p).data_source.data["total"]
+    check(abs(p.x_range.end - float(total.max())) < 1e-9,
+          f"value axis {p.x_range.end} should reach max total {total.max()}")
 
     # Each bin contributes both its edges, so the area steps instead of interpolating.
-    left, right = rd.bin_edges(rd.asm1)
-    expected = [v for pair in zip(left, right) for v in pair]
-    data = p.renderers[-2].data_source.data
-    check(list(data["y"]) == expected,
-          f"area must step on exact-bp bin edges; got {list(data['y'])[:6]}...")
+    b = marginal_bins(rd.asm1_segs_info, rd.placements[rd.asm1], [0] * len(rd.read_names), 1,
+                      0, rd.plot_h)
+    expected = [v for pair in zip(b["left"], b["right"]) for v in pair]
+    data = p.renderers[-3].data_source.data
+    check(list(data["e"]) == expected,
+          f"area must step on exact-bp bin edges; got {list(data['e'])[:6]}...")
 
     # Top of the last stacked area is the total coverage, doubled per bin.
-    total = rd.cov1.total()
-    check([round(v, 9) for v in data["x2"][0::2]] == [round(v, 9) for v in total],
+    check([round(v, 9) for v in data["hi"][0::2]] == [round(v, 9) for v in b["series"][0]],
           "top of the stack must equal summed coverage")
 
 
@@ -175,7 +178,7 @@ def test_coverage_has_no_bin_borders(tmp):
     rd = make_region_data(tmp, "nb")
     for orient, asm in (("x", rd.asm2), ("y", rd.asm1)):
         p = coverage_figure(rd, asm, orient)
-        for r in p.renderers[:-1]:                     # skip the invisible hit layer
+        for r in p.renderers[:-2]:                     # skip the dropouts and hit layer
             g = r.glyph
             check(getattr(g, "line_alpha", 0) in (0, None) or
                   getattr(g, "line_color", None) is None,
@@ -277,15 +280,14 @@ def test_marginals_share_one_scale(tmp):
     rd = make_region_data(tmp, "ms")
     p = _panels(report_layout(rd))
     top, right = p["cov_top"], p["cov_right"]
-    peak = max(float(np.max(rd.cov1.total())), float(np.max(rd.cov2.total())))
+    peak = max(float(np.max(hit_renderer(f).data_source.data["total"])) for f in (top, right))
     check(top.y_range is right.x_range, "one range object: zoom one, the other follows")
     check(abs(top.y_range.end - peak) < 1e-9 and top.y_range.start == 0,
           f"from 0 to the larger peak: {top.y_range.end} vs {peak}")
     check(top.height == right.width, f"same size: {top.height} vs {right.width}")
     for name in ("cov_top", "cov_right"):
-        hit = p[name].renderers[-1].glyph
-        reach = hit.top if name == "cov_top" else hit.right
-        check(abs(reach - peak) < 1e-9, f"{name}: the hover target reaches the shared top ({reach})")
+        src = p[name].renderers[-1].data_source.data
+        check(np.allclose(src["top"], peak), f"{name}: the hover target reaches the shared top")
 
 
 def main():

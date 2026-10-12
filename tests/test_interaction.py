@@ -93,13 +93,14 @@ def test_hit_layer_present_and_invisible(tmp):
     for orient, asm in (("x", rd.asm2), ("y", rd.asm1)):
         p = coverage_figure(rd, asm, orient)
         hit = hit_renderer(p)
-        cov = rd.cov1 if asm == rd.asm1 else rd.cov2
-        check(len(hit.data_source.data["bin_index"]) == len(cov.bins),
+        n_bins = len(p.renderers[0].data_source.data["e"]) // 2
+        check(len(hit.data_source.data["left"]) == n_bins,
               f"{orient}: hit layer must have one quad per bin")
         check(hit.glyph.fill_alpha == 0.0, f"{orient}: hit layer must be invisible")
         check(hit.selection_glyph is not None and hit.selection_glyph.fill_alpha > 0,
               f"{orient}: selected bins must become visible")
-        check(list(hit.data_source.data["contig"]) == list(cov.bin_contig),
+        data = hit.data_source.data
+        check(all(c and e > s0 for c, s0, e in zip(data["contig"], data["bin_start"], data["bin_end"])),
               f"{orient}: hit layer bins must carry genomic identity for the tooltip")
 
 
@@ -124,7 +125,7 @@ def test_hover_tools_wired(tmp):
         check(isinstance(hovers[0].callback, CustomJS),
               f"{name} hover must carry the bin->read callback")
         args = hovers[0].callback.args
-        for key in ("lines", "hit", "bin_off", "bin_reads", "read_off", "read_lines"):
+        for key in ("lines", "M", "O", "reads", "read_off", "read_lines"):
             check(key in args, f"{name} callback missing arg {key}")
 
 
@@ -155,7 +156,7 @@ def test_reverse_link_registered(tmp):
     check(len(cbs) == 1, f"expected one read->bin callback, got {len(cbs)}")
     if cbs:
         args = cbs[0].args
-        check("hit0" in args and "hit1" in args,
+        check(len(args["margs"]) == 2,
               "read->bin callback must reach both coverage panels")
 
 
@@ -197,11 +198,9 @@ def test_hover_links_both_panels(tmp):
     for name, partner in (("cov_top", "cov_right"), ("cov_right", "cov_top")):
         hover = next(t for t in p[name].tools if isinstance(t, HoverTool))
         args = hover.callback.args
-        for key in ("other", "other_g2l", "other_off", "other_bins"):
-            check(key in args, f"{name} hover missing {key} for the partner panel")
-        check(args["other"] is hit_renderer(p[partner]).data_source,
+        check(args["O"]["hit"] is hit_renderer(p[partner]).data_source,
               f"{name} must target {partner}'s hit layer")
-        check(args["hit"] is hit_renderer(p[name]).data_source,
+        check(args["M"]["hit"] is hit_renderer(p[name]).data_source,
               f"{name} must stripe its own hovered bin")
 
 
@@ -239,19 +238,20 @@ def test_band_detection_data(tmp):
     rd = make_region_data(tmp, "band")
     n_series = len(rd.bucket_keys) + 1
 
-    for orient, asm, cov in (("x", rd.asm2, rd.cov2), ("y", rd.asm1, rd.cov1)):
+    for orient, asm in (("x", rd.asm2), ("y", rd.asm1)):
         p = coverage_figure(rd, asm, orient)
         data = hit_renderer(p).data_source.data
+        n_bins = len(data["left"])
         for s in range(n_series):
             check(f"cum_class_{s}" in data, f"{orient}: missing band top cum_class_{s}")
-            check(len(data[f"cum_class_{s}"]) == len(cov.bins),
+            check(len(data[f"cum_class_{s}"]) == n_bins,
                   f"{orient}: cum_class_{s} must have one value per bin")
         # Bands must be non-decreasing and end at the total.
-        for i in range(len(cov.bins)):
+        for i in range(n_bins):
             tops = [data[f"cum_class_{s}"][i] for s in range(n_series)]
             check(tops == sorted(tops), f"{orient}: bin {i} band tops not monotonic: {tops}")
         check([round(v, 9) for v in data[f"cum_class_{n_series - 1}"]] ==
-              [round(v, 9) for v in cov.total()],
+              [round(v, 9) for v in data["total"]],
               f"{orient}: last band must close at the total coverage")
 
     band = _read_bucket_index(rd)
@@ -269,7 +269,7 @@ def test_band_detection_data(tmp):
     args = next(t for t in p["cov_top"].tools if isinstance(t, HoverTool)).callback.args
     check(args["names"]["names_class"] == list(rd.bucket_keys) + ["unassigned"],
           f"band names must mirror the stack order, got {args['names']}")
-    check(list(args["bands"]["band_class"]) == band, "the read -> band map the hover uses")
+    check(list(args["reads"].data["band_class"]) == band, "the read -> band map the hover uses")
     check(args["mode"].text == "class", "unscored: the support classes are on show")
     check(args["vertical"] is True, "top marginal stacks along y, so the cursor's y picks the band")
     args_r = next(t for t in p["cov_right"].tools if isinstance(t, HoverTool)).callback.args

@@ -108,6 +108,28 @@ class ReadLines:
 
 
 @dataclass
+class Placements:
+    """Each read's best placements in one assembly, as intervals on its axis.
+
+    One row per (placement, displayed segment it overlaps): [p0, p1) in plot
+    coordinates, weight 1/n (n placements genome-wide), the read's index into
+    `RegionData.read_names`, and the segment's index into the axis map. Rows are
+    sorted by read, so read g's rows are `first[g]:last[g]`. The marginals bin these
+    afresh for whatever range is in view (`marginal_bins`, glyphs' REBIN_JS).
+    """
+    p0: np.ndarray
+    p1: np.ndarray
+    w: np.ndarray
+    read: np.ndarray
+    seg: np.ndarray
+    first: np.ndarray
+    last: np.ndarray
+
+    def __len__(self) -> int:
+        return len(self.p0)
+
+
+@dataclass
 class RegionData:
     """One recruited region, reduced to arrays."""
     asm1: str
@@ -131,6 +153,8 @@ class RegionData:
     n_partial: int = 0
     # large indels on those rows, shown with them: x, y, read (index), text
     indels: dict = field(default_factory=dict)
+    # assembly -> Placements: what the marginals are binned from, at any bin size
+    placements: dict = field(default_factory=dict)
 
     def segs_info(self, assembly: str) -> list:
         if assembly == self.asm1:
@@ -251,7 +275,9 @@ class RegionData:
                    cov1=cov1, cov2=cov2, bucket_keys=list(SUPPORT_BUCKET_KEYS),
                    contig_lengths={asm1: _contig_lengths(asm1_bam, asm1_segs),
                                    asm2: _contig_lengths(asm2_bam, asm2_segs)},
-                   n_partial=n_partial, indels=indels)
+                   n_partial=n_partial, indels=indels,
+                   placements={asm1: _placements(best[asm1], asm1_segs_info, read_pos),
+                               asm2: _placements(best[asm2], asm2_segs_info, read_pos)})
 
 
 def _contig_lengths(bam_path: str, segs) -> dict:
@@ -527,6 +553,115 @@ def _coverage_at_best(best: dict, segments: list, binsize: int, read_buckets) ->
     return CoverageBins(bins=bins, bucket_bins=bucket_bins, bin_contig=bin_contig,
                         bin_start=bin_start, bin_end=bin_end, bin_offsets=bin_offsets,
                         read_idx=read_idx, read_names=read_names, read_w=read_w)
+
+
+def _placements(best: dict, segs_info: list, read_pos: dict) -> Placements:
+    """`Placements` from `_best_by_read` output: the same reads and weights
+    `_coverage_at_best` bins, kept as intervals instead of bins."""
+    by_contig: dict = {}
+    for k, (contig, s, e, off) in enumerate(segs_info):
+        by_contig.setdefault(contig, []).append((s, e, off, k))
+    rows = []
+    for rn, (kept, n) in best.items():
+        g = read_pos.get(rn)
+        if not n or g is None:
+            continue
+        for b in kept:
+            for s0, s1, off, k in by_contig.get(b[1], ()):
+                lo, hi = max(b[2], s0), min(b[3], s1)
+                if lo < hi:
+                    rows.append((g, off + lo - s0, off + hi - s0, 1.0 / n, k))
+    rows.sort()
+    a = np.array(rows, dtype=float).reshape(-1, 5)
+    read = a[:, 0].astype(np.int32)
+    n_reads = len(read_pos)
+    return Placements(p0=a[:, 1], p1=a[:, 2], w=a[:, 3], read=read, seg=a[:, 4].astype(np.int32),
+                      first=np.searchsorted(read, np.arange(n_reads), "left").astype(np.int32),
+                      last=np.searchsorted(read, np.arange(n_reads), "right").astype(np.int32))
+
+
+MARGIN_BINS = 1000          # bins across the marginal's visible span
+
+
+def nice_bin(span: float, target: int = MARGIN_BINS) -> int:
+    """The bin size for a visible `span`: span/target rounded up to 1, 2 or 5 x 10^k
+    bp, never below 1. Integer steps, so glyphs' REBIN_JS picks the same size."""
+    raw = span / target
+    if raw <= 1:
+        return 1
+    mag = 1
+    while mag * 10 <= raw:
+        mag *= 10
+    return next(f * mag for f in (1, 2, 5, 10) if f * mag >= raw)
+
+
+def coverage_gaps(segs_info: list, pl: Placements) -> tuple:
+    """(left, right) on the axis of every stretch of a segment no placement covers:
+    the coverage dropouts, exact to the bp whatever the bin size."""
+    order = np.lexsort((pl.p0, pl.seg))
+    left, right = [], []
+    for k, (_, s, e, off) in enumerate(segs_info):
+        reach = off                       # covered up to here
+        for i in order[np.searchsorted(pl.seg[order], k, "left"):
+                       np.searchsorted(pl.seg[order], k, "right")]:
+            if pl.p0[i] > reach:
+                left.append(reach)
+                right.append(pl.p0[i])
+            reach = max(reach, pl.p1[i])
+        if off + (e - s) > reach:
+            left.append(reach)
+            right.append(off + (e - s))
+    return np.array(left, float), np.array(right, float)
+
+
+def marginal_bins(segs_info: list, pl: Placements, bands, n_bands: int,
+                  a: float, b: float, binsize: int | None = None) -> dict:
+    """Bin `pl` over the axis range [a, b]: each row adds its weight to every bin it
+    touches, in band `bands[read]`. Bins restart at each segment's start, the last of
+    a segment cut short, as `_coverage_at_best` lays them out; only bins meeting
+    [a, b] are made. The Python twin of glyphs' REBIN_JS, which redoes this in the
+    page on every zoom; it draws the first frame.
+
+    Returns left/right (axis), seg, contig, bin_start/bin_end (genome) per bin, and
+    `series`: n_bands rows of per-bin values.
+    """
+    binsize = binsize or nice_bin(b - a)
+    left, right, segk, contig, gs, ge, base = [], [], [], [], [], [], {}
+    for k, (c, s, e, off) in enumerate(segs_info):
+        n = math.ceil((e - s) / binsize)
+        if off >= b or off + (e - s) <= a:
+            continue
+        j0, j1 = max(0, math.floor((a - off) / binsize)), min(n, math.ceil((b - off) / binsize))
+        base[k] = (len(left) - j0, j0, j1)
+        for j in range(j0, j1):
+            l = j * binsize
+            left.append(off + l)
+            right.append(off + min(e - s, l + binsize))
+            segk.append(k)
+            contig.append(c)
+            gs.append(s + l)
+            ge.append(s + min(e - s, l + binsize))
+    nseg = len(segs_info)
+    b0 = np.zeros(nseg, np.int64)
+    j0 = np.zeros(nseg, np.int64)
+    j1 = np.zeros(nseg, np.int64)          # j0 == j1: no bins, nothing lands
+    offs = np.array([si[3] for si in segs_info], float).reshape(-1)
+    for k, (x0, x1, x2) in base.items():
+        b0[k], j0[k], j1[k] = x0, x1, x2
+    sg = np.asarray(pl.seg, np.int64)
+    lo = np.maximum(j0[sg], np.floor((pl.p0 - offs[sg]) / binsize).astype(np.int64))
+    hi = np.minimum(j1[sg], np.ceil((pl.p1 - offs[sg]) / binsize).astype(np.int64))
+    keep = lo < hi
+    band = np.asarray(bands, np.int64)[pl.read[keep]]
+    diff = np.zeros((n_bands, len(left) + 1))
+    np.add.at(diff, (band, (b0[sg] + lo)[keep]), pl.w[keep])
+    np.add.at(diff, (band, (b0[sg] + hi)[keep]), -pl.w[keep])
+    series = np.cumsum(diff, axis=1)[:, :-1]
+    series[np.abs(series) < 1e-9] = 0.0      # what the running sums leave of an empty bin
+    return dict(left=np.array(left, float), right=np.array(right, float),
+                seg=np.array(segk, np.int32), contig=contig,
+                bin_start=np.array(gs, np.int64), bin_end=np.array(ge, np.int64),
+                series=series, binsize=binsize)
 
 
 def _compute_lines(best, read_names, read_pos,
