@@ -100,23 +100,28 @@ def all_meta(output_dir: str) -> list[dict]:
     return out
 
 
-def place(metas: list[dict], segs_info1: list, segs_info2: list, asm1: str, asm2: str) -> list:
+def place(metas: list[dict], segs_info1: list, segs_info2: list, asm1: str, asm2: str,
+          flips1=None, flips2=None) -> list:
     """Plot rectangles for the snapshots whose stretches lie in this locus's layout.
 
     asm2 is the x axis and asm1 the y axis; `segs_info` rows are (contig, start,
-    end, offset). A stretch overlapping a segment is clipped to it.
+    end, offset), `flips` flag segments drawn backwards. A stretch overlapping a
+    segment is clipped to it.
     """
-    def span(segs_info, iv):
-        for contig, s, e, off in segs_info:
+    def span(segs_info, flips, iv):
+        for k, (contig, s, e, off) in enumerate(segs_info):
             if contig == iv["contig"] and iv["start"] < e and iv["end"] > s:
-                return off + max(iv["start"], s) - s, off + min(iv["end"], e) - s
+                lo, hi = max(iv["start"], s), min(iv["end"], e)
+                if flips and flips[k]:
+                    return off + e - hi, off + e - lo
+                return off + lo - s, off + hi - s
         return None
 
     out = []
     for m in metas:
         if m["top"]["assembly"] != asm1 or m["bottom"]["assembly"] != asm2:
             continue
-        y, x = span(segs_info1, m["top"]), span(segs_info2, m["bottom"])
+        y, x = span(segs_info1, flips1, m["top"]), span(segs_info2, flips2, m["bottom"])
         if x and y:
             out.append({"id": m["id"], "note": m["note"], "created": m["created"],
                         "x0": x[0], "x1": x[1], "y0": y[0], "y1": y[1]})

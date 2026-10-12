@@ -13,12 +13,12 @@ each renderer can build its own mapping — see `docs/qaview.md` §5.
 
 import math
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 import pysam
 
-from qatool.plotters.axis import _build_axis_map, plot_to_genome
+from qatool.plotters.axis import _build_axis_map
 from qatool.plotters.classify import _classify_reads_for_support_colors
 from qatool.plotters.colors import BEST_PID_DELTA_DEFAULT, PID_TIE_EPS_DEFAULT
 from qatool.plotters.coverage import CoverageBins
@@ -155,6 +155,9 @@ class RegionData:
     indels: dict = field(default_factory=dict)
     # assembly -> Placements: what the marginals are binned from, at any bin size
     placements: dict = field(default_factory=dict)
+    # assembly -> one flag per segs_info row: the segment runs backwards along the
+    # axis (`arrange`); missing means none does
+    flips: dict = field(default_factory=dict)
 
     def segs_info(self, assembly: str) -> list:
         if assembly == self.asm1:
@@ -163,9 +166,16 @@ class RegionData:
             return self.asm2_segs_info
         raise ValueError(f"unknown assembly {assembly!r}")
 
+    def flips_of(self, assembly: str) -> list:
+        """Per segs_info row: is that segment drawn backwards?"""
+        return list(self.flips.get(assembly) or [False] * len(self.segs_info(assembly)))
+
     def genome_at(self, assembly: str, pos: float):
         """Plot coordinate -> (contig, genomic position) for the crosshair readout."""
-        return plot_to_genome(self.segs_info(assembly), pos)
+        for (contig, start, end, off), f in zip(self.segs_info(assembly), self.flips_of(assembly)):
+            if off <= pos < off + (end - start):
+                return contig, (end - 1 - int(pos - off)) if f else start + int(pos - off)
+        return None
 
     def bin_edges(self, assembly: str) -> tuple:
         """Exact-bp (left, right) edges for each coverage bin of `assembly`.
@@ -615,7 +625,7 @@ def coverage_gaps(segs_info: list, pl: Placements) -> tuple:
 
 
 def marginal_bins(segs_info: list, pl: Placements, bands, n_bands: int,
-                  a: float, b: float, binsize: int | None = None) -> dict:
+                  a: float, b: float, binsize: int | None = None, flips=None) -> dict:
     """Bin `pl` over the axis range [a, b]: each row adds its weight to every bin it
     touches, in band `bands[read]`. Bins restart at each segment's start, the last of
     a segment cut short, as `_coverage_at_best` lays them out; only bins meeting
@@ -637,10 +647,11 @@ def marginal_bins(segs_info: list, pl: Placements, bands, n_bands: int,
             l = j * binsize
             left.append(off + l)
             right.append(off + min(e - s, l + binsize))
+            r = min(e - s, l + binsize)
             segk.append(k)
             contig.append(c)
-            gs.append(s + l)
-            ge.append(s + min(e - s, l + binsize))
+            gs.append(e - r if flips and flips[k] else s + l)    # a flipped segment runs e -> s
+            ge.append(e - l if flips and flips[k] else s + r)
     nseg = len(segs_info)
     b0 = np.zeros(nseg, np.int64)
     j0 = np.zeros(nseg, np.int64)
@@ -662,6 +673,94 @@ def marginal_bins(segs_info: list, pl: Placements, bands, n_bands: int,
                 seg=np.array(segk, np.int32), contig=contig,
                 bin_start=np.array(gs, np.int64), bin_end=np.array(ge, np.int64),
                 series=series, binsize=binsize)
+
+
+def _seg_at(offs: np.ndarray, p) -> np.ndarray:
+    """Index of the segment holding axis position `p` (offsets ascending)."""
+    return np.clip(np.searchsorted(offs, p, "right") - 1, 0, max(len(offs) - 1, 0))
+
+
+def diagonal_order(rd: "RegionData", axis: str) -> tuple:
+    """(order, flips) for the segments on `axis` ("x": asm2, "y": asm1), laid along
+    the other axis so the reads run on one diagonal.
+
+    A segment's place is the weighted median, along the other axis, of the reads'
+    lines through it; it is flipped when those lines mostly run backwards. A line
+    weighs its length over the read's line count, so a repeat read with many
+    copies pulls no harder than a unique one. Partial rows do not vote. Segments
+    no line reaches go last, in their current order.
+    """
+    L = rd.lines
+    u0, u1, v0, v1 = (L.x0, L.x1, L.y0, L.y1) if axis == "x" else (L.y0, L.y1, L.x0, L.x1)
+    segs = rd.segs_info(rd.asm2 if axis == "x" else rd.asm1)
+    offs = np.array([x[3] for x in segs], float)
+    use = np.asarray(L.layer) != LAYER_PARTIAL
+    per_read = np.bincount(np.asarray(L.read_idx)[use], minlength=len(rd.read_names))
+    k = _seg_at(offs, (u0 + u1) / 2)
+    w = np.abs(u1 - u0) / np.maximum(per_read[L.read_idx], 1)
+    v = (v0 + v1) / 2
+    sign = np.sign((u1 - u0) * (v1 - v0))
+    keys, flips = [], []
+    for j in range(len(segs)):
+        m = use & (k == j) & (w > 0)
+        if not m.any():
+            keys.append((1, j))
+            flips.append(False)
+            continue
+        o = np.argsort(v[m])
+        cw = np.cumsum(w[m][o])
+        keys.append((0, float(v[m][o][np.searchsorted(cw, cw[-1] / 2)])))
+        flips.append(bool(np.sum(w[m] * sign[m]) < 0))
+    order = sorted(range(len(segs)), key=lambda j: keys[j])
+    return order, flips
+
+
+def arrange(rd: "RegionData", axis: str, order=None, flips=None) -> "RegionData":
+    """`rd` with the segments on `axis` re-laid in `order` (default: `diagonal_order`),
+    those flagged in `flips` (indexed by current segment) running backwards.
+
+    Every axis coordinate moves with its segment -- lines, placements, indel marks
+    -- so nothing is fetched again; genome coordinates are unchanged. Applies to a
+    RegionData in its built layout (no flips yet on that axis).
+    """
+    if order is None:
+        order, flips = diagonal_order(rd, axis)
+    asm = rd.asm2 if axis == "x" else rd.asm1
+    segs = rd.segs_info(asm)
+    old_off = np.array([x[3] for x in segs], float)
+    length = np.array([x[2] - x[1] for x in segs], float)
+    flip = np.array(flips if flips is not None else [False] * len(segs), bool)
+    new_off = np.zeros(len(segs))
+    new_off[order] = np.concatenate([[0], np.cumsum(length[order])[:-1]]) if len(segs) else []
+    pos_of = np.empty(len(segs), np.int32)
+    pos_of[order] = np.arange(len(segs), dtype=np.int32)
+
+    def move(p, k):
+        rel = np.asarray(p, float) - old_off[k]
+        return new_off[k] + np.where(flip[k], length[k] - rel, rel)
+
+    L = rd.lines
+    a0, a1 = (L.x0, L.x1) if axis == "x" else (L.y0, L.y1)
+    k = _seg_at(old_off, (np.asarray(a0) + np.asarray(a1)) / 2)
+    moved = dict(zip(("x0", "x1") if axis == "x" else ("y0", "y1"), (move(a0, k), move(a1, k))))
+    lines = replace(L, **moved)
+
+    pl = rd.placements[asm]
+    sk = np.asarray(pl.seg, np.int64)
+    q0, q1 = move(pl.p0, sk), move(pl.p1, sk)
+    placements = {**rd.placements, asm: replace(pl, p0=np.minimum(q0, q1), p1=np.maximum(q0, q1),
+                                                seg=pos_of[sk])}
+    indels = dict(rd.indels)
+    key = "x" if axis == "x" else "y"
+    if len(indels.get(key, [])):
+        pts = np.asarray(indels[key], float)
+        indels[key] = move(pts, _seg_at(old_off, pts))
+
+    new_segs = [(c, s0, e0, int(new_off[j])) for j in order for c, s0, e0, _ in [segs[j]]]
+    field_name = "asm2_segs_info" if axis == "x" else "asm1_segs_info"
+    return replace(rd, lines=lines, placements=placements, indels=indels,
+                   flips={**rd.flips, asm: [bool(flip[j]) for j in order]},
+                   **{field_name: new_segs})
 
 
 def _compute_lines(best, read_names, read_pos,

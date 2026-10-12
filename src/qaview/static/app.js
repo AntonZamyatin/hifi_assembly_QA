@@ -246,7 +246,7 @@ function params() {
     pid: $("#pid").value, plen: $("#plen").value, supp_plen: $("#supp_plen").value,
     partial_pid: $("#partial_pid").value, min_indel: $("#min_indel").value,
     best_pid_delta: $("#best_pid_delta").value, pid_tie_eps: $("#pid_tie_eps").value,
-    binsize: $("#binsize").value || 0,
+    binsize: $("#binsize").value || 0, sort: $("#sort").value,
     color_by: $("#color_by .on").dataset.v, C: $("#C").value, layers: layers.join(","),
     reads: $("#reads_mode .on").dataset.v, background: $("#background").checked,
   });
@@ -308,7 +308,6 @@ async function openLocus(id, keepMsg = false) {
   clearAlignment();
   clearPlot();
   state.rects = [];
-  loadRects(id);
   loadRecruitSeeds(id);
   loadView();
 }
@@ -367,7 +366,7 @@ async function loadView() {
   else requestAnimationFrame(() => requestAnimationFrame(placeHandles));
   restyle();                               // controls changed while it was loading
   renderBackgroundStatus(d.background);
-  drawRects();
+  loadRects(id);                           // placed in this view's layout (it may be sorted)
 }
 
 // ---- restyling on the page ----------------------------------------------------------
@@ -871,7 +870,7 @@ function toggleReads() {
 
 async function loadRects(id) {
   try {
-    const res = await fetch(`/api/loci/${id}/remembered`);
+    const res = await fetch(`/api/loci/${id}/remembered?${params()}`);
     if (!res.ok || id !== state.current) return;
     state.rects = await res.json();
     drawRects();
@@ -964,7 +963,8 @@ async function toggleRemember() {
       const res = await fetch("/api/remembered", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ lid: state.current, alignment: state.lastAlignment,
-                               note: $("#remember-note").value, settings: state.lastSettings || {} }),
+                               note: $("#remember-note").value, settings: state.lastSettings || {},
+                               view: Object.fromEntries(params()) }),
       });
       if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
       const meta = await res.json();
@@ -1095,7 +1095,7 @@ function wire() {
   // Thresholds and bin size change the reads drawn: a new view from the server.
   // Everything else is restyled on the page.
   for (const id of ["pid", "plen", "supp_plen", "partial_pid", "min_indel", "best_pid_delta",
-                    "pid_tie_eps", "binsize"]) {
+                    "pid_tie_eps", "binsize", "sort"]) {
     $(`#${id}`).addEventListener("change", scheduleView);
   }
   $("#C").addEventListener("change", restyle);

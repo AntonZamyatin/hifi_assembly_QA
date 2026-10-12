@@ -95,6 +95,11 @@
           <label>pid_tie_eps <input id="pid_tie_eps" type="number" step="0.0001" min="0" value="0.0001"></label>
           <div id="tie-warning" class="warn small" hidden>pid_tie_eps &ge; best_pid_delta: no read can be called asm1_best or asm2_best.</div>
           <label>binsize <input id="binsize" type="number" step="100" min="0" value="0" title="0 = auto"></label>
+          <label title="lay one axis's segments along the other's diagonal, by where the reads through each land; a segment the reads run backwards on is flipped (its coordinates then read downwards, marked rev)">sort <select id="sort">
+            <option value="">as built</option>
+            <option value="y">Y along X</option>
+            <option value="x">X along Y</option>
+          </select></label>
           <div class="field">
             <span>colour by</span>
             <div class="segmented" id="color_by">

@@ -21,7 +21,7 @@ import numpy as np
 from fixtures import make_region_data
 
 from qaview.glyphs import REBIN_JS, class_stacking
-from qaview.region import MARGIN_BINS, Placements, coverage_gaps, marginal_bins, nice_bin
+from qaview.region import MARGIN_BINS, Placements, arrange, coverage_gaps, marginal_bins, nice_bin
 
 _failures = []
 
@@ -73,7 +73,8 @@ def _js(rd, a, b, gs):
         iv=dict(p0=pl.p0.tolist(), p1=pl.p1.tolist(), w=pl.w.tolist(),
                 read=pl.read.tolist(), seg=pl.seg.tolist()),
         segs=dict(off=[x[3] for x in segs], len=[x[2] - x[1] for x in segs],
-                  contig=[x[0] for x in segs], start=[x[1] for x in segs]),
+                  contig=[x[0] for x in segs], start=[x[1] for x in segs],
+                  flip=[int(f) for f in rd.flips_of(rd.asm1)]),
         reads=dict(band_class=list(st.read_band), first_y=pl.first.tolist(), last_y=pl.last.tolist()),
         n=len(st.keys), a=a, b=b, gs=gs, target=MARGIN_BINS)
     script = REBIN_JS + """
@@ -85,6 +86,7 @@ def _js(rd, a, b, gs):
     const peak = qvRebin(M, reads, D.a, D.b, D.target);
     M.hit.data = M.next;
     const out = {peak, left: Array.from(M.next.left), seg: Array.from(M.next.seg),
+                 bin_start: M.next.bin_start, bin_end: M.next.bin_end,
                  tops: [], bins: qvBinsOf(M, reads, new Set(D.gs)).sort((x, y) => x - y)};
     for (let i = 0; i < D.n; i++) out.tops.push(Array.from(M.next["cum_class_" + i]));
     process.stdout.write(JSON.stringify(out));
@@ -98,12 +100,22 @@ def test_js_matches_python(tmp):
     if shutil.which("node") is None:
         print("  (skipped: no node)")
         return
-    rd = make_region_data(tmp, "js")
+    rd0 = make_region_data(tmp, "js")
+    n = len(rd0.asm1_segs_info)
+    # as built, and reversed with every segment flipped (region.arrange)
+    for rd in (rd0, arrange(rd0, "y", list(range(n))[::-1], [True] * n)):
+        _js_matches(rd)
+
+
+def _js_matches(rd):
     st = class_stacking(rd)
     pl = rd.placements[rd.asm1]
     for a, b in ((0, rd.plot_h), (1234.5, 3456.7), (2999, 3001), (rd.plot_h - 700, rd.plot_h)):
         got = _js(rd, a, b, [int(pl.read[0])])
-        ref = marginal_bins(rd.asm1_segs_info, pl, st.read_band, len(st.keys), a, b)
+        ref = marginal_bins(rd.asm1_segs_info, pl, st.read_band, len(st.keys), a, b,
+                            flips=rd.flips_of(rd.asm1))
+        check(got["bin_start"] == list(ref["bin_start"]) and got["bin_end"] == list(ref["bin_end"]),
+              f"[{a}, {b}]: bins' genome coordinates differ")
         tops = np.cumsum(ref["series"], axis=0)
         check(got["left"] == list(ref["left"]), f"[{a}, {b}]: bin edges differ")
         check(got["seg"] == list(ref["seg"]), f"[{a}, {b}]: bin segments differ")

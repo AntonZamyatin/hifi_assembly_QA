@@ -298,7 +298,7 @@ def test_coordinate_readout(tmp):
               "readout needs both axis maps to convert plot -> genome")
         # The JS lookup must mirror plot_to_genome, including its segment bounds.
         check([list(s) for s in args["ysegs"]] ==
-              [[c, s, e, o] for c, s, e, o in rd.asm1_segs_info],
+              [[c, s, e, o, False] for c, s, e, o in rd.asm1_segs_info],
               "ysegs must match asm1_segs_info exactly")
 
 

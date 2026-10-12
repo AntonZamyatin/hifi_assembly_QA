@@ -57,14 +57,14 @@ def revcomp(seq: str) -> str:
     return seq.translate(_COMP)[::-1]
 
 
-def span_at(segs_info, binsize: int, p0: float, p1: float):
+def span_at(segs_info, binsize: int, p0: float, p1: float, flips=None):
     """The bin-snapped genome stretch under plot interval [p0, p1] on one axis.
 
     Returns (contig, seg_start, seg_end, lo, hi, gmid, clipped). Bins restart at
-    every segment, as `RegionData.bin_edges` lays them out, and a stretch never
-    leaves one segment: it is the segment under the interval's midpoint, gmid is
-    that midpoint in genome coordinates, and `clipped` says whether the interval
-    reached beyond the segment.
+    every segment's genome start, and a stretch never leaves one segment: it is
+    the segment under the interval's midpoint, gmid is that midpoint in genome
+    coordinates, and `clipped` says whether the interval reached beyond the
+    segment. `flips` flags segments drawn backwards (`region.arrange`).
     """
     p0, p1 = sorted((p0, p1))
     mid = (p0 + p1) / 2
@@ -72,11 +72,13 @@ def span_at(segs_info, binsize: int, p0: float, p1: float):
         length = end - start
         if mid < offset + length or i == len(segs_info) - 1:
             break
+    clipped = p0 < offset or p1 > offset + length
+    if flips and flips[i]:                     # axis runs end -> start here
+        p0, p1, mid = (2 * offset + length - p for p in (p1, p0, mid))
     rel0 = int(min(max(p0 - offset, 0), length - 1))
     rel1 = int(min(max(p1 - offset, 0), length - 1))
     lo = start + (rel0 // binsize) * binsize
     hi = min(end, start + (rel1 // binsize + 1) * binsize)
-    clipped = p0 < offset or p1 > offset + length
     gmid = start + int(min(max(mid - offset, 0), length - 1))
     return contig, start, end, lo, hi, gmid, clipped
 
@@ -248,8 +250,9 @@ def align_rect(rd, fasta1, fasta2, x0: float, x1: float, y0: float, y1: float) -
     `fasta1`/`fasta2` need `.fetch`. Raises ValueError for a side over MAX_SPAN.
     """
     b = rd.binsize
-    c1, _, _, lo1, hi1, _, clip1 = span_at(rd.asm1_segs_info, b, y0, y1)
-    c2, s2, e2, lo2, hi2, gx, clip2 = span_at(rd.asm2_segs_info, b, x0, x1)
+    flips = getattr(rd, "flips", None) or {}
+    c1, _, _, lo1, hi1, _, clip1 = span_at(rd.asm1_segs_info, b, y0, y1, flips.get(rd.asm1))
+    c2, s2, e2, lo2, hi2, gx, clip2 = span_at(rd.asm2_segs_info, b, x0, x1, flips.get(rd.asm2))
     for name, lo, hi in ((rd.asm1, lo1, hi1), (rd.asm2, lo2, hi2)):
         if hi - lo > MAX_SPAN:
             raise ValueError(f"the {name} side covers {hi - lo:,} bp; "

@@ -957,6 +957,20 @@ since it knows everything except the seeds.
   drawing the first frame; `tests/test_rebin.py` runs both and checks them against
   the server's fixed-size bins. The `binsize` control now sets only the stretch
   a shift+click aligns.
+- **Sorting along the diagonal.** The "sort" control lays one axis's segments
+  along the other's diagonal (`region.diagonal_order`): a segment goes where the
+  weighted median of its reads' lines lands on the other axis, each line weighing
+  its length over its read's line count (a repeat read pulls no harder than a
+  unique one; partial rows do not vote), and it is flipped when those lines
+  mostly run backwards. Segments no line reaches go last. `region.arrange` then
+  moves every axis coordinate with its segment -- lines, placements, indel marks
+  -- with no new fetch; the region is cached per sort. A flipped segment runs
+  from its end to its start: everything mapping the axis to the genome reads the
+  flags (`RegionData.flips`) -- the readout (marked "rev"), marginal bins, contig
+  end marks, the rectangle aligner, remembered rectangles (placed after the view
+  loads, in its layout) -- and the k-mer background is resampled into the new
+  layout to within one of its bins. A segment whose reads land in two places on
+  the other axis (a duplication) goes by the heavier one.
 - **Coverage dropouts.** Each marginal marks in thin red every stretch of a
   segment that no read's best placement covers (`region.coverage_gaps`), exact
   to the bp and drawn at least a pixel wide, so a dropout narrower than a bin

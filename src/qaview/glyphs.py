@@ -370,12 +370,36 @@ def hit_renderer(fig):
 BACKGROUND_COLORS = ("#c6dbef", "#08306b")
 
 
-def _draw_background(p, bg: dict, floor: float):
+def _background_index(rd, assembly: str, n: int, bs: int) -> np.ndarray:
+    """For each of an axis's n background bins in `rd`'s layout, the bin of the
+    built layout (`similarity.axis_map`) its centre comes from -- an arranged axis
+    (`region.arrange`) takes the image along, to within a bin."""
+    from qaview.similarity import axis_map
+
+    built = {(c, s, e): o for c, s, e, o in axis_map(rd.segments, assembly)}
+    segs, flips = rd.segs_info(assembly), rd.flips_of(assembly)
+    if not segs:
+        return np.arange(n)
+    offs = np.array([x[3] for x in segs], float)
+    length = np.array([x[2] - x[1] for x in segs], float)
+    base = np.array([built.get((c, s, e), o) for c, s, e, o in segs], float)
+    centre = (np.arange(n) + 0.5) * bs
+    j = np.clip(np.searchsorted(offs, centre, "right") - 1, 0, len(segs) - 1)
+    rel = np.clip(centre - offs[j], 0, length[j])
+    rel = np.where(np.asarray(flips, bool)[j], length[j] - rel, rel)
+    return np.clip(((base[j] + rel) // bs).astype(np.int64), 0, n - 1)
+
+
+def _draw_background(p, bg: dict, floor: float, rd=None):
     """The cells at or above `floor` as one image under the reads (level underlay):
     one glyph, so drawing it costs the same however many cells light up."""
     from qaview.similarity import image_rgba
 
     img = image_rgba(bg, floor, BACKGROUND_COLORS)
+    if rd is not None and rd.flips:                 # an arranged view: move the cells with it
+        bs = bg["binsize"]
+        img = img[np.ix_(_background_index(rd, rd.asm1, bg["n1"], bs),
+                         _background_index(rd, rd.asm2, bg["n2"], bs))]
     bs = bg["binsize"]
     return p.image_rgba(image=[img], x=0, y=0, dw=bg["n2"] * bs, dh=bg["n1"] * bs,
                         level="underlay", name="qv-background")
@@ -454,7 +478,7 @@ def dotplot_figure(rd, color_by: str = "class", line_alpha: float = LINE_ALPHA,
         r.glyph.line_alpha = 0.0
         r.selection_glyph.line_width = "hover_width"
     if background is not None:
-        _draw_background(p, background, floor)
+        _draw_background(p, background, floor, rd)
     _draw_indels(p, rd, lines)
     # Tapping picks reads: only the read lines answer it, not the hidden indel marks.
     for tool in p.tools:
@@ -558,7 +582,8 @@ def coverage_figure(rd, assembly: str, orientation: str,
 
     tops, bins = {}, None
     for name, st in stackings.items():
-        bins = marginal_bins(segs, rd.placements[assembly], st.read_band, len(st.keys), 0, extent)
+        bins = marginal_bins(segs, rd.placements[assembly], st.read_band, len(st.keys), 0, extent,
+                             flips=rd.flips_of(assembly))
         cum = np.cumsum(bins["series"], axis=0)
         tops[name] = list(cum)
         base = np.zeros(len(bins["left"]))
@@ -626,20 +651,24 @@ def contig_end_marks(rd, assembly: str, tol: int = CONTIG_END_TOL) -> list:
     """(plot position, direction, contig, "start" | "end", contig length, bp short)
     for each segment edge within `tol` of an end of its contig.
 
-    Direction is the way into the segment: +1 at a contig's start (the segment runs
-    on to larger positions), -1 at its end. Needs `rd.contig_lengths`; a RegionData
+    Direction is the way into the segment along the axis: +1 at a contig's start
+    (the segment runs on to larger positions), -1 at its end -- the other way
+    round on a flipped segment (`region.arrange`). Needs `rd.contig_lengths`; a RegionData
     without them (an older pickle) has no marks.
     """
     lengths = (getattr(rd, "contig_lengths", None) or {}).get(assembly, {})
     out = []
-    for contig, start, end, off in rd.segs_info(assembly):
+    for (contig, start, end, off), f in zip(rd.segs_info(assembly), rd.flips_of(assembly)):
         n = lengths.get(contig)
         if n is None:
             continue
+        lo, hi = off, off + end - start            # a flipped segment has its start at hi
         if start <= tol:
-            out.append((off, 1, contig, "start", n, max(0, start)))
+            out.append((hi, -1, contig, "start", n, max(0, start)) if f else
+                       (lo, 1, contig, "start", n, max(0, start)))
         if end >= n - tol:
-            out.append((off + end - start, -1, contig, "end", n, max(0, n - end)))
+            out.append((lo, 1, contig, "end", n, max(0, n - end)) if f else
+                       (hi, -1, contig, "end", n, max(0, n - end)))
     return out
 
 
@@ -778,9 +807,10 @@ function qvRebin(M, reads, a, b, target) {
         const j1 = Math.min(Math.ceil(len / bin), Math.ceil((b - off) / bin));
         base.set(k, [left.length - j0, j0, j1]);
         for (let j = j0; j < j1; j++) {
-            const l = j * bin, r = Math.min(len, l + bin);
-            left.push(off + l); right.push(off + r); segk.push(k);
-            contig.push(S.contig[k]); gs.push(S.start[k] + l); ge.push(S.start[k] + r);
+            const l = j * bin, r = Math.min(len, l + bin), e = S.start[k] + len;
+            left.push(off + l); right.push(off + r); segk.push(k); contig.push(S.contig[k]);
+            gs.push(S.flip[k] ? e - r : S.start[k] + l);       // a flipped segment runs e -> s
+            ge.push(S.flip[k] ? e - l : S.start[k] + r);
         }
     }
     const nb = left.length, names = Object.keys(M.areas);
@@ -863,7 +893,8 @@ def _marginal_model(rd, fig, assembly: str, axis: str) -> dict:
         segs=ColumnDataSource(dict(off=np.array([x[3] for x in segs], float),
                                    len=np.array([x[2] - x[1] for x in segs], float),
                                    contig=[x[0] for x in segs],
-                                   start=np.array([x[1] for x in segs], float))),
+                                   start=np.array([x[1] for x in segs], float),
+                                   flip=np.array(rd.flips_of(assembly), np.int8))),
         hit=hit_renderer(fig).data_source, areas=areas,
         first=f"first_{axis}", last=f"last_{axis}")
 
@@ -1000,14 +1031,17 @@ def _coordinate_readout(rd, main):
                       "padding": "2px 0 4px 0"})
     cb = CustomJS(
         args=dict(div=div,
-                  ysegs=[[c, s, e, o] for c, s, e, o in rd.asm1_segs_info],
-                  xsegs=[[c, s, e, o] for c, s, e, o in rd.asm2_segs_info],
+                  ysegs=[[c, s, e, o, f] for (c, s, e, o), f in
+                         zip(rd.asm1_segs_info, rd.flips_of(rd.asm1))],
+                  xsegs=[[c, s, e, o, f] for (c, s, e, o), f in
+                         zip(rd.asm2_segs_info, rd.flips_of(rd.asm2))],
                   a1=rd.asm1, a2=rd.asm2),
         code="""
         function loc(segs, p) {
-            for (const [c, s, e, o] of segs)
+            for (const [c, s, e, o, f] of segs)
                 if (p >= o && p < o + (e - s))
-                    return c + ':' + Math.round(s + (p - o)).toLocaleString();
+                    return c + ':' + Math.round(f ? e - 1 - (p - o) : s + (p - o)).toLocaleString()
+                         + (f ? ' (rev)' : '');
             return '&mdash;';
         }
         div.text = a1 + ' ' + loc(ysegs, cb_obj.y) + ' &nbsp;|&nbsp; '
