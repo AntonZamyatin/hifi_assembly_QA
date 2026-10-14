@@ -43,6 +43,7 @@ from dataclasses import dataclass, field
 from qaview.project import Project, Seed, validate_recruitment
 
 # Bump when a recruiter change alters results, so older recruitments are redone.
+# Not bumped: segments exactly merge_gap apart now merge in either order (rare).
 RECRUIT_VERSION = 1
 # The same for the anchor extension alone, so its fixes leave legacy results be.
 # 2: reads at a seal that a merge put inside a segment are recruited.
@@ -80,9 +81,6 @@ def recruit_key(project: Project, seed: Seed, params: dict | None = None) -> str
 
 def recruit_one(job: dict) -> str:
     """Recruit one seed and pickle {"segments", "reads"} to job["out"]. Worker side."""
-    import contextlib
-    import io
-
     from qatool.SegmentStorage import Segment, SegmentCollection
     from qatool.SRRecruiter import Recruiter
 
@@ -99,8 +97,7 @@ def recruit_one(job: dict) -> str:
         out_dir=None, verbose=False,
     )
     seed = SegmentCollection([Segment(*job["seed"])])
-    with contextlib.redirect_stdout(io.StringIO()):     # the recruiter prints regardless
-        segments, reads, _ = srr.run(seed)
+    segments, reads, _ = srr.run(seed)
     tmp = f"{job['out']}.{os.getpid()}.tmp"
     with open(tmp, "wb") as fh:
         # boundary_reads: reads crossing a sealed edge, kept apart from `reads` and out

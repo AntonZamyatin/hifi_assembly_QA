@@ -19,10 +19,10 @@ License: MIT License
 import sqlite3
 import hashlib
 import pysam
-import pysam
 import pandas as pd
 import math
 import os
+import sys
 from collections import Counter
 from typing import Set, Iterable, List, Tuple, Dict
 from qatool.SegmentStorage import *
@@ -169,7 +169,7 @@ class Recruiter:
             # assert(cur_round < self.max_rounds) # TODO! raise error if max rounds exceeded
             cur_round += 1
             if cur_round > self.max_rounds:
-                print(f"max rounds ({self.max_rounds}) exseeded, stopping.")
+                print(f"max rounds ({self.max_rounds}) exceeded, stopping.", file=sys.stderr)
                 break
             self._round = cur_round
             if self.verbose: print(f"[round {cur_round} start]\tnumber of segments: {len(self.sc)}\t"+
@@ -208,7 +208,8 @@ class Recruiter:
             new_end = min(seg.end, contig_len)
             if new_start != seg.start or new_end != seg.end:
                 print(f"WARNING: seed segment {seg.assembly}:{seg.contig}:{seg.start}-{seg.end} "
-                      f"exceeds contig bounds [0, {contig_len}), clamped to {new_start}-{new_end}")
+                      f"exceeds contig bounds [0, {contig_len}), clamped to {new_start}-{new_end}",
+                      file=sys.stderr)
                 changed = True
             clamped.append(Segment(seg.assembly, seg.contig, new_start, new_end))
         if changed:
@@ -309,7 +310,8 @@ class Recruiter:
             else:
                 uncommon_reads.add(aln.query_name)
         if len(common_reads) > self.extension_k or not uncommon_reads:
-            print("SEALED", asm, contig, w_start, w_end, len(common_reads))
+            if self.verbose:
+                print("SEALED", asm, contig, w_start, w_end, len(common_reads))
             return True
         return False
 
@@ -516,7 +518,8 @@ class Recruiter:
                     if candidates:
                         new_start = max(max(candidates), left_limit)
                         if new_start != start:
-                            print("LEFT_ext", seg.assembly, seg.contig, w_start, w_end)
+                            if self.verbose:
+                                print("LEFT_ext", seg.assembly, seg.contig, w_start, w_end)
                             start = new_start
                     sealed_left = True
                     break
@@ -525,7 +528,8 @@ class Recruiter:
                 if new_start == start:
                     sealed_left = True
                     break
-                print("LEFT_ext", seg.assembly, seg.contig, w_start, w_end)
+                if self.verbose:
+                    print("LEFT_ext", seg.assembly, seg.contig, w_start, w_end)
                 start = new_start
 
             # extend right
@@ -558,7 +562,8 @@ class Recruiter:
                     if candidates:
                         new_end = min(min(candidates), right_limit)
                         if new_end != end:
-                            print("RIGHT_ext", seg.assembly, seg.contig, w_start, w_end)
+                            if self.verbose:
+                                print("RIGHT_ext", seg.assembly, seg.contig, w_start, w_end)
                             end = new_end
                     sealed_right = True
                     break
@@ -567,7 +572,8 @@ class Recruiter:
                 if new_end == end:
                     sealed_right = True
                     break
-                print("RIGHT_ext", seg.assembly, seg.contig, w_start, w_end)
+                if self.verbose:
+                    print("RIGHT_ext", seg.assembly, seg.contig, w_start, w_end)
                 end = new_end
 
             updated.append((Segment(seg.assembly, seg.contig, start, end), sealed_left, sealed_right))

@@ -59,7 +59,7 @@ class SegmentCollection:
                 added = True
                 continue
             # completely after interval -> add interval
-            if seg_start >= interval_end + self.merge_gap:
+            if seg_start > interval_end + self.merge_gap:
                 new_segment_list.append(interval)
                 continue
             # overlap -> merge

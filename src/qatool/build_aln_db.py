@@ -1,6 +1,6 @@
 """
 Project: hifi assembly QA
-Module: bulid_aln_db.py
+Module: build_aln_db.py
 Description: 
 
 Author: Anton Zamyatin
@@ -21,8 +21,12 @@ parser.add_argument("bam", help="Path to BAM file")
 parser.add_argument("db", help="Path to output SQLite DB")
 parser.add_argument("asm", help="Assembly name")
 
+# One assembly loads in one transaction, so an interrupted load leaves none of it
+# and "the assembly has rows" means "it is loaded" (prepare_data.sh relies on it).
+# A rollback journal keeps that transaction's journal small (new pages need no
+# undo); a WAL would grow to the size of the load. WAL is restored afterwards.
 SCHEMA_SQL = """
-PRAGMA journal_mode = WAL;
+PRAGMA journal_mode = DELETE;
 PRAGMA synchronous = NORMAL;
 PRAGMA temp_store = MEMORY;
 
@@ -45,13 +49,12 @@ CREATE TABLE IF NOT EXISTS aln (
     plen        REAL,
     aln_type    TEXT NOT NULL
 );
-
--- Fast lookup by (assembly, read_name)
-CREATE INDEX IF NOT EXISTS aln_by_read ON aln(assembly, read_name);
-
--- Optional: helpful for some downstream queries
-CREATE INDEX IF NOT EXISTS aln_by_locus ON aln(assembly, contig, start, end);
 """
+# Made after the rows go in, which is faster than keeping them up to date.
+INDEX_SQL = [
+    "CREATE INDEX IF NOT EXISTS aln_by_read ON aln(assembly, read_name)",
+    "CREATE INDEX IF NOT EXISTS aln_by_locus ON aln(assembly, contig, start, end)",
+]
 
 def get_aln_type(aln: pysam.AlignedSegment) -> str:
     if aln.is_supplementary:
@@ -110,21 +113,24 @@ def build_alignment_db_from_bam(
 
                 if len(rows) >= batch_size:
                     cur.executemany(insert_sql, rows)
-                    con.commit()
                     n_written += len(rows)
                     rows.clear()
 
             if rows:
                 cur.executemany(insert_sql, rows)
-                con.commit()
                 n_written += len(rows)
                 rows.clear()
 
+        for sql in INDEX_SQL:
+            con.execute(sql)
+        con.commit()
         # Analyze helps SQLite planner
         con.execute("ANALYZE;")
         con.commit()
         print(f"[build_alignment_db_from_bam] wrote {n_written:,} rows for assembly={assembly} into {db_path}")
     finally:
+        con.rollback()      # an interrupted load's rows go
+        con.execute("PRAGMA journal_mode = WAL")
         con.close()
 
 if __name__ == "__main__":

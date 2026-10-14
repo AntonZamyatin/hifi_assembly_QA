@@ -119,6 +119,10 @@ def test_errors_are_reported():
              "seed assembly that is neither candidate"),
             (BASE + '[recruitment]\npid = 0.99\n[[seeds]]\nformat = "quast"\npath = "q.tsv"\n',
              "unknown recruitment key"),
+            (BASE + '[recruitment]\npid_threshold = "high"\n[[seeds]]\nformat = "quast"\npath = "q.tsv"\n',
+             "a recruitment value that is not a number"),
+            (BASE + '[recruitment]\nmerge_gap = -1\n[[seeds]]\nformat = "quast"\npath = "q.tsv"\n',
+             "a recruitment value out of range"),
             (BASE, "no seed sources"),
         ]:
             path = make(tmp, body)

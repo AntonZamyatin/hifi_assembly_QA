@@ -73,7 +73,7 @@ collect_reads() {
             -name "*.fasta" -o -name "*.fasta.gz" -o \
             -name "*.fastq" -o -name "*.fastq.gz" \) -print0 | sort -z)
     fi
-    [[ ${#reads[@]} -eq 0 ]] && { echo "ERROR: no reads (.fasta/.fastq/.gz) found in $READS"; exit 1; }
+    [[ ${#reads[@]} -eq 0 ]] && { echo "ERROR: no reads (.fasta/.fastq/.gz) found in $READS" >&2; exit 1; }
     echo "${reads[@]}"
 }
 
@@ -88,7 +88,9 @@ align_one() {
         return
     fi
 
-    read -ra reads <<< "$(collect_reads)"
+    local list
+    list="$(collect_reads)" || exit 1     # read <<< "$(...)" would drop the failure
+    read -ra reads <<< "$list"
 
     echo "[align] ${key}: $(echo "${reads[@]}" | xargs -n1 basename | tr '\n' ' ')"
     $MINIMAP2 -ax map-hifi -N 20 -p 0.5 --secondary=yes \

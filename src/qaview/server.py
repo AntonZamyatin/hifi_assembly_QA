@@ -69,17 +69,29 @@ class RegionCache:
         self.size = size
         self._d: OrderedDict = OrderedDict()
         self._lock = threading.Lock()
+        self._building: dict = {}      # key -> lock held while it is built
 
     def get(self, key, build):
         with self._lock:
             if key in self._d:
                 self._d.move_to_end(key)
                 return self._d[key]
-        rd = build()
-        with self._lock:
-            self._d[key] = rd
-            while len(self._d) > self.size:
-                self._d.popitem(last=False)
+            building = self._building.setdefault(key, threading.Lock())
+        # A second request for the same key waits for the first's build.
+        with building:
+            with self._lock:
+                if key in self._d:
+                    return self._d[key]
+            rd = None
+            try:
+                rd = build()
+            finally:
+                with self._lock:
+                    if rd is not None:
+                        self._d[key] = rd
+                        while len(self._d) > self.size:
+                            self._d.popitem(last=False)
+                    self._building.pop(key, None)
         return rd
 
 

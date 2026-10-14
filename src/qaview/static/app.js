@@ -588,6 +588,7 @@ function wireHandles() {
       if (vertical) ghost.style.left = `${start.left + e.clientX - start.x}px`;
       else ghost.style.top = `${start.top + e.clientY - start.y}px`;
     });
+    g.addEventListener("pointercancel", () => { start = null; ghost.hidden = true; });
     g.addEventListener("pointerup", (e) => {
       if (!start) return;
       ghost.hidden = true;

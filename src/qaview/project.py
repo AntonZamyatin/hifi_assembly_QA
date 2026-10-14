@@ -224,14 +224,10 @@ def load_project(path: str, check_files: bool = True) -> Project:
     if library not in (asm1.name, asm2.name):
         raise ProjectError(f"[data] library_assembly '{library}' is neither candidate")
 
-    unknown = set(t.get("recruitment", {})) - set(RECRUITMENT_DEFAULTS)
-    if unknown:
-        raise ProjectError(f"[recruitment] unknown keys: {', '.join(sorted(unknown))}")
-    recruitment = {**RECRUITMENT_DEFAULTS, **t.get("recruitment", {})}
-    for k, names in RECRUITMENT_CHOICES.items():
-        if recruitment[k] not in names:
-            raise ProjectError(f"[recruitment] {k} must be one of {', '.join(names)}: "
-                               f"{recruitment[k]!r}")
+    try:
+        recruitment = {**RECRUITMENT_DEFAULTS, **validate_recruitment(t.get("recruitment", {}))}
+    except ValueError as e:
+        raise ProjectError(f"[recruitment] {e}") from None
     unknown = set(t.get("resources", {})) - set(RESOURCE_DEFAULTS)
     if unknown:
         raise ProjectError(f"[resources] unknown keys: {', '.join(sorted(unknown))}")

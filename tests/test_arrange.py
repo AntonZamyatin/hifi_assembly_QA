@@ -132,10 +132,21 @@ def test_end_marks_and_background(tmp):
     check(list(idx[:k]) == list(range(k))[::-1], f"a flipped segment's bins run backwards: {idx[:k]}")
 
 
+def test_indels_survive_sorting(tmp):
+    """arrange() turns indel positions into arrays; the layout must still draw them."""
+    from qaview.glyphs import report_layout
+    rd = replace(make_region_data(tmp, "ind"),
+                 indels={"x": [10.0, 20.0], "y": [10.0, 20.0], "read": [0, 0], "text": ["a", "b"]})
+    for axis in ("x", "y"):
+        n = len(rd.asm2_segs_info if axis == "x" else rd.asm1_segs_info)
+        report_layout(arrange(rd, axis, list(range(n)), [False] * n))
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="qaview_arrange_tests_")
     tests = [(test_diagonal_order, True), (test_arrange_keeps_the_genome, True),
-             (test_axis_consumers, False), (test_end_marks_and_background, True)]
+             (test_axis_consumers, False), (test_end_marks_and_background, True),
+             (test_indels_survive_sorting, True)]
     for fn, needs_tmp in tests:
         print(f"{fn.__name__} ...")
         fn(tmp) if needs_tmp else fn()

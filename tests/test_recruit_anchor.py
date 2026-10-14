@@ -336,12 +336,21 @@ def test_split_alignments_take_no_part_in_recruitment():
           f"no piece brings a segment: {spans(sc, 'A')} {spans(sc, 'B')}")
 
 
+def test_merge_gap_either_order():
+    """Segments merge_gap apart merge whichever is added first."""
+    from qatool.SegmentStorage import Segment, SegmentCollection
+    for gap in (0, 10):
+        a, b = Segment("A", "c", 0, 100), Segment("A", "c", 100 + gap, 200)
+        n = [len(SegmentCollection(order, merge_gap=gap)) for order in ([a, b], [b, a])]
+        check(n == [1, 1], f"gap {gap}: {n}")
+
+
 def main():
     tests = [test_edges_move_to_the_nearest_anchors, test_anchor_bridged_in_the_other_assembly_is_not_one,
              test_repeat_copies_get_segments, test_merged_loci_recruit_every_read_inside,
              test_gap_is_crossed_to_the_nearest_anchor, test_common_read_brings_its_other_copies,
              test_split_alignments_take_no_part_in_recruitment,
-             test_qaview_legacy_key_unchanged]
+             test_qaview_legacy_key_unchanged, test_merge_gap_either_order]
     for fn in tests:
         print(f"{fn.__name__} ...")
         fn()

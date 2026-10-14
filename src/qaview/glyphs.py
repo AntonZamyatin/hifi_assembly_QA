@@ -413,7 +413,7 @@ def _draw_indels(p, rd, lines):
     drawn only while their read is selected -- a hover over its marginal bin or a
     tap -- like the rows they sit on. Their text is in the row's tooltip."""
     ind = getattr(rd, "indels", None) or {}
-    if not ind.get("x"):
+    if not len(ind.get("x", ())):
         return None
     src = ColumnDataSource(dict(x=np.asarray(ind["x"], float), y=np.asarray(ind["y"], float),
                                 read=np.asarray(ind["read"], np.int32), text=list(ind["text"])),

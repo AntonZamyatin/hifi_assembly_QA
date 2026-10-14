@@ -124,32 +124,33 @@ process_label() {
     local reads_dir="${READS_MAP[$label]:-}"
     if [[ -z "$reads_dir" ]]; then
         echo "[$(ts)] [${label}] ERROR: no reads_dir in TSV, skipping" >&2
-        return
+        return 1
     fi
     if [[ ! -e "$reads_dir" ]]; then
         echo "[$(ts)] [${label}] ERROR: reads_dir not found: $reads_dir, skipping" >&2
-        return
+        return 1
     fi
 
     # ref haplotype FASTAs
     read -r hap1 hap2 <<< "$(find_hap_fastas "$label")"
     if [[ -z "$hap1" || -z "$hap2" ]]; then
         echo "[$(ts)] [${label}] ERROR: could not find both haplotype FASTAs in $GENOMES_DIR, skipping" >&2
-        return
+        return 1
     fi
 
     # LJA assembly
     local lja="$GENOMES_DIR/${label}.lja.fasta"
     if [[ ! -f "$lja" ]]; then
         echo "[$(ts)] [${label}] ERROR: LJA assembly not found: $lja, skipping" >&2
-        return
+        return 1
     fi
 
     # concatenate haplotypes into diploid ref (skip if already done)
     local ref_fasta="$TMP_DIR/${label}.ref.fasta"
     if [[ ! -f "$ref_fasta" ]]; then
         echo "[$(ts)] [${label}] concat ref: $(basename "$hap1") + $(basename "$hap2")"
-        zcat "$hap1" "$hap2" > "$ref_fasta"
+        zcat "$hap1" "$hap2" > "$ref_fasta.tmp"
+        mv "$ref_fasta.tmp" "$ref_fasta"     # a cut-off concat is never taken as done
         echo "[$(ts)] [${label}] concat ref done"
     else
         echo "[$(ts)] [${label}] SKIP concat ref — already exists"
@@ -173,18 +174,25 @@ process_label() {
 
 # ── run labels with a job pool ────────────────────────────────────────────────
 running=0
-failed=()
+nfail=0
 
 for label in "${LABELS[@]}"; do
     process_label "$label" &
     (( ++running ))
     if (( running >= JOBS )); then
-        wait -n || true
-        (( --running ))
+        wait -n || (( ++nfail ))
+        running=$(( running - 1 ))   # (( --running )) at 0 would trip set -e
     fi
 done
 
-wait
+while (( running > 0 )); do
+    wait -n || (( ++nfail ))
+    running=$(( running - 1 ))   # (( --running )) at 0 would trip set -e
+done
 
 echo ""
 echo "[$(ts)] === All labels processed ==="
+if (( nfail )); then
+    echo "[$(ts)] $nfail label(s) failed; see their logs in $TMP_DIR" >&2
+    exit 1
+fi
