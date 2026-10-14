@@ -21,8 +21,7 @@ import pysam
 from qatool.plotters.axis import _build_axis_map
 from qatool.plotters.classify import _classify_reads_for_support_colors
 from qatool.plotters.colors import BEST_PID_DELTA_DEFAULT, PID_TIE_EPS_DEFAULT
-from qatool.plotters.coverage import CoverageBins
-from qatool.plotters.db import _collect_bam_read_names, _fetch_aln_from_db
+from qatool.plotters.db import _locus_read_names
 from qatool.plotters.reads_dotplot import (
     _BLOCK_COLS, _build_lookup, _fetch_aln_blocks, _map_in_segment, _map_point, _read_span,
     _read_to_ref, _visible_read_span,
@@ -89,23 +88,6 @@ class ReadLines:
     def __len__(self) -> int:
         return len(self.x0)
 
-    def by_read(self, n_reads: int) -> tuple:
-        """CSR map read index -> line row indices, for client-side highlighting.
-
-        Returns (offsets, indices) with offsets of length n_reads + 1.
-        """
-        counts = np.zeros(n_reads, dtype=np.int64)
-        for ri in self.read_idx:
-            counts[ri] += 1
-        offsets = np.zeros(n_reads + 1, dtype=np.int64)
-        np.cumsum(counts, out=offsets[1:])
-        cursor = offsets[:-1].copy()
-        indices = np.zeros(len(self.read_idx), dtype=np.int32)
-        for row, ri in enumerate(self.read_idx):
-            indices[cursor[ri]] = row
-            cursor[ri] += 1
-        return offsets, indices
-
 
 @dataclass
 class Placements:
@@ -143,8 +125,6 @@ class RegionData:
     read_names: list
     read_class: dict
     lines: ReadLines
-    cov1: CoverageBins          # asm1 — right-hand marginal
-    cov2: CoverageBins          # asm2 — top marginal
     bucket_keys: list
     # assembly -> {contig: length} for the contigs in `segments`, from the BAM
     # headers: which segment edges are contig ends (glyphs.contig_bar_figure).
@@ -177,22 +157,6 @@ class RegionData:
                 return contig, (end - 1 - int(pos - off)) if f else start + int(pos - off)
         return None
 
-    def bin_edges(self, assembly: str) -> tuple:
-        """Exact-bp (left, right) edges for each coverage bin of `assembly`.
-
-        Matches the bin order of the corresponding CoverageBins: segments in
-        (contig, start, end) order, ceil(seg_len / binsize) bins each, final bin of a
-        segment clipped to the segment end.
-        """
-        left, right = [], []
-        for _, start, end, offset in self.segs_info(assembly):
-            seg_len = end - start
-            for j in range(math.ceil(seg_len / self.binsize)):
-                l = offset + j * self.binsize
-                left.append(l)
-                right.append(min(offset + seg_len, l + self.binsize))
-        return np.array(left, dtype=np.int64), np.array(right, dtype=np.int64)
-
     @classmethod
     def build(cls, segments, read_names, db_path: str,
               asm1_bam: str, asm2_bam: str,
@@ -216,9 +180,6 @@ class RegionData:
             total_a = sum(s.end - s.start for s in sc_sorted if s.assembly == asm1)
             total_b = sum(s.end - s.start for s in sc_sorted if s.assembly == asm2)
             binsize = max(1, math.ceil(max(total_a, total_b, 1) / 1000))
-        # Sorting once here keeps _build_axis_map's iteration order and
-        # compute_coverage_bins' internal sort in agreement, so bin i of the coverage
-        # arrays and bin i of bin_edges() refer to the same piece of genome.
         asm1_segs_info, plot_h = _build_axis_map(sc_sorted, asm1)
         asm2_segs_info, plot_w = _build_axis_map(sc_sorted, asm2)
         asm1_segs = [s for s in sc_sorted if s.assembly == asm1]
@@ -226,19 +187,20 @@ class RegionData:
         if not asm1_segs or not asm2_segs:
             raise ValueError("segments must contain both asm1 and asm2 segments")
 
-        # Expand the seed set so classification covers every read visible in a marginal.
-        all_reads = set(read_names)
-        all_reads |= _collect_bam_read_names(asm2_bam, asm2_segs, pid_threshold, plen_threshold)
-        all_reads |= _collect_bam_read_names(asm1_bam, asm1_segs, pid_threshold, plen_threshold)
-
         con = sqlite3.connect(db_path)
         try:
-            aln_by_asm = _fetch_aln_from_db(con, list(all_reads), [asm1, asm2],
-                                            pid_threshold, plen_threshold)
+            # Expand the seed set so classification covers every read visible in a marginal.
+            all_reads = set(read_names)
+            all_reads |= _locus_read_names(con, asm2, asm2_segs, pid_threshold, plen_threshold)
+            all_reads |= _locus_read_names(con, asm1, asm1_segs, pid_threshold, plen_threshold)
             aln_blocks = _fetch_aln_blocks(con, list(all_reads), [asm1, asm2],
                                            pid_threshold, plen_threshold)
         finally:
             con.close()
+        # The same rows as _fetch_aln_from_db's, which classification takes; it never
+        # reads plen, so that is left out.
+        aln_by_asm = {a: [(r[0], r[1], r[2], r[3], r[4], r[11], None) for r in rows]
+                      for a, rows in aln_blocks.items()}
 
         read_classes = _classify_support(db_path, all_reads, pid_threshold, plen_threshold,
                                          asm1, asm2, pid_tie_eps, aln_by_asm,
@@ -274,15 +236,11 @@ class RegionData:
             n_partial = len(plines)
             lines = _concat_lines(lines, plines)
 
-        buckets = [read_classes[k] for k in SUPPORT_BUCKET_KEYS]
-        cov1 = _coverage_at_best(best[asm1], asm1_segs, binsize, buckets)
-        cov2 = _coverage_at_best(best[asm2], asm2_segs, binsize, buckets)
-
         return cls(asm1=asm1, asm2=asm2, binsize=binsize, segments=sc_sorted,
                    asm1_segs_info=asm1_segs_info, asm2_segs_info=asm2_segs_info,
                    plot_w=plot_w, plot_h=plot_h,
                    read_names=read_names_l, read_class=read_class, lines=lines,
-                   cov1=cov1, cov2=cov2, bucket_keys=list(SUPPORT_BUCKET_KEYS),
+                   bucket_keys=list(SUPPORT_BUCKET_KEYS),
                    contig_lengths={asm1: _contig_lengths(asm1_bam, asm1_segs),
                                    asm2: _contig_lengths(asm2_bam, asm2_segs)},
                    n_partial=n_partial, indels=indels,
@@ -555,66 +513,10 @@ def _best_by_read(blocks: list, tol: float) -> dict:
     return {rn: _best_placements(bl, tol) for rn, bl in by_read.items()}
 
 
-def _coverage_at_best(best: dict, segments: list, binsize: int, read_buckets) -> CoverageBins:
-    """Marginal coverage: each read adds 1/n to the bins under each of its n best
-    placements in this assembly (a supplementary piece of a best primary adds its
-    primary's share), whichever of them lie in `segments`.
-
-    Bins as `compute_coverage_bins` lays them out -- per segment, in (contig, start)
-    order, the last of a segment cut short -- so bin i here is bin i of
-    RegionData.bin_edges. Built from the aln rows already fetched, no BAM scan.
-    """
-    segments = sorted(segments, key=lambda s: (s.contig, s.start, s.end))
-    bin_contig, bin_start, bin_end = [], [], []
-    by_contig: dict = {}
-    first = 0
-    for seg in segments:
-        n = math.ceil((seg.end - seg.start) / binsize)
-        by_contig.setdefault(seg.contig, []).append((seg.start, seg.end, first))
-        for j in range(n):
-            gs = seg.start + j * binsize
-            bin_contig.append(seg.contig)
-            bin_start.append(gs)
-            bin_end.append(min(seg.end, gs + binsize))
-        first += n
-    n_bins = len(bin_contig)
-    name_to_bucket = {nm: i for i, bucket in enumerate(read_buckets) for nm in bucket}
-    bins = [0.0] * n_bins
-    bucket_bins = [[0.0] * n_bins for _ in read_buckets]
-    bin_reads: list = [dict() for _ in range(n_bins)]
-    read_names: list = []
-    for rn, (kept, n) in best.items():
-        if not n:
-            continue
-        w = 1.0 / n
-        bi = name_to_bucket.get(rn)
-        target = bucket_bins[bi] if bi is not None else bins
-        ri = None
-        for b in kept:
-            for s0, s1, b0 in by_contig.get(b[1], ()):
-                lo, hi = max(b[2], s0), min(b[3], s1)
-                if lo >= hi:
-                    continue
-                if ri is None:
-                    ri = len(read_names)
-                    read_names.append(rn)
-                for i in range(b0 + (lo - s0) // binsize, b0 + math.ceil((hi - s0) / binsize)):
-                    target[i] += w
-                    bin_reads[i][ri] = bin_reads[i].get(ri, 0.0) + w
-    bin_offsets = np.zeros(n_bins + 1, dtype=np.int64)
-    np.cumsum([len(s) for s in bin_reads], out=bin_offsets[1:])
-    read_idx = np.fromiter((ri for s in bin_reads for ri in sorted(s)),
-                           dtype=np.int32, count=int(bin_offsets[-1]))
-    read_w = np.fromiter((s[ri] for s in bin_reads for ri in sorted(s)),
-                         dtype=np.float64, count=int(bin_offsets[-1]))
-    return CoverageBins(bins=bins, bucket_bins=bucket_bins, bin_contig=bin_contig,
-                        bin_start=bin_start, bin_end=bin_end, bin_offsets=bin_offsets,
-                        read_idx=read_idx, read_names=read_names, read_w=read_w)
-
-
 def _placements(best: dict, segs_info: list, read_pos: dict) -> Placements:
-    """`Placements` from `_best_by_read` output: the same reads and weights
-    `_coverage_at_best` bins, kept as intervals instead of bins."""
+    """`Placements` from `_best_by_read` output: each read weighs 1/n at each of
+    its n best placements (a supplementary piece of a best primary at its
+    primary's share), kept as intervals on the axis, clipped to the segments."""
     by_contig: dict = {}
     for k, (contig, s, e, off) in enumerate(segs_info):
         by_contig.setdefault(contig, []).append((s, e, off, k))
@@ -675,7 +577,7 @@ def marginal_bins(segs_info: list, pl: Placements, bands, n_bands: int,
                   a: float, b: float, binsize: int | None = None, flips=None) -> dict:
     """Bin `pl` over the axis range [a, b]: each row adds its weight to every bin it
     touches, in band `bands[read]`. Bins restart at each segment's start, the last of
-    a segment cut short, as `_coverage_at_best` lays them out; only bins meeting
+    a segment cut short; only bins meeting
     [a, b] are made. The Python twin of glyphs' REBIN_JS, which redoes this in the
     page on every zoom; it draws the first frame.
 
@@ -882,7 +784,7 @@ def _order_for_drawing(lines: ReadLines, read_names: list, read_class: dict) -> 
     """Reorder rows back-to-front: common, unclassified, support, supplementary.
 
     Sorting the stored rows (rather than splitting into per-layer renderers) means the
-    dotplot stays one glyph with one data source, so `by_read()` row indices remain
+    dotplot stays one glyph with one data source, so line row indices stay
     valid for the hover/selection callbacks.  `kind="stable"` keeps rows of the same
     layer in their original read order.
     """

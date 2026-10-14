@@ -1,7 +1,7 @@
 """Read classification: support categories (asm1/asm2/common/…) and occurrence buckets."""
 
-import hashlib
 import sqlite3
+from bisect import bisect_right
 
 import pysam
 
@@ -17,26 +17,53 @@ def _interval_in_segments(seg_lookup_by_contig: dict, contig: str, start: int, e
     return False
 
 
-def _is_read_common(loci1: list, loci2: list,
-                    asm1_fasta: pysam.FastaFile, asm2_fasta: pysam.FastaFile) -> bool:
+_COMP = str.maketrans("ACGTNacgtn", "TGCANtgcan")
+
+
+def _revcomp(seq: str) -> str:
+    return seq.translate(_COMP)[::-1]
+
+
+def _seq_reader(fa: pysam.FastaFile, loci) -> callable:
+    """(contig, start, end) -> upper-case sequence for any of `loci`, read with one
+    fetch per run of overlapping loci: reads piled 30 deep do not decompress the
+    same bases 30 times."""
+    runs: dict = {}
+    for c, s, e in sorted(set(loci)):
+        r = runs.setdefault(c, [])
+        if r and s <= r[-1][1]:
+            r[-1][1] = max(r[-1][1], e)
+        else:
+            r.append([s, e])
+    seqs = {c: [(s, fa.fetch(c, s, e).upper()) for s, e in r] for c, r in runs.items()}
+    starts = {c: [s for s, _ in r] for c, r in seqs.items()}
+
+    def get(c, s, e):
+        s0, seq = seqs[c][bisect_right(starts[c], s) - 1]
+        return seq[s - s0:e - s0]
+    return get
+
+
+def _is_read_common(loci1: list, loci2: list, seq1, seq2) -> bool:
     """
-    Mirror of Recruiter._read_is_common: returns True iff the reference sequences
-    at loci1 (asm1) and loci2 (asm2) are identical sets (including reverse complements).
-    loci* = [(contig, start, end), ...]
+    Mirror of Recruiter._read_is_common: True iff the reference sequences at loci1
+    (asm1) and loci2 (asm2) are the same multiset, each taken up to reverse
+    complement. loci* = [(contig, start, end), ...]; seq* = _seq_reader of each.
     """
-    if len(loci1) != len(loci2):
+    if len(loci1) != len(loci2) or \
+            sorted(e - s for _, s, e in loci1) != sorted(e - s for _, s, e in loci2):
         return False
-    _comp = str.maketrans("ACGTNacgtn", "TGCANtgcan")
-    def _hashes(fa, loci):
-        c: dict = {}
-        for contig, s, e in loci:
-            seq = fa.fetch(contig, s, e).upper()
-            h1 = hashlib.sha1(seq.encode()).digest()
-            h2 = hashlib.sha1(seq.translate(_comp)[::-1].encode()).digest()
-            c[h1] = c.get(h1, 0) + 1
-            c[h2] = c.get(h2, 0) + 1
-        return c
-    return _hashes(asm1_fasta, loci1) == _hashes(asm2_fasta, loci2)
+    if len(loci1) == 1:
+        a, b = seq1(*loci1[0]), seq2(*loci2[0])
+        return a == b or a == _revcomp(b)
+
+    def canon(seq, loci):
+        out = []
+        for locus in loci:
+            x = seq(*locus)
+            out.append(min(x, _revcomp(x)))
+        return sorted(out)
+    return canon(seq1, loci1) == canon(seq2, loci2)
 
 
 def _classify_reads_for_occurrence_colors(
@@ -86,7 +113,7 @@ def _classify_reads_for_support_colors(db_file: str, reads_set: set[str],
     Classify each read into: asm1_only, asm2_only, asm1_best, asm2_best, common, other.
 
     For reads aligning to both assemblies within the recruited segments:
-      - common  (gold): reference sequences at both loci are identical (SHA1 including RC),
+      - common  (gold): reference sequences at both loci are identical (up to reverse complement),
                         matching Recruiter._read_is_common.  Requires asm1_fasta/asm2_fasta;
                         without them any equal-pid dual-mapper is labelled common.
       - asm1_best / asm2_best: pid difference exceeds eps (and sequences are not identical).
@@ -151,6 +178,14 @@ def _classify_reads_for_support_colors(db_file: str, reads_set: set[str],
             info["max_pid"] = max(info["max_pid"], pid)
             info["loci"].append((contig, start, end))
 
+    # The sequence at every tied read's loci, read once per stretch of genome.
+    seq1 = seq2 = None
+    if asm1_fasta is not None and asm2_fasta is not None:
+        tied = [v for v in per_read.values() if asm1 in v and asm2 in v
+                and abs(v[asm2]["max_pid"] - v[asm1]["max_pid"]) <= best_pid_delta]
+        seq1 = _seq_reader(asm1_fasta, (l for v in tied for l in v[asm1]["loci"]))
+        seq2 = _seq_reader(asm2_fasta, (l for v in tied for l in v[asm2]["loci"]))
+
     for rn in reads:
         asm_vals = per_read.get(rn, {})
         asm1_info = asm_vals.get(asm1)
@@ -164,8 +199,8 @@ def _classify_reads_for_support_colors(db_file: str, reads_set: set[str],
         elif has_asm1 and has_asm2:
             d = asm2_info["max_pid"] - asm1_info["max_pid"]
             pids_tied = abs(d) <= best_pid_delta
-            if pids_tied and asm1_fasta is not None and asm2_fasta is not None:
-                if _is_read_common(asm1_info["loci"], asm2_info["loci"], asm1_fasta, asm2_fasta):
+            if pids_tied and seq1 is not None:
+                if _is_read_common(asm1_info["loci"], asm2_info["loci"], seq1, seq2):
                     out["common"].add(rn)
                 else:
                     if d > pid_tie_eps:

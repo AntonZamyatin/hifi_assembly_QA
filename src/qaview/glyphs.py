@@ -232,16 +232,13 @@ RATIO_WEAK, RATIO_STRONG = 1.0, 10.0
 
 @dataclass(frozen=True)
 class Stacking:
-    """What a coverage marginal stacks, bottom to top.
-
-    `series[asm]` has one row per band and one column per bin; `read_band[g]` is
-    the band of global read g. The hover callback uses both, so whichever stacking
+    """What a coverage marginal stacks, bottom to top: `read_band[g]` is the band
+    of global read g (marginal_bins and REBIN_JS bin by it), so whichever stacking
     is drawn, hovering a band isolates exactly the reads counted in it.
     """
 
     keys: list
     colors: list
-    series: dict
     read_band: list
 
 
@@ -249,9 +246,7 @@ def class_stacking(rd) -> Stacking:
     """Support classes, then the unassigned remainder -- the original marginals."""
     keys = list(rd.bucket_keys) + ["unassigned"]
     colors = [SUPPORT_COLORS[k] for k in rd.bucket_keys] + ["#6e6e6e"]
-    series = {rd.asm1: list(rd.cov1.bucket_bins or []) + [rd.cov1.bins],
-              rd.asm2: list(rd.cov2.bucket_bins or []) + [rd.cov2.bins]}
-    return Stacking(keys, colors, series, _read_bucket_index(rd))
+    return Stacking(keys, colors, _read_bucket_index(rd))
 
 
 def ratio_band(ratio) -> int:
@@ -268,8 +263,8 @@ def ratio_band(ratio) -> int:
 def ratio_stacking(rd, ratios: dict) -> Stacking:
     """Coverage split by which candidate each read favours, and how strongly.
 
-    Recomputed from the stored per-bin read weights, so it is exact -- the bands
-    sum to the same total as the class stacking -- and needs no BAM access.
+    Binned from the same placements as the class stacking, so the bands sum to
+    the same total.
     """
     w, s = f"{RATIO_WEAK:g}", f"{RATIO_STRONG:g}"
     keys = [f"indifferent (|r| < {w})",
@@ -278,12 +273,8 @@ def ratio_stacking(rd, ratios: dict) -> Stacking:
             "not scored"]
     colors = [ratio_color(0.0), ratio_color(-0.5), ratio_color(-1.0),
               ratio_color(0.5), ratio_color(1.0), UNSCORED_COLOR]
-    series = {}
-    for asm, cov in ((rd.asm1, rd.cov1), (rd.asm2, rd.cov2)):
-        bands = [ratio_band(ratios.get(n)) for n in cov.read_names]
-        series[asm] = list(cov.rebucket(bands, len(keys)))
     read_band = [ratio_band(ratios.get(n)) for n in rd.read_names]
-    return Stacking(keys, colors, series, read_band)
+    return Stacking(keys, colors, read_band)
 
 
 def _read_ratios(rd, ratios) -> np.ndarray:
@@ -774,8 +765,8 @@ def _global_index(rd, cov):
 def _read_bucket_index(rd) -> list:
     """Global read index -> stacked-band index, matching the coverage series order.
 
-    `coverage_figure` stacks `bucket_bins` (in `rd.bucket_keys` order) then the
-    unbucketed remainder, so band i is bucket i and the last band is 'unassigned'.
+    `coverage_figure` stacks the classes in `rd.bucket_keys` order, then the
+    unclassified remainder: band i is class i and the last band is 'unassigned'.
     """
     pos = {k: i for i, k in enumerate(rd.bucket_keys)}
     unassigned = len(rd.bucket_keys)
@@ -957,7 +948,7 @@ def _wire_rebin(rd, main, shared, lines, margs: list, reads):
         r.js_on_change("end", cb)
 
 
-def _link_bins_to_reads(rd, cov_fig, marg, other_marg, main, status, orientation,
+def _link_bins_to_reads(cov_fig, marg, other_marg, main, status, orientation,
                         reads, stackings: dict, mode: Div):
     """Hover a coverage bin: stripe that bin, light the matching bins on the other
     assembly, and show only the reads passing through it.
@@ -970,15 +961,12 @@ def _link_bins_to_reads(rd, cov_fig, marg, other_marg, main, status, orientation
     The bins change with the zoom, so the reads under one are found by scanning the
     placements (`marg`, see REBIN_JS) -- one pass, well under a frame.
     """
-    i32 = lambda a: np.asarray(a, dtype=np.int32)
-    rl_off, rl_idx = rd.lines.by_read(len(rd.read_names))
     names = {f"names_{k}": list(st.keys) for k, st in stackings.items()}
 
     cb = CustomJS(
         args=dict(
             lines=line_renderer(main).data_source, M=marg, O=other_marg, reads=reads,
-            status=status, mode=mode,
-            read_off=i32(rl_off), read_lines=i32(rl_idx), names=names,
+            status=status, mode=mode, names=names,
             vertical=(orientation == "x"), label=cov_fig.name or "",
         ),
         code=REBIN_JS + """
@@ -1015,8 +1003,7 @@ def _link_bins_to_reads(rd, cov_fig, marg, other_marg, main, status, orientation
             if (band < 0 || read_band[g] === band) gs.add(g);   // narrow to the band
         }
         const rows = [];
-        for (const g of gs)
-            for (let j = read_off[g]; j < read_off[g + 1]; j++) rows.push(read_lines[j]);
+        for (const g of gs) for (const r of qvRowsOf(lines, g)) rows.push(r);
         lines.selected.indices = rows;
         hit.selected.indices = [b];
         other.selected.indices = qvBinsOf(O, reads, gs);
@@ -1245,8 +1232,8 @@ def report_layout(rd, color_by: str = "class", visible_layers=None,
     reads = _reads_source(rd, stackings)
     mx = _marginal_model(rd, cov_top, rd.asm2, "x")
     my = _marginal_model(rd, cov_right, rd.asm1, "y")
-    _link_bins_to_reads(rd, cov_top, mx, my, main, status, "x", reads, stackings, mode)
-    _link_bins_to_reads(rd, cov_right, my, mx, main, status, "y", reads, stackings, mode)
+    _link_bins_to_reads(cov_top, mx, my, main, status, "x", reads, stackings, mode)
+    _link_bins_to_reads(cov_right, my, mx, main, status, "y", reads, stackings, mode)
     _link_reads_to_bins(main, [mx, my], reads)
     _wire_rebin(rd, main, shared, line_renderer(main).data_source, [mx, my], reads)
     _link_bin_click(cov_top, mx, reads, mode, stackings, "x")

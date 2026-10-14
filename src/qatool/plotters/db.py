@@ -68,6 +68,26 @@ def _collect_bam_read_names(bamfile: str, segments: list,
     return names
 
 
+# No alignment spans more reference than this (HiFi reads are tens of kb); it bounds
+# _locus_read_names' index scan from below.
+# ponytail: fixed bound, a read spanning more is missed; store the span if ever needed.
+MAX_ALN_SPAN = 1_000_000
+
+
+def _locus_read_names(con, assembly: str, segments: list,
+                      pid_threshold: float, plen_threshold: float) -> set:
+    """Names of reads with a qualifying alignment overlapping the segments: what
+    _collect_bam_read_names finds in the BAM, from the aln_by_locus index."""
+    names = set()
+    for seg in segments:
+        names.update(r for (r,) in con.execute(
+            "SELECT read_name FROM aln WHERE assembly = ? AND contig = ? "
+            "AND start > ? AND start < ? AND end > ? AND pid >= ? AND plen >= ?",
+            (assembly, seg.contig, seg.start - MAX_ALN_SPAN, seg.end, seg.start,
+             pid_threshold, plen_threshold)))
+    return names
+
+
 def _stripe_coords(db_path: str, read_set: set, assembly: str,
                    pid_threshold: float, plen_threshold: float) -> dict:
     """Return merged intervals {contig: [(start, end, n_reads), ...]} for read_set in assembly."""

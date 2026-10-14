@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import matplotlib
 matplotlib.use("Agg")
 
-from fixtures import make_region_data, write_bam
+from fixtures import make_region_data, marginal, write_bam
 
 import numpy as np
 
@@ -212,8 +212,8 @@ def test_ratio_stacking_is_exact(tmp):
     rs, cs = ratio_stacking(rd, ratios), class_stacking(rd)
     check(len(rs.keys) == len(rs.colors) == 6, "six bands, six colours")
     for asm in (rd.asm1, rd.asm2):
-        a = np.sum(rs.series[asm], axis=0)
-        b = np.sum(np.array(cs.series[asm], dtype=float), axis=0)
+        a = marginal(rd, asm, rs.read_band, len(rs.keys))["series"].sum(axis=0)
+        b = marginal(rd, asm, cs.read_band, len(cs.keys))["series"].sum(axis=0)
         check(np.allclose(a, b),
               f"{asm}: log-ratio bands must sum to the same coverage as the classes")
     got = [rs.read_band[rd.read_names.index(n)] for n in names]

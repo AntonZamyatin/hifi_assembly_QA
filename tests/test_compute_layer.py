@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from fixtures import (
     BEST_PID_DELTA, BINSIZE, READS_A, READS_B, SEGS_A, SEGS_B,
-    reference_coverage_bins, write_bam, write_db,
+    marginal, reference_coverage_bins, write_bam, write_db,
 )
 
 from qatool.SegmentStorage import Segment
@@ -168,8 +168,9 @@ def test_region_data_build(tmp):
     check(rd.plot_h == 6700, f"asm1 extent (exact bp) should be 6700, got {rd.plot_h}")
     check(rd.plot_w == 3300, f"asm2 extent (exact bp) should be 3300, got {rd.plot_w}")
     check(rd.bucket_keys == SUPPORT_BUCKET_KEYS, "bucket key order must mirror report.py")
-    check(len(rd.cov1.bins) == 8, f"asm1 has 8 bins, got {len(rd.cov1.bins)}")
-    check(len(rd.cov2.bins) == 4, f"asm2 (3300bp) has 4 bins, got {len(rd.cov2.bins)}")
+    n1, n2 = len(marginal(rd, "asm1")["left"]), len(marginal(rd, "asm2")["left"])
+    check(n1 == 8, f"asm1 has 8 bins, got {n1}")
+    check(n2 == 4, f"asm2 (3300bp) has 4 bins, got {n2}")
 
     # Reads aligning to both assemblies (r1, r2, r3) should produce lines.
     check(len(rd.lines) > 0, "expected read-correspondence lines")
@@ -187,7 +188,7 @@ def test_region_data_build(tmp):
     check(rd.genome_at("asm2", 0) == ("ctgB", 1000), "crosshair readout on asm2")
 
 
-def test_bin_edges_match_coverage(tmp):
+def test_marginal_bin_edges(tmp):
     from qaview.region import RegionData
 
     bam1 = write_bam(os.path.join(tmp, "g1.bam"), READS_A)
@@ -200,9 +201,10 @@ def test_bin_edges_match_coverage(tmp):
                           asm1="asm1", asm2="asm2", pid_threshold=0.99,
                           plen_threshold=0.5, binsize=BINSIZE)
 
-    for asm, cov in ((rd.asm1, rd.cov1), (rd.asm2, rd.cov2)):
-        left, right = rd.bin_edges(asm)
-        check(len(left) == len(cov.bins), f"{asm}: {len(left)} edges vs {len(cov.bins)} bins")
+    for asm in (rd.asm1, rd.asm2):
+        m = marginal(rd, asm)
+        left, right = np.asarray(m["left"]), np.asarray(m["right"])
+        check(len(left) == m["series"].shape[1], f"{asm}: {len(left)} edges vs {m['series'].shape} bins")
         check(bool(np.all(right > left)), f"{asm}: every bin must have positive width")
         widths = right - left
         check(bool(np.all(widths <= BINSIZE)), f"{asm}: no bin may exceed binsize")
@@ -225,7 +227,7 @@ def main():
         (test_plot_to_genome_exact, False),
         (test_plot_to_genome_padded, False),
         (test_region_data_build, True),
-        (test_bin_edges_match_coverage, True),
+        (test_marginal_bin_edges, True),
     ]
     for fn, needs_tmp in tests:
         print(f"{fn.__name__} ...")

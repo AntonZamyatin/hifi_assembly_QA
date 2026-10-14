@@ -40,54 +40,6 @@ def _panels(layout):
     return {"cov_top": by_pos[(0, 1)], "main": by_pos[(1, 1)], "cov_right": by_pos[(1, 2)]}
 
 
-def test_read_to_line_csr(tmp):
-    """ReadLines.by_read must invert read_idx exactly."""
-    rd = make_region_data(tmp, "csr")
-    off, idx = rd.lines.by_read(len(rd.read_names))
-    check(len(off) == len(rd.read_names) + 1, "offsets must be n_reads + 1")
-    check(int(off[-1]) == len(rd.lines), "offsets must end at the line count")
-    for r in range(len(rd.read_names)):
-        rows = set(idx[off[r]:off[r + 1]].tolist())
-        expected = {i for i, ri in enumerate(rd.lines.read_idx) if ri == r}
-        check(rows == expected,
-              f"read {rd.read_names[r]}: CSR rows {rows} != {expected}")
-
-
-def test_bin_to_line_roundtrip(tmp):
-    """Reproduce the CustomJS lookup in Python: bin -> reads -> line rows."""
-    rd = make_region_data(tmp, "rt")
-    cov = rd.cov1
-    off, idx = rd.lines.by_read(len(rd.read_names))
-    pos = {n: i for i, n in enumerate(rd.read_names)}
-
-    checked = 0
-    for b in range(len(cov.bins)):
-        names = cov.reads_in_bin(b)
-        if not names:
-            continue
-        rows = set()
-        for n in names:
-            g = pos.get(n)
-            if g is None:
-                continue
-            rows.update(idx[off[g]:off[g + 1]].tolist())
-        # Every selected line must belong to a read that really is in this bin.
-        for r in rows:
-            check(rd.read_names[rd.lines.read_idx[r]] in names,
-                  f"bin {b} selected a line whose read is not in the bin")
-        checked += 1
-    check(checked > 0, "fixture produced no populated bins to test")
-
-
-def test_coverage_read_names_are_a_subset(tmp):
-    """The JS remap assumes every coverage read name exists in rd.read_names."""
-    rd = make_region_data(tmp, "sub")
-    for label, cov in (("cov1", rd.cov1), ("cov2", rd.cov2)):
-        missing = set(cov.read_names) - set(rd.read_names)
-        check(not missing,
-              f"{label} has reads absent from RegionData.read_names: {missing}")
-
-
 def test_hit_layer_present_and_invisible(tmp):
     rd = make_region_data(tmp, "hit")
     for orient, asm in (("x", rd.asm2), ("y", rd.asm1)):
@@ -125,7 +77,7 @@ def test_hover_tools_wired(tmp):
         check(isinstance(hovers[0].callback, CustomJS),
               f"{name} hover must carry the bin->read callback")
         args = hovers[0].callback.args
-        for key in ("lines", "M", "O", "reads", "read_off", "read_lines"):
+        for key in ("lines", "M", "O", "reads"):
             check(key in args, f"{name} callback missing arg {key}")
 
 
@@ -211,21 +163,6 @@ def test_nonselected_reads_hidden(tmp):
           "reads outside the hovered bin must be invisible, not merely dimmed")
 
 
-def test_coverage_by_read_transpose(tmp):
-    """CoverageBins.by_read must be the exact transpose of the bin index."""
-    rd = make_region_data(tmp, "tr")
-    for cov in (rd.cov1, rd.cov2):
-        off, bins = cov.by_read()
-        check(len(off) == len(cov.read_names) + 1, "offsets must be n_reads + 1")
-        check(int(off[-1]) == len(cov.read_idx), "must hold every (bin, read) pair")
-        for r in range(len(cov.read_names)):
-            got = set(bins[off[r]:off[r + 1]].tolist())
-            expected = {b for b in range(len(cov.bins))
-                        if r in cov.read_idx[cov.bin_offsets[b]:cov.bin_offsets[b + 1]]}
-            check(got == expected,
-                  f"read {cov.read_names[r]}: bins {got} != {expected}")
-
-
 def test_band_detection_data(tmp):
     """Hovering a stacked band narrows the highlight to that read class.
 
@@ -304,11 +241,10 @@ def test_coordinate_readout(tmp):
 
 def main():
     tmp = tempfile.mkdtemp(prefix="qaview_interaction_tests_")
-    tests = [test_read_to_line_csr, test_bin_to_line_roundtrip,
-             test_coverage_read_names_are_a_subset, test_hit_layer_present_and_invisible,
+    tests = [test_hit_layer_present_and_invisible,
              test_hover_tools_wired, test_selection_glyphs, test_reverse_link_registered,
              test_draw_order_and_widths, test_hover_links_both_panels,
-             test_nonselected_reads_hidden, test_coverage_by_read_transpose,
+             test_nonselected_reads_hidden,
              test_band_detection_data, test_common_colour_matches_marginals,
              test_coordinate_readout]
     for fn in tests:

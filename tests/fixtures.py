@@ -125,6 +125,16 @@ def make_region_data(tmp: str, prefix: str = "rd", binsize: int = BINSIZE):
         binsize=binsize, best_pid_delta=BEST_PID_DELTA)
 
 
+def marginal(rd, asm: str, bands=None, n_bands: int = 1, binsize: int | None = None) -> dict:
+    """`asm`'s marginal over its whole axis at `binsize` (default rd.binsize), as the
+    page's first frame bins it (region.marginal_bins); one band unless given."""
+    from qaview.region import marginal_bins
+    ext = rd.plot_h if asm == rd.asm1 else rd.plot_w
+    bands = [0] * len(rd.read_names) if bands is None else bands
+    return marginal_bins(rd.segs_info(asm), rd.placements[asm], bands, n_bands, 0, ext,
+                         binsize or rd.binsize)
+
+
 def reference_coverage_bins(bamfile, segments, pid_threshold, plen_threshold,
                             binsize, read_buckets, best_pid_delta):
     """Pre-refactor `alignment_plot` binning, verbatim, as a regression oracle.

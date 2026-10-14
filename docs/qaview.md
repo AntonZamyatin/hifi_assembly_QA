@@ -290,25 +290,21 @@ it to JS. See §9 for the cost tiers.
 
 ### 7.4 Coverage-bin hover → read highlight
 
-Backed by the CSR `bin_reads` index (§6). `CustomJS` on hover writes
-`source.selected.indices`; `nonselection_glyph` dims everything else. Client-side and
-instant.
+`CustomJS` on hover writes `source.selected.indices`; `nonselection_glyph` dims
+everything else. Client-side and instant.
 
-Three implementation notes from building it:
+Implementation notes:
 
 - **An invisible per-bin hover target is required.** Hovering the stacked coverage
   quads directly reports whichever bucket lies under the cursor, and misses entirely
   where that bucket is zero. `coverage_figure` therefore appends one full-height
   transparent quad per bin (`hit_renderer`), which always resolves the bin and whose
   `selection_glyph` doubles as the bin highlight for the reverse direction.
-- **Two CSR indexes, not one.** bin → reads comes from `compute_coverage_bins`;
-  read → line rows comes from `ReadLines.by_read()`, since one read contributes
-  several line segments (one per block pair).
-- **The two indexes use different read numbering.** `CoverageBins.read_names` is
-  per-assembly and holds only reads that reached a bin, while `RegionData.read_names`
-  is the global sorted list the line rows index into. The callback builds a lookup
-  table once and caches it on `window`. `test_coverage_read_names_are_a_subset`
-  guards the assumption that every coverage read exists globally.
+- **bin → reads** scans the marginal's placements (`region.Placements`, the rows
+  REBIN_JS bins), since the bins change with the zoom. **read → line rows**
+  (`qvRowsOf` in REBIN_JS) is built in the page from the lines' `read` column, once
+  per lines data; one read contributes several line segments (one per block pair).
+  Both index `RegionData.read_names`.
 
 ### 7.5 Publication export
 

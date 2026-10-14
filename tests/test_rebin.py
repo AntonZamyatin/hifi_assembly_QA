@@ -1,6 +1,5 @@
 """The marginals' zoom-dependent binning: region.marginal_bins (Python, first frame)
-and glyphs.REBIN_JS (the page, every zoom) must agree, and both must match the
-server's fixed-size bins at the same bin size.
+and glyphs.REBIN_JS (the page, every zoom) must agree.
 
 The JS half runs under node; it is skipped (and said so) when node is missing.
 
@@ -31,20 +30,6 @@ def check(cond, msg):
         _failures.append(msg)
         print(f"  FAIL: {msg}")
     return cond
-
-
-def test_matches_server_bins(tmp):
-    """At the server's bin size over the whole locus: the same bins, band by band."""
-    rd = make_region_data(tmp, "sb")
-    st = class_stacking(rd)
-    for asm, cov in ((rd.asm1, rd.cov1), (rd.asm2, rd.cov2)):
-        ext = rd.plot_h if asm == rd.asm1 else rd.plot_w
-        b = marginal_bins(rd.segs_info(asm), rd.placements[asm], st.read_band, len(st.keys),
-                          0, ext, rd.binsize)
-        check(np.allclose(b["series"], np.array(st.series[asm], float)),
-              f"{asm}: bins differ from the server's")
-        left, _ = rd.bin_edges(asm)
-        check(list(b["left"]) == list(left), f"{asm}: bin edges differ")
 
 
 def test_nice_bin():
@@ -131,7 +116,7 @@ def _js_matches(rd):
 
 def main():
     tmp = tempfile.mkdtemp(prefix="qaview_rebin_tests_")
-    tests = [(test_matches_server_bins, True), (test_nice_bin, False), (test_coverage_gaps, False),
+    tests = [(test_nice_bin, False), (test_coverage_gaps, False),
              (test_js_matches_python, True)]
     for fn, needs_tmp in tests:
         print(f"{fn.__name__} ...")

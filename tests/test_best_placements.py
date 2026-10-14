@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import numpy as np
 
-from fixtures import write_bam, write_db
+from fixtures import marginal, write_bam, write_db
 
 _failures = []
 
@@ -77,7 +77,7 @@ def test_lines_run_between_best_placements_only():
 def test_marginals_split_each_read_over_its_best_placements():
     with tempfile.TemporaryDirectory() as tmp:
         rd = build(tmp)
-    a = rd.cov1.total()                      # asm A, bins of 500 bp over 0-10 kb
+    a = marginal(rd, "A")["series"][0]       # asm A, bins of 500 bp over 0-10 kb
     at = lambda pos: a[pos // 500]
     check(np.isclose(at(1500), 1.0), f"unique read: weight 1 ({at(1500)})")
     check(np.isclose(at(3500), 0.5) and np.isclose(at(5500), 0.5),
@@ -87,7 +87,7 @@ def test_marginals_split_each_read_over_its_best_placements():
           f"a best copy outside the locus still takes its share: 1/2 here ({at(9000)})")
     check(np.isclose(at(2250), 1.0) and np.isclose(at(6250), 1.0),
           f"the primary and its supplementary piece both at the primary's share ({at(2250)}, {at(6250)})")
-    b = rd.cov2.total()
+    b = marginal(rd, "B")["series"][0]
     check(np.isclose(b.sum(), 2 * 1.0 + 2 * 1.0 + 2 * 1.0 + 1.0),
           f"asm B: each read once over its bins ({b.sum()})")
 
@@ -174,7 +174,7 @@ def test_one_sided_reads_show_partial_alignments_on_selection():
     check(len(ind.get("x", [])) == 1 and relaxed.read_names[ind["read"][0]] == "sv"
           and abs(ind["x"][0] - 3300) < 1 and ind["text"][0] == "600 bp deletion in B at cB:3,301",
           f"one cross, at the deletion's middle on B's axis: {ind}")
-    b = rd.cov2.total()
+    b = marginal(rd, "B")["series"][0]
     check(np.isclose(b[2000 // 500], 0.0) and np.isclose(b[8000 // 500], 1.0),
           f"B's marginal does not count the pieces (w alone at 8 kb): {b[4]}, {b[16]}")
     check(full.n_partial == 0, "without a partial plen there are none")
