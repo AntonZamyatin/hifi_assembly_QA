@@ -287,7 +287,7 @@ def test_common_colour_matches_marginals(tmp):
 def test_coordinate_readout(tmp):
     rd = make_region_data(tmp, "co")
     layout = report_layout(rd)
-    divs = [c for c in layout.children if isinstance(c, Div)]
+    divs = [c for c in layout.children if isinstance(c, Div) and c.visible]
     check(len(divs) == 2, f"expected coordinate + bin-status Divs, got {len(divs)}")
     p = _panels(layout)
     events = p["main"].js_event_callbacks.get("mousemove", [])

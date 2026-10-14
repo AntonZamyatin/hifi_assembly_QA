@@ -165,7 +165,24 @@
     <div class="resizer" data-side="right" title="drag to resize"></div>
     <button class="collapse" data-side="right" title="collapse sidebar">&rsaquo;</button>
     <div class="side-body">
-      <div class="slot" id="right-top"></div>
+      <section id="reads-panel">
+        <div class="section-head"><span>Reads</span></div>
+        <div id="bin-meta" class="small muted">Click a marginal bin to list its reads.</div>
+        <div class="tbl-wrap" id="bin-reads-wrap" hidden>
+          <table id="bin-reads" class="tbl">
+            <thead></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div id="read-meta" class="small muted" hidden></div>
+        <div class="tbl-wrap" id="read-alns-wrap" hidden>
+          <table id="read-alns" class="tbl">
+            <thead></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+      <div id="right-split" title="drag to resize; double-click to reset"></div>
       <section id="align-panel">
         <div class="section-head"><span>Alignment</span></div>
         <div id="align-meta" class="small muted">Shift+drag a rectangle on the dotplot to align the stretches under it.</div>

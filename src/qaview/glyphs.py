@@ -25,7 +25,7 @@ from bokeh.plotting import figure
 
 from qatool.plotters.axis import contig_runs
 from qatool.plotters.colors import SUPPORT_COLORS
-from qaview.region import MARGIN_BINS, coverage_gaps, marginal_bins
+from qaview.region import LAYER_PARTIAL, MARGIN_BINS, coverage_gaps, marginal_bins
 
 SUPPLEMENTARY_COLOR = "#d62728"
 # A one-sided read's partial alignments in the other candidate (region.LAYER_PARTIAL):
@@ -34,6 +34,9 @@ PARTIAL_COLOR = "#ff7f0e"
 PARTIAL_ALPHA = 0.9
 # A large indel on a partial row: a cross on its line, with it on selection only.
 INDEL_COLOR = "#4a148c"
+# a read picked in the read browser: rings on its best-placement lines
+PICK_COLOR = "#e6007e"
+PICK_RING = 18
 # coverage dropouts on the marginals; drawn past any coverage, the axis clips them
 DROPOUT_COLOR = "#e41a1c"
 DROPOUT_TOP = 1e9
@@ -870,6 +873,22 @@ function qvBinsOf(M, reads, gs) {
     return Array.from(out);
 }
 
+// Read g's line rows. The map is built once per lines data (its `read` column).
+function qvRowsOf(lines, g) {
+    const read = lines.data["read"];
+    const cache = window.qvRowsCache || (window.qvRowsCache = new WeakMap());
+    let m = cache.get(read);
+    if (!m) {
+        m = new Map();
+        for (let r = 0; r < read.length; r++) {
+            const a = m.get(read[r]);
+            if (a) a.push(r); else m.set(read[r], [r]);
+        }
+        cache.set(read, m);
+    }
+    return m.get(g) || [];
+}
+
 // The reads under the current selected line rows.
 function qvSelectedReads(lines) {
     const read = lines.data["read"], gs = new Set();
@@ -1024,6 +1043,68 @@ def _link_reads_to_bins(main, margs: list, reads):
     lines.selected.js_on_change("indices", cb)
 
 
+def _link_bin_click(cov_fig, marg, reads, mode: Div, stackings: dict, orientation: str):
+    """Clicking a marginal bin hands every read in it to the page's read browser, as
+    a `qv-bin` DOM event: the bin, the reads (indices into `qv-reads`) and each
+    one's band in the stacking on show, with the bands' names and colours."""
+    cb = CustomJS(args=dict(M=marg, reads=reads, mode=mode, vertical=(orientation == "x"),
+                            label=cov_fig.name or "",
+                            names={k: list(st.keys) for k, st in stackings.items()},
+                            colors={k: list(st.colors) for k, st in stackings.items()}),
+                  code="""
+        const h = M.hit.data, p = vertical ? cb_obj.x : cb_obj.y;
+        let lo = 0, hi = h.right.length;                // first bin ending past p
+        while (lo < hi) { const mid = (lo + hi) >> 1; if (h.right[mid] > p) hi = mid; else lo = mid + 1; }
+        if (lo >= h.left.length || h.left[lo] > p) return;
+        const b = lo, I = M.iv.data, gs = new Set();
+        for (let i = 0; i < I.p0.length; i++)
+            if (I.seg[i] === h.seg[b] && I.p0[i] < h.right[b] && I.p1[i] > h.left[b]) gs.add(I.read[i]);
+        const m = mode.text, band = reads.data["band_" + m];
+        const list = Array.from(gs);
+        document.dispatchEvent(new CustomEvent("qv-bin", {detail: {
+            assembly: label, contig: h.contig[b], start: h.bin_start[b], end: h.bin_end[b],
+            reads: list, bands: list.map((g) => band[g]),
+            band_names: names[m], band_colors: colors[m]}}));
+        """)
+    cov_fig.js_on_event("tap", cb)
+
+
+def _pick_read(main, margs: list, reads) -> Div:
+    """A hidden model the page sets to "<read index>#<n>" to select that read: its
+    lines on the dotplot and its bins on both marginals (it may have no lines --
+    a read placed in one candidate only). Empty text clears the selection."""
+    pick = Div(text="", visible=False, name="qv-pick")
+    lines = line_renderer(main).data_source
+    # A read's line is a few pixels long on a large locus: a ring at the middle of
+    # each of its best-placement lines shows where it is at any zoom.
+    marks = ColumnDataSource(dict(x=[], y=[]), name="qv-pick-marks")
+    main.scatter("x", "y", source=marks, marker="circle", size=PICK_RING, fill_alpha=0.0,
+                 line_color=PICK_COLOR, line_width=2.5)
+    pick.js_on_change("text", CustomJS(
+        args=dict(lines=lines, margs=margs, reads=reads, marks=marks, partial=LAYER_PARTIAL),
+        code=REBIN_JS + """
+        const t = cb_obj.text;
+        if (!t) {
+            lines.selected.indices = [];
+            for (const M of margs) M.hit.selected.indices = [];
+            marks.data = {x: [], y: []};
+            return;
+        }
+        const g = parseInt(t), d = lines.data;
+        const rows = [], x = [], y = [];
+        for (const r of qvRowsOf(lines, g)) {
+            rows.push(r);
+            if (d.layer[r] === partial) continue;      // rings mark the best placements only
+            x.push((d.x0[r] + d.x1[r]) / 2);
+            y.push((d.y0[r] + d.y1[r]) / 2);
+        }
+        lines.selected.indices = rows;
+        marks.data = {x, y};
+        for (const M of margs) M.hit.selected.indices = qvBinsOf(M, reads, [g]);
+        """))
+    return pick
+
+
 def _coordinate_readout(rd, main):
     """Live contig:position readout for the crosshair, both axes."""
     div = Div(text="<i>hover the dotplot for coordinates</i>",
@@ -1168,6 +1249,9 @@ def report_layout(rd, color_by: str = "class", visible_layers=None,
     _link_bins_to_reads(rd, cov_right, my, mx, main, status, "y", reads, stackings, mode)
     _link_reads_to_bins(main, [mx, my], reads)
     _wire_rebin(rd, main, shared, line_renderer(main).data_source, [mx, my], reads)
+    _link_bin_click(cov_top, mx, reads, mode, stackings, "x")
+    _link_bin_click(cov_right, my, reads, mode, stackings, "y")
+    pick = _pick_read(main, [mx, my], reads)
     readout = _coordinate_readout(rd, main)
 
     corner = Spacer(width=BAR_SIZE, height=margin_size, tags=["qv:corner"])
@@ -1197,7 +1281,7 @@ def report_layout(rd, color_by: str = "class", visible_layers=None,
         div.width = BAR_SIZE + w + margin_size
         div.styles = {**div.styles, "white-space": "nowrap", "overflow": "hidden",
                       "text-overflow": "ellipsis"}
-    return column(readout, status, grid)
+    return column(readout, status, grid, pick)   # pick: hidden, for the page
 
 
 def save_html(layout, path: str, title: str = "qaview", inline: bool = True) -> str:

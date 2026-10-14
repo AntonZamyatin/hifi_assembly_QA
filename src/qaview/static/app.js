@@ -308,6 +308,7 @@ async function openLocus(id, keepMsg = false) {
   clearAlignment();
   clearPlot();
   state.rects = [];
+  clearBrowser();
   loadRecruitSeeds(id);
   loadView();
 }
@@ -366,6 +367,7 @@ async function loadView() {
   else requestAnimationFrame(() => requestAnimationFrame(placeHandles));
   restyle();                               // controls changed while it was loading
   renderBackgroundStatus(d.background);
+  clearBrowser();                          // its read indices belonged to the old view
   loadRects(id);                           // placed in this view's layout (it may be sorted)
 }
 
@@ -866,6 +868,260 @@ function toggleReads() {
   else if (state.lastRect) alignRect(...state.lastRect);
 }
 
+// ---- read browser ------------------------------------------------------------------
+// A click on a marginal bin lists its reads (glyphs._link_bin_click sends them as a
+// `qv-bin` event); a click on one of them selects it in the plot (`qv-pick`) and
+// lists all its alignments.
+
+const browser = { gen: 0, pick: 0, picked: null, rows: [], alns: [] };
+
+// A table filled from `rows`: a click on a header sorts by that column (again:
+// the other way), a drag on a header's right edge narrows or widens the column.
+// The table is as wide as its columns, at least its panel's width (it scrolls
+// when wider); a cell cut short ends in an ellipsis, its full text the tooltip.
+// `cols`: {key, label, num, w (default width), fmt(row) -> text, cell(row, td)}.
+function fillTable(table, cols, rows, onRow) {
+  const st = table._sort || (table._sort = { key: null, asc: true });
+  const widths = table._widths || (table._widths = {});
+  const fit = () => {
+    const sum = cols.reduce((t, c) => t + (widths[c.key] || c.w), 0);
+    table.style.width = `max(100%, ${sum}px)`;
+  };
+  fit();
+  const head = el("tr");
+  for (const c of cols) {
+    const th = el("th", c.label);
+    if (c.num) th.className = "num";
+    if (c.title) th.title = c.title;
+    th.style.width = `${widths[c.key] || c.w}px`;
+    if (st.key === c.key) th.classList.add("sorted", st.asc ? "asc" : "desc");
+    th.addEventListener("click", () => {
+      if (table._resized) { table._resized = false; return; }   // the end of a drag
+      st.asc = st.key === c.key ? !st.asc : true;
+      st.key = c.key;
+      fillTable(table, cols, rows, onRow);
+    });
+    const grip = el("span");
+    grip.className = "col-grip";
+    grip.addEventListener("pointerdown", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      grip.setPointerCapture(e.pointerId);
+      const x0 = e.clientX, w0 = th.offsetWidth;
+      const move = (ev) => {
+        widths[c.key] = Math.max(16, w0 + ev.clientX - x0);
+        th.style.width = `${widths[c.key]}px`;
+        fit();
+      };
+      const up = (ev) => {
+        grip.removeEventListener("pointermove", move);
+        grip.removeEventListener("pointerup", up);
+        table._resized = ev.clientX !== x0;
+      };
+      grip.addEventListener("pointermove", move);
+      grip.addEventListener("pointerup", up);
+    });
+    th.append(grip);
+    head.append(th);
+  }
+  table.tHead.replaceChildren(head);
+  let list = rows;
+  const c = st.key && cols.find((x) => x.key === st.key);
+  if (c) {
+    const v = c.sort || ((r) => r[c.key]);
+    const blank = (x) => x == null || x !== x;           // null or NaN: always last
+    list = [...rows].sort((a, b) => {
+      const x = v(a), y = v(b);
+      if (blank(x) || blank(y)) return blank(x) - blank(y);
+      const d = typeof x === "number" ? x - y : String(x).localeCompare(String(y));
+      return st.asc ? d : -d;
+    });
+  }
+  table.tBodies[0].replaceChildren(...list.map((r) => {
+    const tr = el("tr");
+    for (const col of cols) {
+      const td = el("td");
+      if (col.num) td.className = "num";
+      if (col.cell) col.cell(r, td);
+      else {
+        td.textContent = col.fmt ? col.fmt(r) : String(r[col.key] ?? "");
+        td.title = td.textContent;
+      }
+      tr.append(td);
+    }
+    if (onRow) onRow(r, tr);
+    return tr;
+  }));
+}
+
+function clearBrowser() {
+  browser.gen++;
+  browser.rows = [];
+  browser.picked = null;
+  $("#bin-meta").textContent = "Click a marginal bin to list its reads.";
+  $("#bin-reads tbody").replaceChildren();
+  $("#bin-reads-wrap").hidden = true;
+  clearReadAlns();
+}
+
+function clearReadAlns() {
+  browser.alns = [];
+  $("#read-meta").hidden = true;
+  $("#read-alns tbody").replaceChildren();
+  $("#read-alns-wrap").hidden = true;
+}
+
+function fmtScore(r) {
+  if (r !== r) return "—";                 // NaN: not scored
+  if (!isFinite(r)) return r > 0 ? "+inf" : "-inf";
+  return (r >= 0 ? "+" : "") + r.toFixed(2);
+}
+
+const READ_COLS = [
+  { key: "band", label: "", w: 14, cell: (r, td) => {
+      td.className = "sw";
+      const i = el("i");
+      i.style.background = r.color;
+      td.append(i);
+      td.title = r.bandName;
+    } },
+  { key: "name", label: "read", w: 160 },
+  { key: "len", label: "length", num: true, w: 62,
+    fmt: (r) => r.len === undefined ? "…" : r.len === null ? "?" : r.len.toLocaleString() },
+  { key: "ratio", label: "score", num: true, w: 56, title: "log-ratio, nats: + favours the y candidate",
+    fmt: (r) => fmtScore(r.ratio) },
+];
+
+const ALN_COLS = [
+  { key: "assembly", label: "asm", w: 68 },
+  { key: "contig", label: "contig", w: 96 },
+  { key: "start", label: "start", num: true, w: 92, fmt: (a) => a.start.toLocaleString() },
+  { key: "end", label: "end", num: true, w: 92, fmt: (a) => a.end.toLocaleString() },
+  { key: "strand", label: "str", w: 30 },
+  { key: "pid", label: "pid", num: true, w: 62, fmt: (a) => a.pid == null ? "—" : a.pid.toFixed(4) },
+  { key: "plen", label: "plen", num: true, w: 54, fmt: (a) => a.plen == null ? "—" : a.plen.toFixed(3) },
+  { key: "type", label: "type", w: 84 },
+];
+
+function renderBinReads() {
+  fillTable($("#bin-reads"), READ_COLS, browser.rows, (r, tr) => {
+    tr.style.background = `color-mix(in srgb, ${r.color} 22%, transparent)`;
+    tr.title = `${r.name}\n${r.bandName}\n${r.txt}`;
+    if (r.g === browser.picked) tr.classList.add("on");
+    tr.addEventListener("click", () => pickRead(r, tr));
+  });
+}
+
+function renderReadAlns() {
+  fillTable($("#read-alns"), ALN_COLS, browser.alns, (a, tr) => {
+    if (a.best) tr.className = "best";
+    else if (!a.passes) tr.className = "fails";
+  });
+}
+
+async function onBin(e) {
+  const d = e.detail, doc = viewDoc();
+  const reads = doc && doc.get_model_by_name("qv-reads");
+  if (!reads) return;
+  const gen = ++browser.gen;
+  browser.picked = null;
+  // unsorted, the rows come by band, then name
+  browser.rows = d.reads.map((g, i) => ({
+    g, band: d.bands[i], color: d.band_colors[d.bands[i]], bandName: d.band_names[d.bands[i]],
+    name: reads.data.name[g], ratio: reads.data.ratio[g], txt: reads.data.ratio_txt[g],
+  })).sort((a, b) => a.band - b.band || a.name.localeCompare(b.name));
+  const rows = browser.rows;
+  $("#bin-meta").textContent = `${d.assembly} ${d.contig}:${d.start.toLocaleString()}-` +
+    `${d.end.toLocaleString()}  ·  ${rows.length.toLocaleString()} reads`;
+  renderBinReads();
+  $("#bin-reads-wrap").hidden = false;
+  clearReadAlns();
+  if (!rows.length) return;
+  try {
+    const res = await fetch("/api/reads/lengths", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ names: rows.map((r) => r.name) }),
+    });
+    if (!res.ok || gen !== browser.gen) return;
+    const got = await res.json();
+    for (const r of rows) r.len = got[r.name] ?? null;
+    renderBinReads();
+  } catch (_) { /* lengths are a nicety */ }
+}
+
+async function pickRead(r, tr) {
+  for (const x of document.querySelectorAll("#bin-reads tr.on")) x.classList.remove("on");
+  tr.classList.add("on");
+  browser.picked = r.g;
+  const doc = viewDoc();
+  const pick = doc && doc.get_model_by_name("qv-pick");
+  if (pick) pick.text = `${r.g}#${++browser.pick}`;      // a new text, so a re-click fires too
+  const gen = browser.gen;
+  $("#read-meta").hidden = false;
+  $("#read-meta").textContent = `${r.name}: alignments…`;
+  const q = new URLSearchParams({ name: r.name, pid: $("#pid").value, plen: $("#plen").value,
+                                  best_pid_delta: $("#best_pid_delta").value });
+  let alns;
+  try {
+    const res = await fetch(`/api/reads/alignments?${q}`);
+    if (!res.ok) throw new Error(errorDetail(await res.text()));
+    alns = await res.json();
+  } catch (err) {
+    $("#read-meta").textContent = `${r.name}: ${err.message}`;
+    return;
+  }
+  if (gen !== browser.gen || browser.picked !== r.g) return;
+  const nBest = alns.filter((a) => a.best).length;
+  $("#read-meta").textContent = `${r.name}  ·  ${alns.length} alignments, ${nBest} at best ` +
+    "placements (bold); grey: below the display pid/plen";
+  browser.alns = alns;
+  renderReadAlns();
+  $("#read-alns-wrap").hidden = false;
+}
+
+// The border between the read browser and the alignment panel: a drag sets the
+// browser's height, kept across sessions; a double-click restores half and half.
+const SPLIT_KEY = "qaview.readsHeight";
+
+function setReadsHeight(px) {
+  const body = $("#right .side-body");
+  const h = Math.round(Math.min(body.clientHeight - 120, Math.max(100, px)));
+  $("#reads-panel").style.flexBasis = `${h}px`;
+  return h;
+}
+
+function wireSplit() {
+  const handle = $("#right-split");
+  try {
+    const saved = parseFloat(localStorage.getItem(SPLIT_KEY));
+    if (saved) setReadsHeight(saved);
+  } catch (_) { /* storage blocked: half and half */ }
+  handle.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    handle.setPointerCapture(e.pointerId);
+    handle.classList.add("active");
+    document.body.classList.add("resizing-v");
+    const top = $("#reads-panel").getBoundingClientRect().top;
+    let h = null;
+    const move = (ev) => { h = setReadsHeight(ev.clientY - top); };
+    const up = () => {
+      handle.removeEventListener("pointermove", move);
+      handle.removeEventListener("pointerup", up);
+      handle.removeEventListener("pointercancel", up);
+      handle.classList.remove("active");
+      document.body.classList.remove("resizing-v");
+      try { if (h) localStorage.setItem(SPLIT_KEY, String(h)); } catch (_) { /* not critical */ }
+    };
+    handle.addEventListener("pointermove", move);
+    handle.addEventListener("pointerup", up);
+    handle.addEventListener("pointercancel", up);
+  });
+  handle.addEventListener("dblclick", () => {
+    $("#reads-panel").style.flexBasis = "";
+    try { localStorage.removeItem(SPLIT_KEY); } catch (_) { /* not critical */ }
+  });
+}
+
 // ---- remembered alignments ---------------------------------------------------------
 
 async function loadRects(id) {
@@ -1076,6 +1332,8 @@ function wireRectAlign() {
 // ---- wiring -----------------------------------------------------------------------
 
 function wire() {
+  document.addEventListener("qv-bin", onBin);
+  wireSplit();
   $("#loci tbody").addEventListener("click", (e) => {
     if (e.target.closest("td.star button")) {
       toggleStar(e.target.closest("tr").dataset.id);

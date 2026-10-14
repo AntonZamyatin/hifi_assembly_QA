@@ -500,6 +500,53 @@ def _best_placements(blocks: list, tol: float) -> tuple:
     return kept, sum(b[10] != "supplementary" for b in kept)
 
 
+def read_lengths(db_path: str, names: list, assemblies: list, chunk: int = 800) -> dict:
+    """read -> its length (q_len) from the aln table."""
+    out = {}
+    ph = ",".join("?" * len(assemblies))
+    con = sqlite3.connect(db_path)
+    try:
+        for i in range(0, len(names), chunk):
+            c = list(names[i:i + chunk])
+            sql = (f"SELECT read_name, MAX(q_len) FROM aln WHERE assembly IN ({ph}) "
+                   f"AND read_name IN ({','.join('?' * len(c))}) GROUP BY read_name")
+            out.update(con.execute(sql, list(assemblies) + c).fetchall())
+    finally:
+        con.close()
+    return out
+
+
+def read_alignments(db_path: str, name: str, assemblies: list, pid: float, plen: float,
+                    tol: float) -> list:
+    """Every alignment of read `name` in `assemblies`, genome-wide, as dicts:
+    assembly, contig, start, end, strand ("+"/"-"), pid, plen, type, and two marks --
+    `passes` (the display pid/plen) and `best` (one of its best placements there,
+    `_best_placements`, the ones the plots draw). Unmapped records are left out."""
+    con = sqlite3.connect(db_path)
+    try:
+        rows = con.execute(
+            f"SELECT assembly, {_BLOCK_COLS}, plen FROM aln WHERE assembly IN "
+            f"({','.join('?' * len(assemblies))}) AND read_name = ? AND contig IS NOT NULL "
+            f"AND start IS NOT NULL ORDER BY assembly, contig, start",
+            list(assemblies) + [name]).fetchall()
+    finally:
+        con.close()
+    out = []
+    for asm in assemblies:
+        mine = [r for r in rows if r[0] == asm]
+        blocks = [r[1:-1] for r in mine if r[12] is not None and r[12] >= pid
+                  and r[13] is not None and r[13] >= plen]
+        best = {(b[1], b[2], b[3], b[10]) for b in _best_placements(blocks, tol)[0]}
+        for r in mine:
+            b = r[1:-1]
+            ok = r[12] is not None and r[12] >= pid and r[13] is not None and r[13] >= plen
+            out.append(dict(assembly=asm, contig=b[1], start=b[2], end=b[3],
+                            strand="+" if b[4] == 1 else "-", pid=b[11], plen=r[13],
+                            type=b[10], passes=bool(ok),
+                            best=ok and (b[1], b[2], b[3], b[10]) in best))
+    return out
+
+
 def _best_by_read(blocks: list, tol: float) -> dict:
     """read -> (best placements, n) over one assembly's aln rows (`_best_placements`)."""
     by_read: dict = {}

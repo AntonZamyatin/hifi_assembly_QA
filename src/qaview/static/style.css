@@ -10,7 +10,7 @@
   --star: #c98a00;
   --warn: #b2182b;
   --left-w: 360px;
-  --right-w: 260px;
+  --right-w: 340px;
   --collapsed: 22px;
   font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
   color: var(--ink);
@@ -243,6 +243,38 @@ dl.files dd { font-family: ui-monospace, monospace; font-size: 11px; }
   border: 1.5px dashed var(--accent);
   background: color-mix(in srgb, var(--accent) 8%, transparent);
 }
+
+/* ---- read browser (top half of the right sidebar) -------------------------------- */
+
+#reads-panel { flex: 0 0 50%; min-height: 0; margin-top: 18px;   /* clear of the collapse button */
+               display: flex; flex-direction: column; gap: 6px; padding-bottom: 4px; }
+#right-split { flex: 0 0 9px; margin: 0 -4px 6px; cursor: ns-resize; position: relative; }
+#right-split::after { content: ""; position: absolute; left: 4px; right: 4px; top: 4px;
+                      border-top: 1px solid var(--line); }
+#right-split:hover, #right-split.active { background: color-mix(in srgb, var(--accent) 25%, transparent); }
+body.resizing-v, body.resizing-v * { cursor: ns-resize !important; user-select: none; }
+.tbl-wrap { flex: 1 1 0; min-height: 60px; overflow: auto;
+            border: 1px solid var(--line); border-radius: 3px; background: var(--panel); }
+.tbl-wrap[hidden] { display: none; }
+/* Fixed layout: columns keep the widths their headers set (app.js fillTable sets
+   the table's width to their sum, at least the panel's); cut text ellipsizes. */
+.tbl { width: 100%; table-layout: fixed; border-collapse: collapse; font-size: 12px; }
+.tbl th, .tbl td { padding: 2px 5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tbl th { position: sticky; top: 0; z-index: 1; background: var(--panel); text-align: left;
+          font-weight: 600; border-bottom: 1px solid var(--line); cursor: pointer; user-select: none; }
+.tbl th.sorted.asc::after { content: " \25B4"; }
+.tbl th.sorted.desc::after { content: " \25BE"; }
+.tbl th:not(.sorted):hover::after { content: " \2195"; opacity: .5; }
+.tbl .col-grip { position: absolute; top: 0; right: 0; width: 6px; height: 100%; cursor: col-resize; }
+.tbl .col-grip:hover { background: color-mix(in srgb, var(--accent) 30%, transparent); }
+.tbl .num { text-align: right; font-variant-numeric: tabular-nums; }
+.tbl td.sw { padding: 0 0 0 4px; }
+.tbl td.sw i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; }
+#bin-reads tbody tr { cursor: pointer; }
+#bin-reads tbody tr:hover { filter: brightness(0.95); }
+#bin-reads tbody tr.on { outline: 1.5px solid var(--accent); outline-offset: -1.5px; }
+#read-alns tr.best td { font-weight: 600; }
+#read-alns tr.fails td { color: var(--muted); }
 
 /* ---- reads under the alignment ------------------------------------------------- */
 

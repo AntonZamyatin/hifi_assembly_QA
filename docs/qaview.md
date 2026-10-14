@@ -971,6 +971,23 @@ since it knows everything except the seeds.
   loads, in its layout) -- and the k-mer background is resampled into the new
   layout to within one of its bins. A segment whose reads land in two places on
   the other axis (a duplication) goes by the heavier one.
+- **Read browser.** The right sidebar's top half. A click on a marginal bin
+  lists every read in it (`glyphs._link_bin_click` sends them to the page as a
+  `qv-bin` DOM event), rows tinted by their band in the stacking on show, with
+  length (`q_len`, `POST /api/reads/lengths`) and log-ratio score once scored. A
+  click on a read selects it in the plot -- its lines and its bins on both
+  marginals, through the hidden `qv-pick` model, so a read placed in one
+  candidate only still lights its bins; a ring marks the middle of each of its
+  best-placement lines, which on a large locus are only a few pixels long -- and
+  lists all its alignments in both
+  candidates (`GET /api/reads/alignments`, `region.read_alignments`): contig,
+  start, end, strand, pid, plen and type, the best placements the plots draw in
+  bold, those below the display pid/plen in grey. A new view clears it. A
+  click on a column header sorts by it (again: the other way); a drag on a
+  header's right edge narrows or widens that column (a table is as wide as its
+  columns, at least its panel, and scrolls when wider; cut text ends in an
+  ellipsis, with the full text on hover). The border between the read browser
+  and the alignment panel drags, kept across sessions; a double-click resets it.
 - **Coverage dropouts.** Each marginal marks in thin red every stretch of a
   segment that no read's best placement covers (`region.coverage_gaps`), exact
   to the bp and drawn at least a pixel wide, so a dropout narrower than a bin

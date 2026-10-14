@@ -33,7 +33,8 @@ from qaview.pipeline import Pipeline
 from qaview.project import (RECRUITMENT_CHOICES, RECRUITMENT_RANGES, Project, ProjectError,
                             load_project)
 from qaview.region import (LAYER_COMMON, LAYER_OTHER, LAYER_PARTIAL, LAYER_SUPPLEMENTARY,
-                           LAYER_SUPPORT, RegionData, arrange)
+                           LAYER_SUPPORT, RegionData, arrange, read_alignments,
+                           read_lengths)
 
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
@@ -456,6 +457,21 @@ def create_app(project: Project | None = None, pipeline: Pipeline | None = None,
                 min_indel=min_indel)
 
         return s.regions.get(key, build)
+
+    # ---- read browser -----------------------------------------------------------------
+
+    @app.post("/api/reads/lengths")
+    def reads_lengths(names: list[str] = Body(..., embed=True)):
+        """Read -> length, for the reads of a clicked marginal bin."""
+        p = cur().project
+        return read_lengths(p.db, names, [p.asm1.name, p.asm2.name])
+
+    @app.get("/api/reads/alignments")
+    def reads_alignments(name: str, pid: float = 0.997, plen: float = 0.999,
+                         best_pid_delta: float = 0.001):
+        """Every alignment of one read in both candidates, marked (region.read_alignments)."""
+        p = cur().project
+        return read_alignments(p.db, name, [p.asm1.name, p.asm2.name], pid, plen, best_pid_delta)
 
     @app.get("/api/loci/{lid}/align")
     def align(lid: str, x0: float, x1: float, y0: float, y1: float,
