@@ -521,7 +521,7 @@ def create_app(project: Project | None = None, pipeline: Pipeline | None = None,
             out["reads"] = pileup(
                 rd, out, {p.asm1.name: p.asm1.bam, p.asm2.name: p.asm2.bam},
                 {p.asm1.name: p.asm1.fasta, p.asm2.name: p.asm2.fasta}, p.db, stacking,
-                pid=pid, plen=plen, best_pid_delta=best_pid_delta, pid_tie_eps=pid_tie_eps)
+                pid=pid, plen=plen, best_pid_delta=best_pid_delta)
         return out
 
     @app.get("/api/loci/{lid}/view")
@@ -595,8 +595,6 @@ def create_app(project: Project | None = None, pipeline: Pipeline | None = None,
                 "worst_band_edge": score.worst_band_edge,
                 "placements": getattr(score, "placements", 0),
                 "pruned": getattr(score, "pruned", 0),
-                "boundary": len(getattr(score, "boundary", ())),
-                "dropped_boundary": len(getattr(score, "dropped_boundary", ())),
                 "fixed_quality": len(getattr(score, "fixed_quality", ())),
                 # per read, for Delta S at another C on the page (+/-inf as 1e308:
                 # JSON has no infinity, and any C clamps it the same)

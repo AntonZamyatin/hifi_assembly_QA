@@ -12,12 +12,11 @@ src/qatool/          Importable package
   SegmentStorage.py    Segment + SegmentCollection (non-overlapping interval set)
   aln_utils.py         CIGAR parsing / identity + length stats
   build_aln_db.py      BAM -> SQLite `aln` table
-  SRRecruiter.py       Recursive read<->segment recruiter + likelihood metrics
-  analysis.py          Read-only DB query helpers (return DataFrames)
-  plotters.py          Mosaic k-mer dotplot + coverage report plot
-  alignment_plot.py    Coverage / alignment plotting helpers
-  RecruitLogger.py     Recruitment logging
-scripts/             Data-prep shell drivers (prepare_data.sh, run_prepare.sh, align.sh)
+  SRRecruiter.py       Recursive read<->segment recruiter
+  plotters/            Mosaic k-mer dotplot + coverage report plot
+src/qaview/          Interactive viewer (`python -m qaview project.toml`)
+src/qamodel/         Pair-HMM read scoring
+scripts/             Data-prep shell drivers (prepare_data.sh, run_prepare.sh)
 docs/
   plotters.md          Deep dev notes on plotters.py (coordinate system, fixed bugs)
   comparative_study.md 52-assembly VGP vs LJA comparative study notes

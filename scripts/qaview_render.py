@@ -7,8 +7,8 @@ self-contained page — bokeh JS is inlined, so it opens over scp/sshfs with no 
     scripts/qaview_render.py --base examples --label rVipUrs1 \
         --contig SUPER_Z --start 5404885 --end 5409029 -o /tmp/rVipUrs1.html
 
-Phase 1: static panels with linked zoom and a shared crosshair.  No widgets yet, so
-every threshold is fixed at the values passed here.
+Every threshold is fixed at the values passed here; the qaview server
+(`python -m qaview project.toml`) is the interactive version.
 """
 
 import argparse
@@ -50,8 +50,6 @@ def main(argv=None):
     ap.add_argument("--ext-max", type=int, default=300_000)
     ap.add_argument("--ext-rounds", type=int, default=2)
     ap.add_argument("--max-rounds", type=int, default=100)
-    ap.add_argument("--recruit-out", default=None,
-                    help="recruiter scratch dir (default: alongside --out)")
     ap.add_argument("--color-by", choices=("class", "block"), default="class")
     args = ap.parse_args(argv)
 
@@ -77,11 +75,7 @@ def main(argv=None):
         reads: set = set()
     else:
         from qatool.SRRecruiter import Recruiter
-        out_dir = args.recruit_out or os.path.join(
-            os.path.dirname(os.path.abspath(args.out)) or ".", f"{args.label}_recruit")
-        os.makedirs(out_dir, exist_ok=True)
-        print(f"[qaview] recruiting from {args.contig}:{args.start:,}-{args.end:,} "
-              f"(scratch: {out_dir})", flush=True)
+        print(f"[qaview] recruiting from {args.contig}:{args.start:,}-{args.end:,}", flush=True)
         srr = Recruiter(
             db_path=paths["db"], asm1=args.asm1, asm2=args.asm2,
             asm1_bam_path=paths["bam1"], asm2_bam_path=paths["bam2"],
@@ -90,7 +84,7 @@ def main(argv=None):
             plen_threshold=args.plen_threshold, best_pid_delta=args.best_pid_delta,
             extension_window=args.ext_window, ext_max=args.ext_max,
             ext_rounds=args.ext_rounds, max_rounds=args.max_rounds,
-            out_dir=out_dir, verbose=True,
+            verbose=True,
         )
         segments, reads, _df = srr.run(
             SegmentCollection([Segment(args.asm1, args.contig, args.start, args.end)]))

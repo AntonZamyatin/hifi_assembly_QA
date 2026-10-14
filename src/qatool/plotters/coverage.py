@@ -72,47 +72,18 @@ class CoverageBins:
         """Read names landing in bin i."""
         return [self.read_names[j] for j in self.read_idx[self.bin_offsets[i]:self.bin_offsets[i + 1]]]
 
-    def by_read(self) -> tuple:
-        """Transpose of the bin index: local read index -> bin indices, CSR-style.
-
-        Returns (offsets, bins) with offsets of length len(read_names) + 1.  Lets a
-        viewer answer "which bins does this read occupy?" without rescanning.
-        """
-        n = len(self.read_names)
-        counts = np.zeros(n, dtype=np.int64)
-        for r in self.read_idx:
-            counts[r] += 1
-        offsets = np.zeros(n + 1, dtype=np.int64)
-        np.cumsum(counts, out=offsets[1:])
-        cursor = offsets[:-1].copy()
-        bins = np.zeros(len(self.read_idx), dtype=np.int32)
-        for b in range(len(self.bins)):
-            for k in range(self.bin_offsets[b], self.bin_offsets[b + 1]):
-                r = self.read_idx[k]
-                bins[cursor[r]] = b
-                cursor[r] += 1
-        return offsets, bins
-
 
 def compute_coverage_bins(bamfile: str, segments: list,
                           pid_threshold: float = 0.99, plen_threshold: float | None = None,
                           binsize: int = 1000, read_buckets=None,
-                          best_pid_delta: float = BEST_PID_DELTA_DEFAULT,
-                          best_only=None, best_tol: float = 0.0) -> CoverageBins:
+                          best_pid_delta: float = BEST_PID_DELTA_DEFAULT) -> CoverageBins:
     """
     Bin read coverage over `segments`, tracking which reads contribute to each bin.
 
     A read's qualifying alignments are those within best_pid_delta of its own best
     pid; each contributes weight 1/n so a multi-mapping read still counts once in
     total.  Reads not in any bucket accumulate into `bins`.
-
-    `best_only` names reads counted only at their best placements (within
-    `best_tol` of their best pid, plus supplementary pieces of them), the read's
-    weight of 1 split evenly across those placements -- a supplementary piece
-    belongs to a placement and does not take a share of its own. qaview uses it
-    for reads that vote for one assembly; off by default.
     """
-    best_only = best_only or set()
     if not segments:
         raise ValueError("segments must be a non-empty list")
     segments = sorted(segments, key=lambda s: (s.contig, s.start, s.end))
@@ -154,46 +125,37 @@ def compute_coverage_bins(bamfile: str, segments: list,
                 startbin = math.floor((max(aln.reference_start, seg.start) - seg.start + offset) / binsize)
                 endbin = math.ceil((min(aln.reference_end, seg.end) - seg.start + offset) / binsize)
                 if startbin < endbin:
-                    valid_alns.append((aln.query_name, float(pid), startbin, endbin,
-                                       aln.is_supplementary))
+                    valid_alns.append((aln.query_name, float(pid), startbin, endbin))
             offset += math.ceil((seg.end - seg.start) / binsize) * binsize
     finally:
         bam.close()
 
     # Pass 1: find best pid per read.
     best_pid_by_read = {}
-    for read_name, pid, startbin, endbin, _supp in valid_alns:
+    for read_name, pid, startbin, endbin in valid_alns:
         if read_name not in best_pid_by_read or pid > best_pid_by_read[read_name]:
             best_pid_by_read[read_name] = pid
 
     # Pass 2: collect qualifying alignments (within best_pid_delta of best) per read,
     # then fill bins with weight 1 / number of tied alignments.
     qualifying: dict = {}
-    for read_name, pid, startbin, endbin, supp in valid_alns:
-        best = best_pid_by_read.get(read_name, float("-inf"))
-        if read_name in best_only:
-            keep = supp or pid + best_tol >= best
-        else:
-            keep = pid + best_pid_delta >= best
-        if keep:
-            qualifying.setdefault(read_name, []).append((startbin, endbin, supp))
+    for read_name, pid, startbin, endbin in valid_alns:
+        if pid + best_pid_delta >= best_pid_by_read[read_name]:
+            qualifying.setdefault(read_name, []).append((startbin, endbin))
 
     read_names = list(qualifying)
     read_pos = {name: i for i, name in enumerate(read_names)}
     bin_reads: list = [dict() for _ in range(n_bins)]      # read index -> weight
 
     for read_name, ranges in qualifying.items():
-        if read_name in best_only:
-            w = 1.0 / max(1, sum(not supp for _, _, supp in ranges))
-        else:
-            w = 1.0 / len(ranges)
+        w = 1.0 / len(ranges)
         if bucket_bins is None:
             target = bins
         else:
             bucket_idx = name_to_bucket.get(read_name)
             target = bucket_bins[bucket_idx] if bucket_idx is not None else bins
         ri = read_pos[read_name]
-        for startbin, endbin, _supp in ranges:
+        for startbin, endbin in ranges:
             for i in range(startbin, endbin):
                 target[i] += w
                 bin_reads[i][ri] = bin_reads[i].get(ri, 0.0) + w

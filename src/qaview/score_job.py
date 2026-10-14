@@ -2,8 +2,7 @@
 `python -m qaview.score_job <project.toml> <recruitment.pkl> [--pid X --plen Y]`.
 
 `--pid`/`--plen` are the thresholds the locus was recruited with (the pipeline
-knows them for every seed; older recruitment files do not record them); the
-recruitment's boundary reads are scored too (`score_locus(boundary_reads=)`).
+knows them for every seed; older recruitment files do not record them).
 
 A subprocess so the server never imports the pair-HMM engine or forks from a
 threaded process; this one forks the scoring workers itself. It goes through
@@ -48,7 +47,6 @@ def main(argv=None):
         fastas={p.asm1.name: p.asm1.fasta, p.asm2.name: p.asm2.fasta},
         genome_fasta=p.genome_fasta, library_assembly=p.library_assembly,
         cache_dir=p.loci_dir, progress=progress,
-        boundary_reads=sorted(rec.get("boundary_reads", ())),
         pid_threshold=pid, plen_threshold=plen)
     return 0
 

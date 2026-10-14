@@ -87,10 +87,10 @@ def _best_info(db, assembly: str, names, pid: float, plen: float) -> dict:
     return out
 
 
-def placements(bam, db, rd, assembly: str, contig: str, lo: int, hi: int, *,
-               pid: float, plen: float, best_pid_delta: float, pid_tie_eps: float) -> list:
+def placements(bam, db, assembly: str, contig: str, lo: int, hi: int, *,
+               pid: float, plen: float, best_pid_delta: float) -> list:
     """The alignments over [lo, hi) that the marginal for `assembly` counts: a read's
-    best placements (`pid_tie_eps` is no longer used here; kept for callers)."""
+    best placements."""
     cand = []
     for a in bam.fetch(contig, lo, hi):
         if a.is_unmapped:
@@ -253,7 +253,7 @@ def project(ev: dict, cols: list, other: str) -> tuple[list, list]:
 
 
 def pileup(rd, a: dict, bams: dict, fastas: dict, db_path: str, stacking, *,
-           pid: float, plen: float, best_pid_delta: float, pid_tie_eps: float) -> dict:
+           pid: float, plen: float, best_pid_delta: float) -> dict:
     """Rows of reads for both sides of alignment `a` (a qaview.align result).
 
     `bams`/`fastas` map assembly name to a file path; `stacking` is the
@@ -277,8 +277,8 @@ def pileup(rd, a: dict, bams: dict, fastas: dict, db_path: str, stacking, *,
                      a["bottom_end"], bottom_map, a["strand"] == "-", a["top"])):
                 ref = fa_f[asm].fetch(contig, lo, hi).upper()
                 rows = []
-                for aln, p in placements(bam_f[asm], db, rd, asm, contig, lo, hi, pid=pid, plen=plen,
-                                         best_pid_delta=best_pid_delta, pid_tie_eps=pid_tie_eps):
+                for aln, p in placements(bam_f[asm], db, asm, contig, lo, hi, pid=pid, plen=plen,
+                                         best_pid_delta=best_pid_delta):
                     g = gidx.get(aln.query_name)
                     band = stacking.read_band[g] if g is not None else len(stacking.keys) - 1
                     try:

@@ -35,12 +35,6 @@ const state = {
 
 // ---- formatting --------------------------------------------------------------------
 
-function fmtBp(bp) {
-  if (bp >= 1e6) return (bp / 1e6).toFixed(bp >= 1e7 ? 0 : 1) + " Mb";
-  if (bp >= 1e3) return Math.round(bp / 1e3) + " kb";
-  return bp + " bp";
-}
-
 function fmtDs(x) {
   if (x === null || x === undefined) return "";
   const a = Math.abs(x), s = x > 0 ? "+" : x < 0 ? "−" : "";
@@ -648,13 +642,10 @@ function renderScore(d) {
   const parts = el("span",
     `emission ${fmtDs(s.emission)} (${s.at_plus_C} at +C, ${s.at_minus_C} at −C)  ·  ` +
     `exposure ${fmtDs(s.exposure)}  ·  ${s.scored.toLocaleString()} scored, ${s.dropped} dropped` +
-    (s.boundary || s.dropped_boundary ? `  ·  boundary ${s.boundary} scored, ${s.dropped_boundary} dropped` : "") +
     (s.fixed_quality ? `  ·  ${s.fixed_quality.toLocaleString()} at fixed Q${p.fallback_qual}` : ""));
   parts.className = "parts";
-  parts.title = "scored: reads with a log-ratio (boundary reads included)\n" +
-    "dropped: a placement passing the recruitment's pid/plen crosses a segment edge\n" +
-    "boundary: reads crossing a sealed edge, scored with windows past it; dropped when " +
-    "they do not reach one candidate's segments" +
+  parts.title = "scored: reads with a log-ratio\n" +
+    "dropped: a placement passing the recruitment's pid/plen crosses a segment edge" +
     (s.fixed_quality ? `\nfixed Q${p.fallback_qual}: reads stored without base qualities ` +
      "(aligned from FASTA), every base given that quality" : "");
   const ramp = el("span"); ramp.className = "legend-ramp";

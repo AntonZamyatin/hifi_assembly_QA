@@ -1,16 +1,15 @@
-"""Tests for the pair-HMM score in qaview: log-ratio colouring and the Delta S panel.
+"""Tests for the pair-HMM score in qaview: log-ratio colouring and the marginals' bands.
 
 The colouring has one hard constraint, inherited from the hover and selection
 callbacks: rows are addressed by position, so a colour mode may change colours,
 widths and opacities but never the number or order of rows. Most checks here
-are about that, plus the promise that the clamp C is display-only.
+are about that.
 
 Run: venv/bin/python tests/test_score_view.py
 """
 
 import math
 import os
-import pickle
 import sys
 import tempfile
 
@@ -28,10 +27,8 @@ from qatool.SegmentStorage import Segment
 
 from qamodel.exposure import Exposure
 from qamodel.score import LocusScore, ReadScore
-from qaview.app import QaviewApp, dataset_paths
 from qaview.glyphs import (UNSCORED_COLOR, _line_source, class_stacking, ratio_band,
                            ratio_color, ratio_stacking, ratio_strength, report_layout)
-from qaview.score import ScoreJob, score_cache_path
 
 _failures = []
 
@@ -128,53 +125,6 @@ def test_unscored_before_scoring(tmp):
     report_layout(rd, color_by="log-ratio")                 # must not raise
 
 
-def test_score_cache_ignores_display(tmp):
-    p = dict(dataset_paths("b", "l", "asm1", "asm2"), asm1="asm1", asm2="asm2",
-             contig="c", start=0, end=100, pid_threshold=0.997, plen_threshold=0.999,
-             best_pid_delta=0.001, merge_gap=1, extension_window=1, ext_max=1,
-             ext_rounds=1, max_rounds=1)
-    a = score_cache_path(tmp, p)
-    check(a == score_cache_path(tmp, dict(p, binsize=5000, color="log-ratio")),
-          "display settings must not invalidate a score")
-    check(a != score_cache_path(tmp, dict(p, asm2="other")),
-          "a different assembly pair must be a different score")
-
-
-def test_score_job_reads_cache(tmp):
-    p = dict(dataset_paths("b", "l", "asm1", "asm2"), asm1="asm1", asm2="asm2",
-             contig="c", start=0, end=100, pid_threshold=0.997, plen_threshold=0.999,
-             best_pid_delta=0.001, merge_gap=1, extension_window=1, ext_max=1,
-             ext_rounds=1, max_rounds=1)
-    cache = os.path.join(tmp, "sc")
-    os.makedirs(cache, exist_ok=True)
-    ls = fake_score(["x"], [-5.0])
-    with open(score_cache_path(cache, p), "wb") as fh:
-        pickle.dump(ls, fh)
-    job = ScoreJob(p, "unused.pkl", cache).start()
-    check(job.done and job.from_cache and job.result.reads[0].ratio == -5.0,
-          "a cached score must load without starting a subprocess")
-
-
-def test_clamp_is_display_only(tmp):
-    """Moving C changes Delta S in the panel and the colours, never the stored ratios."""
-    app = QaviewApp(cache_dir=os.path.join(tmp, "cache"))
-    app.rd = make_region_data(tmp, "cl")
-    names = sorted(set(app.rd.read_names))
-    app.score = fake_score(names, [-150.0] + [0.1] * (len(names) - 1))
-    app.color_by.value = "log-ratio"
-    app.clamp.value = 200
-    app._render()
-    html200 = app.score_pane.object
-    app.clamp.value = 50
-    app._render()
-    html50 = app.score_pane.object
-    want200 = f"{app.score.at(200):+.2f}"
-    want50 = f"{app.score.at(50):+.2f}"
-    check(want200 in html200 and want50 in html50 and want50 != want200,
-          f"panel must show Delta S at the slider's C: {want200} / {want50}")
-    check(app.score.reads[0].ratio == -150.0, "the slider must not touch stored ratios")
-
-
 def test_rebucket_counts_repeated_placements(tmp):
     """Two tied alignments of one read in the same bin contribute 2/n there, not 1/n.
 
@@ -267,8 +217,6 @@ def main():
     tmp = tempfile.mkdtemp(prefix="qaview_score_view_")
     tests = [(test_strength_scale, False), (test_line_source_keeps_rows, True),
              (test_hidden_layers_stay_hidden, True), (test_unscored_before_scoring, True),
-             (test_score_cache_ignores_display, True), (test_score_job_reads_cache, True),
-             (test_clamp_is_display_only, True),
              (test_rebucket_counts_repeated_placements, True), (test_ratio_bands, False),
              (test_ratio_stacking_is_exact, True), (test_layout_marginals_follow_colour, True),
              (test_packed_ratio_colours_match_ratio_color, False)]

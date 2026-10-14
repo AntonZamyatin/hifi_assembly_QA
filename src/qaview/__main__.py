@@ -8,8 +8,6 @@ the port:
 
     ssh -L 5006:localhost:5006 <host>
     venv/bin/python -m qaview examples/projects/hg002_hic.toml
-
-The earlier Panel app is still available as `panel serve src/qaview/app.py`.
 """
 
 import argparse

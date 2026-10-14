@@ -1,8 +1,7 @@
 """Bokeh figure builders for the interactive report.
 
-Phase 1: the static panels — read-correspondence lines, marginal coverage, contig
-bars — wired together with linked ranges, wheel zoom and a shared crosshair.
-No widgets and no hover/selection yet (Phases 2-3).
+Read-correspondence lines, marginal coverage and contig bars, wired together with
+linked ranges, wheel zoom, a shared crosshair, and hover/tap selection in CustomJS.
 
 Every number comes from `RegionData`; nothing here touches a BAM or a DB.  Contig
 colours are taken from the same matplotlib colormap `report_plot` uses so the
@@ -744,22 +743,6 @@ def contig_bar_figure(rd, assembly: str, orientation: str, colors: dict,
     p.min_border = 0
     _draw_end_marks(p, rd, assembly, orientation, p.width if orientation == "x" else p.height)
     return p
-
-
-def _global_index(rd, cov):
-    """(local -> global, global -> local) read-index maps between a CoverageBins and rd.
-
-    `CoverageBins.read_names` is per-assembly and holds only reads that reached a bin,
-    while line rows index `RegionData.read_names`.  Precomputing both directions in
-    Python keeps the hover callback to plain array lookups.
-    """
-    pos = {n: i for i, n in enumerate(rd.read_names)}
-    l2g = [pos.get(n, -1) for n in cov.read_names]
-    g2l = [-1] * len(rd.read_names)
-    for local, g in enumerate(l2g):
-        if g >= 0:
-            g2l[g] = local
-    return l2g, g2l
 
 
 def _read_bucket_index(rd) -> list:

@@ -1,8 +1,10 @@
 # qaview — interactive design document
 
-Status: Panel app implemented (§3–§11). **Being rebuilt** on a project file, a
-FastAPI server and a CSS-grid page — see §13, written 2026-09-24, which supersedes
-§3's choice of Panel and §7.5b's seed picker. Written 2026-07-27.
+Status: rebuilt on a project file, a FastAPI server and a CSS-grid page — see §13,
+written 2026-09-24, which supersedes §3's choice of Panel and §7.5b's seed picker.
+The Panel app of §3–§11 (`app.py`, `state.py`, `recruit.py`, `score.py`, `seeds.py`,
+`jobs.py` and their workers) was removed on 2026-10-14; those sections are kept as
+design history. Written 2026-07-27.
 
 `qaview` is an interactive exploration frontend for the assembly-QA report figure.
 It is a new package (`src/qaview/`) that reuses `qatool`'s data layer and adds a
@@ -148,7 +150,7 @@ Consequences:
 
 ### Coordinate inverse (new)
 
-`axis.py` has `_bins_to_genome_intervals` but no scalar inverse. The crosshair
+`axis.py` had no scalar plot -> genome inverse. The crosshair
 readout needs one:
 
 ```python
@@ -1047,11 +1049,12 @@ that belongs to a project lives in a `Session` replaced whole).
 | module | fate |
 |---|---|
 | `glyphs.py` | reused; `report_layout` already takes a size box |
-| `region.py`, `state.py` | reused |
+| `region.py` | reused |
+| `state.py` | removed with the Panel app (2026-10-14); `report_plot` export went with it |
 | `recruit.py` | `run_recruitment` reused by the queue; cache key reused |
 | `score.py`, `score_worker.py` | replaced by `phmm_likelihood_report(cache_dir=...)` in a subprocess |
 | `seeds.py` | becomes the QUAST loader behind the seed interface |
-| `app.py` | replaced by `project.py`, `pipeline.py`, `server.py` and `static/` |
+| `app.py` | replaced by `project.py`, `pipeline.py`, `server.py` and `static/`; removed 2026-10-14 |
 
 ### 13.7 Open
 

@@ -79,7 +79,7 @@ class SegmentCollection:
     def __len__(self):
         return self.count
 
-    def __add__(self, other: SegmentCollection) -> SegmentCollection:
+    def __iadd__(self, other: SegmentCollection) -> SegmentCollection:
         for segment in other:
             self.add(segment)
         return self

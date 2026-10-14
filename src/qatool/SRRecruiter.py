@@ -20,14 +20,11 @@ import sqlite3
 import hashlib
 import pysam
 import pandas as pd
-import math
-import os
 import sys
 from collections import Counter
 from typing import Set, Iterable, List, Tuple, Dict
-from qatool.SegmentStorage import *
+from qatool.SegmentStorage import Segment, SegmentCollection
 from qatool.aln_utils import cigar_stats
-from qatool.plotters import report_plot
 
 # Extension strategies (Recruiter(extension=...)):
 #   legacy -- crawl 100 bp windows; seal a window with more than extension_k common
@@ -55,7 +52,7 @@ class Recruiter:
                  pid_threshold: float=0.99, plen_threshold: float=0.99,
                  extension_window: int=100, extension_k: int=5,
                  ext_max: int=100_000, ext_rounds: int=100,
-                 max_rounds=100, out_dir: str | None = "recruitment_out",
+                 max_rounds=100,
                  best_pid_delta: float = 0.0001,
                  extension: str = "legacy"):
         self.db_path = db_path
@@ -85,21 +82,12 @@ class Recruiter:
         self.extension_k = extension_k
         self.ext_max = ext_max
         self.ext_rounds = ext_rounds
-        self.out_dir = out_dir
         self.best_pid_delta = best_pid_delta
         if extension not in EXTENSIONS:
             raise ValueError(f"extension must be one of {EXTENSIONS}, not {extension!r}")
         self.extension = extension
-
-        self.sc: SegmentCollection = SegmentCollection(merge_gap=self.merge_gap)
-        self.seen_reads: Set[str] = set()
-        self.aln_df: pd.DataFrame = pd.DataFrame(columns=["read_name", "asm", "contig",
-                                                          "start", "end", "pid", "plen", "ed"])
-        self._sealed: Dict[Tuple[str, str, int, int], Tuple[bool, bool]] = {}
         self._contig_lens: Dict[str, Dict[str, int]] = {}
-        self._common_cache: Dict[str, bool] = {}
-        self._aln_cache: Dict[str, list] = {}
-        self._init_anchor_state()
+        self.reset()
 
     def _init_anchor_state(self):
         # Anchor extension. Seals are positions, so they survive merges and rounds:
@@ -108,9 +96,6 @@ class Recruiter:
         self._edge_seals: Dict[Tuple[str, str, str], Set[int]] = {}
         self._anchor_cache: Dict[str, list | None] = {}
         self._bridge_cache: Dict[Tuple[str, str, int, int], bool] = {}
-        # Reads crossing a sealed edge overlap the segment only within an anchor, so
-        # none are kept apart now; left for the callers that read it, always empty.
-        self.boundary_reads: Set[str] = set()
         # One row per edge decision, for comparing strategies: round, assembly,
         # contig, side, from, to, why ("anchor", "copy", "contig_end", "limit"), read.
         self.edge_log: List[dict] = []
@@ -129,29 +114,6 @@ class Recruiter:
         # contained in one was judged then: it joined seen_reads or failed the
         # static pid/plen filter, so later scans need not look at it again.
         self._scanned: Dict[Tuple[str, str], List[Tuple[int, int]]] = {}
-
-    def _concat_seqs_for_segments(self, sc_sorted: List[Segment], assembly: str) -> str:
-        fa = self.fastas[assembly]
-        parts: List[str] = []
-        for seg in sc_sorted:
-            if seg.assembly != assembly:
-                continue
-            parts.append(fa.fetch(seg.contig, seg.start, seg.end))
-        return "".join(parts)
-
-    def _write_round_plot(self, round_id: int):
-        if self.out_dir is None:
-            return
-        os.makedirs(self.out_dir, exist_ok=True)
-        sc_sorted = sorted(self.sc, key=lambda s: (s.contig, s.start, s.end))
-        seq_asm1 = self._concat_seqs_for_segments(sc_sorted, self.asm1)
-        seq_asm2 = self._concat_seqs_for_segments(sc_sorted, self.asm2)
-        out_path = os.path.join(self.out_dir, f"round_{round_id}.png")
-        """report_plot(
-            seq_asm1, seq_asm2, self.sc, self.seen_reads,
-            self.db_path, self.pid_threshold, self.plen_threshold,
-            output_path=out_path, asm1=self.asm1, asm2=self.asm2, show=False
-        )"""
 
     def run(self, seed: List[Segment]|SegmentCollection) -> Tuple[SegmentCollection, Set[str], pd.DataFrame]:
         """
@@ -182,7 +144,6 @@ class Recruiter:
                 break
             self.seen_reads.update(new_reads)
             self.expand_reads_to_segments(new_reads)
-            self._write_round_plot(cur_round)
         if self.verbose: print(f"DONE segments recruited:", self.sc)
         # Final pass: include reads fully contained in the final segments
         final_reads = self.expand_segments_to_reads()
@@ -686,95 +647,3 @@ class Recruiter:
                 aln_rows[-1]["ed"] = (None if ed is None else int(ed))
         self.aln_df = pd.concat([self.aln_df, pd.DataFrame(aln_rows)], ignore_index=True)
         self.sc += new_segments
-
-
-def metrics_report_from_aln_df(
-    aln_df: pd.DataFrame,
-    assembly_lengths: Dict[str, float],
-    pid_threshold: float | None = None,
-    plen_threshold: float | None = None,
-) -> pd.DataFrame:
-    """
-    Compute per-assembly support/likelihood metrics from recruiter alignment table.
-
-    Metrics per assembly:
-      - reads_only: number of reads with qualifying alignments only in that assembly
-      - likelihood: Π_r ( (Σ_i exp(-D_i)) / L_A )
-      - log_likelihood: Σ_r log( (Σ_i exp(-D_i)) / L_A )
-
-    Uses D_i = ed if 'ed' exists; otherwise falls back to D_i = (1 - pid) * q_aln_len
-    when 'q_aln_len' is present.
-    """
-    required = {"read_name", "asm"}
-    missing = required - set(aln_df.columns)
-    if missing:
-        raise ValueError(f"aln_df is missing required columns: {sorted(missing)}")
-    if not assembly_lengths:
-        raise ValueError("assembly_lengths must be provided, e.g. {'asm1': L_asm1, 'asm2': L_asm2}")
-
-    df = aln_df.copy()
-    if pid_threshold is not None and "pid" in df.columns:
-        df = df[df["pid"] >= float(pid_threshold)]
-    if plen_threshold is not None and "plen" in df.columns:
-        df = df[df["plen"] >= float(plen_threshold)]
-
-    if "ed" in df.columns:
-        df = df[df["ed"].notna()].copy()
-        df["D"] = df["ed"].astype(float)
-    elif "q_aln_len" in df.columns and "pid" in df.columns:
-        print("here")
-        df["D"] = (1.0 - df["pid"].astype(float)) * df["q_aln_len"].astype(float)
-    else:
-        raise ValueError("Need either 'ed' column or both 'pid' and 'q_aln_len' to compute D")
-
-    reads = sorted(df["read_name"].astype(str).unique().tolist())
-    if not reads:
-        return pd.DataFrame(columns=["asm", "reads_only", "likelihood", "log_likelihood", "n_reads", "L_A"])
-
-    read_sets: Dict[str, set] = {}
-    for asm, g in df.groupby("asm"):
-        read_sets[str(asm)] = set(g["read_name"].astype(str).unique().tolist())
-
-    rows = []
-    all_assemblies = sorted(read_sets.keys())
-    for asm in all_assemblies:
-        l_a = float(assembly_lengths.get(asm, 0.0))
-        if l_a <= 0:
-            raise ValueError(f"assembly_lengths['{asm}'] must be > 0")
-
-        own_reads = read_sets.get(asm, set())
-        other_reads = set()
-        for other_asm, rr in read_sets.items():
-            if other_asm != asm:
-                other_reads |= rr
-        reads_only = len(own_reads - other_reads)
-
-        by_read_sum = (
-            df[df["asm"].astype(str) == asm]
-            .assign(_exp=lambda x: x["pid"].map(lambda d: math.exp(-float(d))))
-            .groupby("read_name", as_index=True)["_exp"]
-            .sum()
-            .to_dict()
-        )
-
-        log_likelihood = 0.0
-        valid = True
-        for r in reads:
-            p = float(by_read_sum.get(r, 0.0)) / l_a
-            if p <= 0.0:
-                continue
-            log_likelihood += math.log(p)
-        likelihood = 0.0 if not valid else math.exp(log_likelihood)
-        if not valid:
-            log_likelihood = float("-inf")
-
-        rows.append({
-            "asm": asm,
-            "reads_only": int(reads_only),
-            "likelihood": float(likelihood),
-            "log_likelihood": float(log_likelihood),
-            "n_reads": int(len(reads)),
-            "L_A": float(l_a),
-        })
-
-    return pd.DataFrame(rows).sort_values("asm").reset_index(drop=True)

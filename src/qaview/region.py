@@ -12,6 +12,7 @@ each renderer can build its own mapping — see `docs/qaview.md` §5.
 """
 
 import math
+import re
 import sqlite3
 from dataclasses import dataclass, field, replace
 
@@ -58,7 +59,7 @@ class ReadLines:
     """Read-correspondence line segments in plot space (asm2 = X, asm1 = Y).
 
     One entry per (asm1 block, asm2 block) pair sharing read span.  Unlike
-    `reads_block_dotplot` these are **not** merged: merging is resolution-dependent
+    the old static dotplot these are **not** merged: merging is resolution-dependent
     and would have to be redone on every zoom, so the interactive renderer encodes
     depth with alpha instead.
 
@@ -291,7 +292,7 @@ def _all_contig_lengths(bam_path: str) -> dict:
         return dict(zip(bam.references, bam.lengths))
 
 
-_CIGAR = __import__("re").compile(r"(\d+)([MIDNSHP=X])")
+_CIGAR = re.compile(r"(\d+)([MIDNSHP=X])")
 # At most this many of a read's other alignments are kept: in a repeat a read can
 # have dozens tied at its best, each drawn against each of its whole placements.
 PARTIAL_MAX_PER_READ = 5

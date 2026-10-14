@@ -115,7 +115,7 @@ def recruiter(files, extension="anchor", merge_gap=1_000, plen=0.5):
 
     return Recruiter(**files, pid_threshold=0.99, plen_threshold=plen, best_pid_delta=0.001,
                      merge_gap=merge_gap, extension_window=100, ext_max=300_000,
-                     ext_rounds=100, max_rounds=100, out_dir=None, verbose=False,
+                     ext_rounds=100, max_rounds=100, verbose=False,
                      extension=extension)
 
 
@@ -144,7 +144,6 @@ def test_edges_move_to_the_nearest_anchors():
             check(any(s <= 50_000 and e >= 55_000 for _, s, e in spans(sc, asm)[1:]),
                   f"{asm}: r20's other qualifying alignment is a segment too: {spans(sc, asm)}")
         check(reads >= {f"r{i}" for i in range(20, 36)}, f"reads inside, anchors too: {sorted(reads)}")
-        check(r.boundary_reads == set(), "no boundary reads")
         log = [(e["assembly"], e["side"], e["from"], e["to"], e["why"], e["read"]) for e in r.edge_log]
         check(("A", "L", 28_000, 20_000, "anchor", "r20") in log
               and ("A", "R", 32_000, 40_000, "anchor", "r35") in log, f"asm1's edges: {log}")

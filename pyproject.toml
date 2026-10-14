@@ -17,9 +17,8 @@ dependencies = [
 
 [project.optional-dependencies]
 # qaview: bokeh draws, fastapi/uvicorn serve the page, edlib and parasail align
-# the stretches under a shift+drag rectangle; panel runs the older app
-# (src/qaview/app.py).
-view = ["bokeh", "fastapi", "uvicorn", "edlib", "parasail", "panel"]
+# the stretches under a shift+drag rectangle.
+view = ["bokeh", "fastapi", "uvicorn", "edlib", "parasail"]
 # The compiled pair-HMM engine. Without it qamodel still works;
 # forward_window is the same recursion in numpy, about 28x slower.
 model = ["numba"]

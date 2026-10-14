@@ -27,9 +27,7 @@ import pandas as pd
 import numpy as np
 
 from qatool.SegmentStorage import *
-from qatool.SRRecruiter import Recruiter, metrics_report_from_aln_df
-from qatool.analysis import *
-from qatool.alignment_plot import *
+from qatool.SRRecruiter import Recruiter
 from qatool.plotters import *
 """
 
@@ -62,7 +60,7 @@ def run_pipe(db_path, asm1, asm2, bam1, bam2, fasta1, fasta2, sg, fig_path,
         pid_threshold=pid_threshold, plen_threshold=plen_threshold,
         best_pid_delta=best_pid_delta,
         extension_window=ext_window, ext_max=ext_max, ext_rounds=ext_rounds,
-        max_rounds=max_rounds, out_dir=None,   # per-round plots are disabled
+        max_rounds=max_rounds,
     )
     segments, reads, df = SRR.run(sg)
 
@@ -97,9 +95,8 @@ def run_pipe(db_path, asm1, asm2, bam1, bam2, fasta1, fasta2, sg, fig_path,
         fastas={asm1: fasta1, asm2: fasta2},
         genome_fasta=genome_fasta, library_assembly=library_assembly,
         cache_dir=LOCI_DIR,
-        # the recruitment's thresholds and boundary reads, as qaview passes them,
+        # the recruitment's thresholds, as qaview passes them,
         # so both find the same cached score
-        boundary_reads=sorted(getattr(SRR, "boundary_reads", ())),
         pid_threshold=pid_threshold, plen_threshold=plen_threshold,
     )
     if score_path:

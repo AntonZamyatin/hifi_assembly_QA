@@ -26,36 +26,6 @@ def _build_axis_map(sc, assembly: str, binsize: int = None):
     return segs, offset
 
 
-def _bins_to_genome_intervals(bin_values: list, segs_info: list, binsize: int) -> list:
-    """
-    Map hot bins (bin_values[i] > 0) back to merged genome (contig, start, end) intervals.
-    segs_info: [(contig, seg_start, seg_end, plot_offset), ...] from _build_axis_map.
-    """
-    intervals = []
-    for i, v in enumerate(bin_values):
-        if v <= 0:
-            continue
-        plot_start = i * binsize
-        for contig, seg_start, seg_end, offset in segs_info:
-            seg_plot_end = offset + math.ceil((seg_end - seg_start) / binsize) * binsize
-            if offset <= plot_start < seg_plot_end:
-                gen_start = seg_start + (plot_start - offset)
-                gen_end   = min(seg_end, seg_start + ((i + 1) * binsize - offset))
-                intervals.append((contig, gen_start, gen_end))
-                break
-
-    # Merge consecutive intervals on the same contig
-    if not intervals:
-        return []
-    merged = [list(intervals[0])]
-    for contig, s, e in intervals[1:]:
-        if contig == merged[-1][0] and s <= merged[-1][2]:
-            merged[-1][2] = max(merged[-1][2], e)
-        else:
-            merged.append([contig, s, e])
-    return [(c, s, e) for c, s, e in merged]
-
-
 def contig_runs(segs_info, total):
     """Yield (contig, bar_off, bar_end) merging consecutive same-contig segments.
 

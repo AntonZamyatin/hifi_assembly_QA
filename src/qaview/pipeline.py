@@ -94,17 +94,15 @@ def recruit_one(job: dict) -> str:
         extension_window=r["extension_window"], ext_max=r["ext_max"],
         ext_rounds=r["ext_rounds"], max_rounds=r["max_rounds"],
         extension=r.get("extension", "legacy"),
-        out_dir=None, verbose=False,
+        verbose=False,
     )
     seed = SegmentCollection([Segment(*job["seed"])])
     segments, reads, _ = srr.run(seed)
     tmp = f"{job['out']}.{os.getpid()}.tmp"
     with open(tmp, "wb") as fh:
-        # boundary_reads: reads crossing a sealed edge, kept apart from `reads` and out
-        # of locus_id (empty since anchor version 3); edge_log: why each edge stopped.
-        # params: what it was recruited with -- the scorer takes its pid/plen.
+        # edge_log: why each edge stopped. params: what it was recruited with -- the
+        # scorer takes its pid/plen.
         pickle.dump({"segments": list(segments), "reads": set(reads),
-                     "boundary_reads": set(srr.boundary_reads),
                      "edge_log": list(srr.edge_log), "params": dict(r)}, fh)
     os.replace(tmp, job["out"])
     return job["out"]
@@ -172,7 +170,6 @@ class Locus:
     seeds: list[str] = field(default_factory=list)
     n_reads: int = 0
     params: dict = field(default_factory=dict)     # recruitment parameters behind it
-    boundary: frozenset = frozenset()              # reads crossing a sealed edge
     span: dict = field(default_factory=dict)       # assembly -> bp
     n_segments: dict = field(default_factory=dict)  # assembly -> count
     status: str = "queued"      # queued | scoring | scored | failed
@@ -189,7 +186,7 @@ class Locus:
         row = {"id": self.id, "seeds": list(self.seeds), "n_seeds": len(self.seeds),
                "reads": self.n_reads, "span": self.span, "segments": self.n_segments,
                "status": self.status, "progress": round(self.progress, 3),
-               "error": self.error, "delta_s": None, "boundary": len(self.boundary),
+               "error": self.error, "delta_s": None,
                "recruiting": sorted(self.recruiting), "recruit_error": self.recruit_error,
                "background": self.background, "background_error": self.background_error}
         if s is not None:
@@ -431,7 +428,6 @@ class Pipeline:
             if loc is None:
                 names = (self.project.asm1.name, self.project.asm2.name)
                 loc = Locus(lid, st.path, reads_key=rkey, n_reads=len(reads), params=dict(params),
-                            boundary=frozenset(rec.get("boundary_reads", ())),
                             span={a: sum(s.end - s.start for s in segs if s.assembly == a)
                                   for a in names},
                             n_segments={a: sum(s.assembly == a for s in segs) for a in names})
@@ -448,10 +444,9 @@ class Pipeline:
     # ---- scoring ---------------------------------------------------------------------
 
     def score_kwargs(self, loc: Locus) -> dict:
-        """What scoring takes from the recruitment: its thresholds and boundary reads."""
+        """What scoring takes from the recruitment: its thresholds."""
         params = loc.params or self.project.recruitment
-        return {"boundary_reads": sorted(loc.boundary),
-                "pid_threshold": params["pid_threshold"],
+        return {"pid_threshold": params["pid_threshold"],
                 "plen_threshold": params["plen_threshold"]}
 
     def score_path(self, loc: Locus) -> str:
