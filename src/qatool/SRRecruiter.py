@@ -17,14 +17,12 @@ License: MIT License
 """
 
 import sqlite3
-import hashlib
 import pysam
 import pandas as pd
 import sys
-from collections import Counter
-from typing import Set, Iterable, List, Tuple, Dict
+from typing import Set, List, Tuple, Dict
 from qatool.SegmentStorage import Segment, SegmentCollection
-from qatool.aln_utils import cigar_stats
+from qatool.aln_utils import cigar_stats, rows_for_reads, same_sequences
 
 # Extension strategies (Recruiter(extension=...)):
 #   legacy -- crawl 100 bp windows; seal a window with more than extension_k common
@@ -240,41 +238,36 @@ class Recruiter:
             if float(pid) + self.best_pid_delta >= best_pid[asm]:
                 loci[asm].append((str(contig), int(start), int(end)))
 
-        # Step 3: compare sequence hash multisets
-        _comp = str.maketrans("ACGTNacgtn", "TGCANtgcan")
-
-        def _seq_hashes(asm: str, loci_list: List[Tuple[str, int, int]]) -> Counter:
-            fa = self.fastas[asm]
-            out: Counter = Counter()
-            for contig, start, end in loci_list:
-                seq = fa.fetch(contig, start, end).upper()
-                out[hashlib.sha1(seq.encode()).digest()] += 1
-                out[hashlib.sha1(seq.translate(_comp)[::-1].encode()).digest()] += 1
-            return out
-
-        is_common = _seq_hashes(self.asm1, loci[self.asm1]) == _seq_hashes(self.asm2, loci[self.asm2])
+        # Step 3: the same sequences, up to reverse complement
+        fa1, fa2 = self.fastas[self.asm1], self.fastas[self.asm2]
+        is_common = same_sequences(loci[self.asm1], loci[self.asm2],
+                                   lambda *l: fa1.fetch(*l).upper(),
+                                   lambda *l: fa2.fetch(*l).upper())
         self._common_cache[read_name] = is_common
         return is_common
 
-    def _check_window_for_extension(self, asm: str, contig: str, w_start: int, w_end: int) -> bool:
-        if w_end <= w_start:
-            return True
-        common_reads: Set[str] = set()
-        uncommon_reads: Set[str] = set()
+    def _legacy_window(self, asm: str, contig: str, w_start: int, w_end: int, side: str):
+        """A legacy extension window's qualifying alignments: their outer ends on
+        `side` ("L": starts, "R": ends), those of common reads, and whether the window
+        seals -- more than extension_k common reads in it, or none uncommon."""
+        ends: List[int] = []
+        common_ends: List[int] = []
+        common: Set[str] = set()
+        uncommon: Set[str] = set()
         for aln in self.bams[asm].fetch(contig, w_start, w_end):
-            assert(not aln.is_unmapped)
-            soft_left, soft_right, hard_left, hard_right, q_aln_len, q_len, plen, pid, _ = cigar_stats(aln)
-            if pid < self.pid_threshold or plen is None or plen < self.plen_threshold:
+            if not self._qualifies(aln):
                 continue
+            pos = int(aln.reference_start if side == "L" else aln.reference_end)
+            ends.append(pos)
             if self._read_is_common(aln.query_name):
-                common_reads.add(aln.query_name)
+                common_ends.append(pos)
+                common.add(aln.query_name)
             else:
-                uncommon_reads.add(aln.query_name)
-        if len(common_reads) > self.extension_k or not uncommon_reads:
-            if self.verbose:
-                print("SEALED", asm, contig, w_start, w_end, len(common_reads))
-            return True
-        return False
+                uncommon.add(aln.query_name)
+        sealed = len(common) > self.extension_k or not uncommon
+        if sealed and ends and self.verbose:
+            print("SEALED", asm, contig, w_start, w_end, len(common))
+        return ends, common_ends, sealed
 
     def _find_container_interval(self, sc: SegmentCollection, asm: str, contig: str,
                                  start: int, end: int) -> Tuple[int, int] | None:
@@ -459,19 +452,12 @@ class Recruiter:
                 if w_end <= w_start:
                     sealed_left = True
                     break
-                left_ends: List[int] = []
-                common_left_ends: List[int] = []
-                for aln in self.bams[seg.assembly].fetch(seg.contig, w_start, w_end):
-                    _, _, _, _, _, _, plen, pid, _ = cigar_stats(aln)
-                    if pid < self.pid_threshold or plen is None or plen < self.plen_threshold:
-                        continue
-                    left_ends.append(int(aln.reference_start))
-                    if self._read_is_common(aln.query_name):
-                        common_left_ends.append(int(aln.reference_start))
+                left_ends, common_left_ends, sealed = self._legacy_window(
+                    seg.assembly, seg.contig, w_start, w_end, "L")
                 if not left_ends:
                     sealed_left = True
                     break
-                if self._check_window_for_extension(seg.assembly, seg.contig, w_start, w_end):
+                if sealed:
                     # Window is common-dominated: snap out to the nearest bridging common
                     # read (the one whose start is closest to the boundary), then seal.
                     # Do not keep crawling through the common region.
@@ -503,19 +489,12 @@ class Recruiter:
                 if w_end <= w_start:
                     sealed_right = True
                     break
-                right_ends: List[int] = []
-                common_right_ends: List[int] = []
-                for aln in self.bams[seg.assembly].fetch(seg.contig, w_start, w_end):
-                    _, _, _, _, _, _, plen, pid, _ = cigar_stats(aln)
-                    if pid < self.pid_threshold or plen is None or plen < self.plen_threshold:
-                        continue
-                    right_ends.append(int(aln.reference_end))
-                    if self._read_is_common(aln.query_name):
-                        common_right_ends.append(int(aln.reference_end))
+                right_ends, common_right_ends, sealed = self._legacy_window(
+                    seg.assembly, seg.contig, w_start, w_end, "R")
                 if not right_ends:
                     sealed_right = True
                     break
-                if self._check_window_for_extension(seg.assembly, seg.contig, w_start, w_end):
+                if sealed:
                     # Window is common-dominated: snap out to the nearest bridging common
                     # read (the one whose end is closest to the boundary), then seal.
                     # Do not keep crawling through the common region.
@@ -585,8 +564,7 @@ class Recruiter:
                     continue
                 if any(s <= a_start and a_end <= e for s, e in done):
                     continue                # judged when that extent was scanned
-                soft_left, soft_right, hard_left, hard_right, q_aln_len, q_len, plen, pid, _ = cigar_stats(aln)
-                if not self._recruits(aln, pid, plen):
+                if not self._recruits(aln):
                     continue
                 reads.add(aln.query_name)
             scanned_now.append((key, (seg.start, seg.end)))
@@ -596,13 +574,11 @@ class Recruiter:
             self._scanned.setdefault(key, []).append(extent)
         return reads
 
-    def _recruits(self, aln, pid: float, plen) -> bool:
+    def _recruits(self, aln) -> bool:
         """Whether a BAM record recruits its read: pid and plen at the thresholds.
         Supplementary records never do: partial alignments, they would tie in
         unrelated regions (qaview classes split reads instead)."""
-        if aln.is_supplementary:
-            return False
-        return pid >= self.pid_threshold and plen is not None and plen >= self.plen_threshold
+        return not aln.is_supplementary and self._qualifies(aln)
 
     def expand_reads_to_segments(self, reads: Set[str]):
         """
@@ -610,10 +586,6 @@ class Recruiter:
         Returns:
             SegmentCollection
         """
-        def _chunks(lst: List[str], n: int) -> Iterable[List[str]]:
-            for i in range(0, len(lst), n):
-                yield lst[i:i + n]
-
         new_segments: SegmentCollection = SegmentCollection()
         aln_rows = []
         asm_placeholders: str = ",".join(["?"] * len(self.bams.keys()))
@@ -624,26 +596,22 @@ class Recruiter:
                       AND contig IS NOT NULL
                       AND start IS NOT NULL
                       AND end IS NOT NULL
-                      AND read_name IN ({{READS_IN}})
+                      AND read_name IN ({{reads}})
                       AND aln_type != 'supplementary'
                       AND pid >= ?
                       AND plen >= ?
                     """
-        tail_params = [self.pid_threshold, self.plen_threshold]
-        for chunk in _chunks(list(reads), 1000):
-            reads_in = ",".join(["?"] * len(chunk))
-            sql = base_sql.replace("{READS_IN}", reads_in)
-            params = list(self.bams.keys()) + chunk + tail_params
-            rows = self.con.execute(sql, params).fetchall()
-            # Every qualifying alignment of every recruited read is a segment, common
-            # reads included: HiFi-quality alignments are what tie related segments
-            # together, and the scorer must see each read's placements in both
-            # candidates (a copy left out of one makes it look one-sided, +/-C).
-            for read_name, asm, contig, start, end, pid, plen, ed, strand in rows:
-                new_segments.add(Segment(str(asm), str(contig), int(start), int(end)))
-                aln_rows.append({"read_name": str(read_name), "asm": str(asm),
-                                 "contig": str(contig), "start": int(start),
-                                 "end": int(end), "pid": float(pid), "plen": float(plen)})
-                aln_rows[-1]["ed"] = (None if ed is None else int(ed))
+        # Every qualifying alignment of every recruited read is a segment, common
+        # reads included: HiFi-quality alignments are what tie related segments
+        # together, and the scorer must see each read's placements in both
+        # candidates (a copy left out of one makes it look one-sided, +/-C).
+        for read_name, asm, contig, start, end, pid, plen, ed, strand in rows_for_reads(
+                self.con, base_sql, reads, before=list(self.bams.keys()),
+                after=[self.pid_threshold, self.plen_threshold]):
+            new_segments.add(Segment(str(asm), str(contig), int(start), int(end)))
+            aln_rows.append({"read_name": str(read_name), "asm": str(asm),
+                             "contig": str(contig), "start": int(start),
+                             "end": int(end), "pid": float(pid), "plen": float(plen)})
+            aln_rows[-1]["ed"] = (None if ed is None else int(ed))
         self.aln_df = pd.concat([self.aln_df, pd.DataFrame(aln_rows)], ignore_index=True)
         self.sc += new_segments

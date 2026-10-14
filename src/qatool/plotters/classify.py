@@ -5,6 +5,7 @@ from bisect import bisect_right
 
 import pysam
 
+from qatool.aln_utils import same_sequences
 from qatool.plotters.colors import BEST_PID_DELTA_DEFAULT, PID_TIE_EPS_DEFAULT
 from qatool.plotters.db import _fetch_aln_from_db
 
@@ -15,13 +16,6 @@ def _interval_in_segments(seg_lookup_by_contig: dict, contig: str, start: int, e
         if start < e and end > s:
             return True
     return False
-
-
-_COMP = str.maketrans("ACGTNacgtn", "TGCANtgcan")
-
-
-def _revcomp(seq: str) -> str:
-    return seq.translate(_COMP)[::-1]
 
 
 def _seq_reader(fa: pysam.FastaFile, loci) -> callable:
@@ -42,28 +36,6 @@ def _seq_reader(fa: pysam.FastaFile, loci) -> callable:
         s0, seq = seqs[c][bisect_right(starts[c], s) - 1]
         return seq[s - s0:e - s0]
     return get
-
-
-def _is_read_common(loci1: list, loci2: list, seq1, seq2) -> bool:
-    """
-    Mirror of Recruiter._read_is_common: True iff the reference sequences at loci1
-    (asm1) and loci2 (asm2) are the same multiset, each taken up to reverse
-    complement. loci* = [(contig, start, end), ...]; seq* = _seq_reader of each.
-    """
-    if len(loci1) != len(loci2) or \
-            sorted(e - s for _, s, e in loci1) != sorted(e - s for _, s, e in loci2):
-        return False
-    if len(loci1) == 1:
-        a, b = seq1(*loci1[0]), seq2(*loci2[0])
-        return a == b or a == _revcomp(b)
-
-    def canon(seq, loci):
-        out = []
-        for locus in loci:
-            x = seq(*locus)
-            out.append(min(x, _revcomp(x)))
-        return sorted(out)
-    return canon(seq1, loci1) == canon(seq2, loci2)
 
 
 def _classify_reads_for_occurrence_colors(
@@ -114,7 +86,7 @@ def _classify_reads_for_support_colors(db_file: str, reads_set: set[str],
 
     For reads aligning to both assemblies within the recruited segments:
       - common  (gold): reference sequences at both loci are identical (up to reverse complement),
-                        matching Recruiter._read_is_common.  Requires asm1_fasta/asm2_fasta;
+                        matching Recruiter._read_is_common (aln_utils.same_sequences).  Requires asm1_fasta/asm2_fasta;
                         without them any equal-pid dual-mapper is labelled common.
       - asm1_best / asm2_best: pid difference exceeds eps (and sequences are not identical).
       - other: pid tie but sequences differ (or no qualifying aln in either assembly).
@@ -200,7 +172,7 @@ def _classify_reads_for_support_colors(db_file: str, reads_set: set[str],
             d = asm2_info["max_pid"] - asm1_info["max_pid"]
             pids_tied = abs(d) <= best_pid_delta
             if pids_tied and seq1 is not None:
-                if _is_read_common(asm1_info["loci"], asm2_info["loci"], seq1, seq2):
+                if same_sequences(asm1_info["loci"], asm2_info["loci"], seq1, seq2):
                     out["common"].add(rn)
                 else:
                     if d > pid_tie_eps:

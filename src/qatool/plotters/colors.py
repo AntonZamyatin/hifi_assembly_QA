@@ -1,7 +1,7 @@
 """Shared color palettes and default tolerance constants for the report plots."""
 
-PID_TIE_EPS_DEFAULT = 0.001
-BEST_PID_DELTA_DEFAULT = 0.0001
+PID_TIE_EPS_DEFAULT = 0.0001
+BEST_PID_DELTA_DEFAULT = 0.001
 
 SUPPORT_COLORS = {
     "asm1_only": "#b2182b",   # strong red

@@ -2,13 +2,15 @@
 maps between read, reference and plot coordinates (qaview.region, reads_overlay).
 """
 
+from qatool.aln_utils import rows_for_reads
+
 # Per-block columns needed for geometry + supplementary detection.  `pid` is last so
 # callers that ignore it can keep unpacking the geometry fields positionally.
 _BLOCK_COLS = ("read_name, contig, start, end, strand, "
                "soft_left, soft_right, hard_left, hard_right, q_aln_len, aln_type, pid")
 
 
-def _fetch_aln_blocks(con, reads, assemblies, pid_threshold, plen_threshold, chunk=800):
+def _fetch_aln_blocks(con, reads, assemblies, pid_threshold, plen_threshold):
     """assembly -> list of (read_name, contig, start, end, strand, sl, sr, hl, hr, q_aln_len, aln_type)."""
     out = {a: [] for a in assemblies}
     if not reads:
@@ -17,12 +19,9 @@ def _fetch_aln_blocks(con, reads, assemblies, pid_threshold, plen_threshold, chu
     base = f"""SELECT assembly, {_BLOCK_COLS} FROM aln
                WHERE assembly IN ({ph_asm}) AND contig IS NOT NULL
                  AND start IS NOT NULL AND end IS NOT NULL
-                 AND pid >= ? AND plen >= ? AND read_name IN ({{R}})"""
-    for i in range(0, len(reads), chunk):
-        c = reads[i:i + chunk]
-        sql = base.replace("{R}", ",".join(["?"] * len(c)))
-        for row in con.execute(sql, list(assemblies) + [pid_threshold, plen_threshold] + c):
-            out[str(row[0])].append(row[1:])
+                 AND pid >= ? AND plen >= ? AND read_name IN ({{reads}})"""
+    for row in rows_for_reads(con, base, reads, before=[*assemblies, pid_threshold, plen_threshold]):
+        out[str(row[0])].append(row[1:])
     return out
 
 

@@ -15,6 +15,40 @@ License: MIT License
 import pysam
 from typing import Tuple, Optional
 
+
+_COMP = str.maketrans("ACGTNacgtn", "TGCANtgcan")
+
+
+def revcomp(seq: str) -> str:
+    return seq.translate(_COMP)[::-1]
+
+
+def same_sequences(loci1: list, loci2: list, seq1, seq2) -> bool:
+    """The common-read test: True iff the sequences at loci1 (in one assembly) and
+    loci2 (in the other) are the same multiset, each taken up to reverse
+    complement. loci* = [(contig, start, end), ...]; seq*(contig, start, end)
+    returns the upper-case sequence there."""
+    if len(loci1) != len(loci2) or \
+            sorted(e - s for _, s, e in loci1) != sorted(e - s for _, s, e in loci2):
+        return False
+    if len(loci1) == 1:
+        a, b = seq1(*loci1[0]), seq2(*loci2[0])
+        return a == b or a == revcomp(b)
+
+    def canon(seq, loci):
+        return sorted(min(x, revcomp(x)) for x in (seq(*locus) for locus in loci))
+    return canon(seq1, loci1) == canon(seq2, loci2)
+
+
+def rows_for_reads(con, sql: str, reads, before=(), after=(), chunk: int = 800):
+    """Rows of `sql` over every read in `reads`. Its `{reads}` stands for the
+    read_name IN list, run in chunks under SQLite's limit on bound variables;
+    `before` and `after` bind the placeholders on either side of it."""
+    reads = list(reads)
+    for i in range(0, len(reads), chunk):
+        c = reads[i:i + chunk]
+        yield from con.execute(sql.replace("{reads}", ",".join("?" * len(c))), [*before, *c, *after])
+
 def cigar_stats(aln: pysam.AlignedSegment) -> Tuple[int, int, int, int, int, int, Optional[float], float, int]:
     """
     Calculate stats from CIGAR string.

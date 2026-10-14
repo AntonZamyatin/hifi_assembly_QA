@@ -7,6 +7,7 @@ Kept separate from the plotting code: `report_plot` invokes this only when its
 import math
 import sqlite3
 
+from qatool.aln_utils import rows_for_reads
 from qatool.plotters.db import _stripe_coords
 
 
@@ -40,24 +41,20 @@ def likelihood_report(db_path: str, read_classes: dict,
 
     ed_by_asm: dict = {asm1: {}, asm2: {}}
     if included:
-        reads_list = list(included)
         con = sqlite3.connect(db_path)
         try:
-            for i in range(0, len(reads_list), 800):
-                chunk = reads_list[i:i + 800]
-                reads_ph = ",".join(["?"] * len(chunk))
-                sql = f"""
-                    SELECT assembly, read_name, ed FROM aln
-                    WHERE assembly IN (?, ?)
-                      AND contig IS NOT NULL
-                      AND pid >= ? AND plen >= ?
-                      AND ed IS NOT NULL
-                      AND read_name IN ({reads_ph})
-                """
-                for row_asm, rname, ed in con.execute(
-                        sql, [asm1, asm2, pid_threshold, plen_thr] + chunk):
-                    if row_asm in ed_by_asm:
-                        ed_by_asm[row_asm].setdefault(rname, []).append(int(ed))
+            sql = """
+                SELECT assembly, read_name, ed FROM aln
+                WHERE assembly IN (?, ?)
+                  AND contig IS NOT NULL
+                  AND pid >= ? AND plen >= ?
+                  AND ed IS NOT NULL
+                  AND read_name IN ({reads})
+            """
+            for row_asm, rname, ed in rows_for_reads(
+                    con, sql, included, before=[asm1, asm2, pid_threshold, plen_thr]):
+                if row_asm in ed_by_asm:
+                    ed_by_asm[row_asm].setdefault(rname, []).append(int(ed))
         finally:
             con.close()
 

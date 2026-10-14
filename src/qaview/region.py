@@ -19,6 +19,7 @@ from dataclasses import dataclass, field, replace
 import numpy as np
 import pysam
 
+from qatool.aln_utils import rows_for_reads
 from qatool.plotters.axis import _build_axis_map
 from qatool.plotters.classify import _classify_reads_for_support_colors
 from qatool.plotters.colors import BEST_PID_DELTA_DEFAULT, PID_TIE_EPS_DEFAULT
@@ -316,8 +317,7 @@ def _large_indels(cigar: str, start: int, min_len: int) -> list:
 
 def _partial_alignments(db_path: str, reads_by_asm: dict, pid: float, plen: float,
                         min_plen: float, lengths: dict, partial_pid: float | None = None,
-                        min_indel: int = 50, best_pid_delta: float = BEST_PID_DELTA_DEFAULT,
-                        chunk: int = 800) -> dict:
+                        min_indel: int = 50, best_pid_delta: float = BEST_PID_DELTA_DEFAULT) -> dict:
     """assembly -> {read: [(row, label, indels)]}: the reads' alignments there that do
     not qualify at the display pid and plen, but reach `partial_pid` (default the
     display pid) with plen at least `min_plen` -- partial ones of any type, and
@@ -334,33 +334,29 @@ def _partial_alignments(db_path: str, reads_by_asm: dict, pid: float, plen: floa
     con = sqlite3.connect(db_path)
     try:
         for asm, reads in reads_by_asm.items():
-            reads = list(reads)
             got: dict = {}
-            for i in range(0, len(reads), chunk):
-                c = reads[i:i + chunk]
-                rows = con.execute(
-                    f"SELECT {_BLOCK_COLS}, plen, cigar FROM aln WHERE assembly = ? "
-                    f"AND contig IS NOT NULL AND pid >= ? AND plen >= ? "
-                    f"AND NOT (pid >= ? AND plen >= ?) "
-                    f"AND read_name IN ({','.join('?' * len(c))})",
-                    [asm, ppid, min_plen, pid, plen, *c])
-                for r in rows:
-                    n = lengths[asm].get(r[1], 0)
-                    at_end = ((r[5] + r[7] > 0 and r[2] <= CLIP_END_TOL)
-                              or (r[6] + r[8] > 0 and r[3] >= n - CLIP_END_TOL))
-                    whole = r[12] >= plen
-                    big = _large_indels(r[13], r[2], min_indel)
-                    if whole and not big:
-                        continue      # short of the pid throughout: divergence, not an SV
-                    kind = "whole-length" if whole else "partial " + _PARTIAL_KIND.get(r[10], r[10])
-                    label = (f"{kind} in {asm}, pid {r[11]:.4f}, plen {r[12]:.2f}"
-                             + ("" if whole else f", {'at a contig end' if at_end else 'inside a contig'}"))
-                    if big:
-                        label += "; " + ", ".join(f"{ln:,} bp {k} at {r[1]}:{pos + 1:,}"
-                                                  for pos, k, ln in big[:3])
-                        if len(big) > 3:
-                            label += f" (+{len(big) - 3} more)"
-                    got.setdefault(r[0], []).append((r[:12], label, big))
+            rows = rows_for_reads(
+                con, f"SELECT {_BLOCK_COLS}, plen, cigar FROM aln WHERE assembly = ? "
+                     f"AND contig IS NOT NULL AND pid >= ? AND plen >= ? "
+                     f"AND NOT (pid >= ? AND plen >= ?) AND read_name IN ({{reads}})",
+                reads, before=[asm, ppid, min_plen, pid, plen])
+            for r in rows:
+                n = lengths[asm].get(r[1], 0)
+                at_end = ((r[5] + r[7] > 0 and r[2] <= CLIP_END_TOL)
+                          or (r[6] + r[8] > 0 and r[3] >= n - CLIP_END_TOL))
+                whole = r[12] >= plen
+                big = _large_indels(r[13], r[2], min_indel)
+                if whole and not big:
+                    continue      # short of the pid throughout: divergence, not an SV
+                kind = "whole-length" if whole else "partial " + _PARTIAL_KIND.get(r[10], r[10])
+                label = (f"{kind} in {asm}, pid {r[11]:.4f}, plen {r[12]:.2f}"
+                         + ("" if whole else f", {'at a contig end' if at_end else 'inside a contig'}"))
+                if big:
+                    label += "; " + ", ".join(f"{ln:,} bp {k} at {r[1]}:{pos + 1:,}"
+                                              for pos, k, ln in big[:3])
+                    if len(big) > 3:
+                        label += f" (+{len(big) - 3} more)"
+                got.setdefault(r[0], []).append((r[:12], label, big))
             out[asm] = {rn: _best_partials(items, best_pid_delta) for rn, items in got.items()}
     finally:
         con.close()
@@ -459,20 +455,17 @@ def _best_placements(blocks: list, tol: float) -> tuple:
     return kept, sum(b[10] != "supplementary" for b in kept)
 
 
-def read_lengths(db_path: str, names: list, assemblies: list, chunk: int = 800) -> dict:
+def read_lengths(db_path: str, names: list, assemblies: list) -> dict:
     """read -> its length (q_len) from the aln table."""
-    out = {}
     ph = ",".join("?" * len(assemblies))
     con = sqlite3.connect(db_path)
     try:
-        for i in range(0, len(names), chunk):
-            c = list(names[i:i + chunk])
-            sql = (f"SELECT read_name, MAX(q_len) FROM aln WHERE assembly IN ({ph}) "
-                   f"AND read_name IN ({','.join('?' * len(c))}) GROUP BY read_name")
-            out.update(con.execute(sql, list(assemblies) + c).fetchall())
+        return dict(rows_for_reads(
+            con, f"SELECT read_name, MAX(q_len) FROM aln WHERE assembly IN ({ph}) "
+                 f"AND read_name IN ({{reads}}) GROUP BY read_name",
+            names, before=assemblies))
     finally:
         con.close()
-    return out
 
 
 def read_alignments(db_path: str, name: str, assemblies: list, pid: float, plen: float,

@@ -46,7 +46,7 @@ from __future__ import annotations
 import sqlite3
 
 from qamodel.phmm.reads import ReadStore, revcomp
-from qatool.aln_utils import cigar_stats
+from qatool.aln_utils import cigar_stats, rows_for_reads
 
 _M, _I, _D, _N, _S, _H, _EQ, _X = 0, 1, 2, 3, 4, 5, 7, 8
 
@@ -72,18 +72,14 @@ def _best_info(db, assembly: str, names, pid: float, plen: float) -> dict:
     """read -> (its best non-supplementary pid, its primary's pid or None) over its
     qualifying alignments in `assembly`, genome-wide."""
     out: dict = {}
-    names = list(names)
-    for i in range(0, len(names), 500):
-        chunk = names[i:i + 500]
-        rows = db.execute(
-            f"SELECT read_name, pid, aln_type FROM aln WHERE assembly = ? "
-            f"AND pid >= ? AND plen >= ? AND read_name IN ({','.join('?' * len(chunk))})",
-            [assembly, pid, plen, *chunk]).fetchall()
-        for name, p, kind in rows:
-            if kind == "supplementary":
-                continue
-            best, prim = out.get(name, (-1.0, None))
-            out[name] = (max(best, p), p if kind in ("primary", "primary_wsup") else prim)
+    for name, p, kind in rows_for_reads(
+            db, "SELECT read_name, pid, aln_type FROM aln WHERE assembly = ? "
+                "AND pid >= ? AND plen >= ? AND read_name IN ({reads})",
+            names, before=[assembly, pid, plen]):
+        if kind == "supplementary":
+            continue
+        best, prim = out.get(name, (-1.0, None))
+        out[name] = (max(best, p), p if kind in ("primary", "primary_wsup") else prim)
     return out
 
 

@@ -556,6 +556,25 @@ function placeHandles() {
   }
 }
 
+// A pointer drag on `el`: `start(e)` on the press (returning false ignores it),
+// `move(e)` while held, `end(e, cancelled)` on release or cancel.
+function onDrag(el, { start, move, end }) {
+  el.addEventListener("pointerdown", (e) => {
+    if (start(e) === false) return;
+    e.preventDefault();
+    el.setPointerCapture(e.pointerId);
+    const up = (ev) => {
+      el.removeEventListener("pointermove", move);
+      el.removeEventListener("pointerup", up);
+      el.removeEventListener("pointercancel", up);
+      end(ev, ev.type === "pointercancel");
+    };
+    el.addEventListener("pointermove", move);
+    el.addEventListener("pointerup", up);
+    el.addEventListener("pointercancel", up);
+  });
+}
+
 function wireHandles() {
   const ghost = $("#plot-ghost");
   for (const { id, cursor, tip } of HANDLES) {
@@ -566,34 +585,31 @@ function wireHandles() {
     $("#plot-cell").append(g);
     let start = null;
     const vertical = cursor === "ew-resize";
-    g.addEventListener("pointerdown", (e) => {
-      const p = reportPanels(), main = (p["qv:main"] || [])[0], top = (p["qv:top"] || [])[0];
-      if (!main || !top) return;
-      start = { x: e.clientX, y: e.clientY, s: { w: main.width, h: main.height, m: top.height },
-                left: parseFloat(g.style.left), top: parseFloat(g.style.top) };
-      g.setPointerCapture(e.pointerId);
-      Object.assign(ghost.style, { left: g.style.left, top: g.style.top,
-                                   width: g.style.width, height: g.style.height });
-      ghost.hidden = false;
-      e.preventDefault();
-    });
-    g.addEventListener("pointermove", (e) => {
-      if (!start) return;
-      if (vertical) ghost.style.left = `${start.left + e.clientX - start.x}px`;
-      else ghost.style.top = `${start.top + e.clientY - start.y}px`;
-    });
-    g.addEventListener("pointercancel", () => { start = null; ghost.hidden = true; });
-    g.addEventListener("pointerup", (e) => {
-      if (!start) return;
-      ghost.hidden = true;
-      const d = vertical ? e.clientX - start.x : e.clientY - start.y;
-      const s = { ...start.s };
-      if (id === "w") s.w += d;
-      else if (id === "h") s.h += d;
-      else s.m += d;
-      start = null;
-      state.userSizes = s;
-      applySizes(s);
+    onDrag(g, {
+      start: (e) => {
+        const p = reportPanels(), main = (p["qv:main"] || [])[0], top = (p["qv:top"] || [])[0];
+        if (!main || !top) return false;
+        start = { x: e.clientX, y: e.clientY, s: { w: main.width, h: main.height, m: top.height },
+                  left: parseFloat(g.style.left), top: parseFloat(g.style.top) };
+        Object.assign(ghost.style, { left: g.style.left, top: g.style.top,
+                                     width: g.style.width, height: g.style.height });
+        ghost.hidden = false;
+      },
+      move: (e) => {
+        if (vertical) ghost.style.left = `${start.left + e.clientX - start.x}px`;
+        else ghost.style.top = `${start.top + e.clientY - start.y}px`;
+      },
+      end: (e, cancelled) => {
+        ghost.hidden = true;
+        if (cancelled) return;
+        const d = vertical ? e.clientX - start.x : e.clientY - start.y;
+        const s = { ...start.s };
+        if (id === "w") s.w += d;
+        else if (id === "h") s.h += d;
+        else s.m += d;
+        state.userSizes = s;
+        applySizes(s);
+      },
     });
     g.addEventListener("dblclick", () => {
       state.userSizes = null;
@@ -895,23 +911,15 @@ function fillTable(table, cols, rows, onRow) {
     });
     const grip = el("span");
     grip.className = "col-grip";
-    grip.addEventListener("pointerdown", (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      grip.setPointerCapture(e.pointerId);
-      const x0 = e.clientX, w0 = th.offsetWidth;
-      const move = (ev) => {
+    let x0 = 0, w0 = 0;
+    onDrag(grip, {
+      start: (e) => { e.stopPropagation(); x0 = e.clientX; w0 = th.offsetWidth; },
+      move: (ev) => {
         widths[c.key] = Math.max(16, w0 + ev.clientX - x0);
         th.style.width = `${widths[c.key]}px`;
         fit();
-      };
-      const up = (ev) => {
-        grip.removeEventListener("pointermove", move);
-        grip.removeEventListener("pointerup", up);
-        table._resized = ev.clientX !== x0;
-      };
-      grip.addEventListener("pointermove", move);
-      grip.addEventListener("pointerup", up);
+      },
+      end: (ev) => { table._resized = ev.clientX !== x0; },
     });
     th.append(grip);
     head.append(th);
@@ -1088,25 +1096,20 @@ function wireSplit() {
     const saved = parseFloat(localStorage.getItem(SPLIT_KEY));
     if (saved) setReadsHeight(saved);
   } catch (_) { /* storage blocked: half and half */ }
-  handle.addEventListener("pointerdown", (e) => {
-    e.preventDefault();
-    handle.setPointerCapture(e.pointerId);
-    handle.classList.add("active");
-    document.body.classList.add("resizing-v");
-    const top = $("#reads-panel").getBoundingClientRect().top;
-    let h = null;
-    const move = (ev) => { h = setReadsHeight(ev.clientY - top); };
-    const up = () => {
-      handle.removeEventListener("pointermove", move);
-      handle.removeEventListener("pointerup", up);
-      handle.removeEventListener("pointercancel", up);
+  let top = 0, h = null;
+  onDrag(handle, {
+    start: () => {
+      handle.classList.add("active");
+      document.body.classList.add("resizing-v");
+      top = $("#reads-panel").getBoundingClientRect().top;
+      h = null;
+    },
+    move: (ev) => { h = setReadsHeight(ev.clientY - top); },
+    end: () => {
       handle.classList.remove("active");
       document.body.classList.remove("resizing-v");
       try { if (h) localStorage.setItem(SPLIT_KEY, String(h)); } catch (_) { /* not critical */ }
-    };
-    handle.addEventListener("pointermove", move);
-    handle.addEventListener("pointerup", up);
-    handle.addEventListener("pointercancel", up);
+    },
   });
   handle.addEventListener("dblclick", () => {
     $("#reads-panel").style.flexBasis = "";
@@ -1695,24 +1698,18 @@ function saveWidths() {
 
 function wireResizers() {
   for (const handle of document.querySelectorAll(".resizer")) {
-    handle.addEventListener("pointerdown", (e) => {
-      e.preventDefault();
-      const side = handle.dataset.side;
-      handle.setPointerCapture(e.pointerId);
-      handle.classList.add("active");
-      document.body.classList.add("resizing");
-      const move = (ev) => setWidth(side, side === "left" ? ev.clientX : window.innerWidth - ev.clientX);
-      const up = () => {
-        handle.removeEventListener("pointermove", move);
-        handle.removeEventListener("pointerup", up);
-        handle.removeEventListener("pointercancel", up);
+    const side = handle.dataset.side;
+    onDrag(handle, {
+      start: () => {
+        handle.classList.add("active");
+        document.body.classList.add("resizing");
+      },
+      move: (ev) => setWidth(side, side === "left" ? ev.clientX : window.innerWidth - ev.clientX),
+      end: () => {
         handle.classList.remove("active");
         document.body.classList.remove("resizing");
         saveWidths();
-      };
-      handle.addEventListener("pointermove", move);
-      handle.addEventListener("pointerup", up);
-      handle.addEventListener("pointercancel", up);
+      },
     });
     // Double-click restores the default width.
     handle.addEventListener("dblclick", () => {

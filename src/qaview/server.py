@@ -19,8 +19,9 @@ import os
 import threading
 from collections import OrderedDict
 from contextlib import asynccontextmanager
+from dataclasses import astuple, dataclass, fields, replace
 
-from fastapi import Body, FastAPI, HTTPException, Query
+from fastapi import Body, Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -44,10 +45,21 @@ LAYERS = {"common": LAYER_COMMON, "unclassified": LAYER_OTHER,
 
 # "": the built layout; "x" / "y": that axis's segments along the other's diagonal
 SORTS = ("", "x", "y")
-# the view settings `region` takes, in its order
-REGION_ARGS = ("pid", "plen", "best_pid_delta", "pid_tie_eps", "binsize", "supp_plen",
-               "partial_pid", "min_indel", "sort")
-REGION_TYPES = (float, float, float, float, int, float, float, int, str)
+
+
+@dataclass(frozen=True)
+class RegionQuery:
+    """The settings a locus's region is built for: query parameters of every
+    endpoint that draws it or places things on it, with the page's defaults."""
+    pid: float = 0.997
+    plen: float = 0.999
+    best_pid_delta: float = 0.001
+    pid_tie_eps: float = 0.0001
+    binsize: int = 0
+    supp_plen: float = 0.3
+    partial_pid: float = 0.99
+    min_indel: int = 50
+    sort: str = ""
 
 # Pixels of the report that are not the dotplot: the y contig bar and right
 # marginal across, the top marginal and x contig bar down, plus the readout and
@@ -262,8 +274,8 @@ def create_app(project: Project | None = None, pipeline: Pipeline | None = None,
     @app.get("/api/loci")
     def get_loci():
         pipe = cur().pipe
-        seq, rows = pipe.changes_since(-1)
-        return {"seq": seq, "progress": pipe.progress(), "rows": pipe.rows(),
+        progress = pipe.progress()          # its seq is read before the rows
+        return {"seq": progress["seq"], "progress": progress, "rows": pipe.rows(),
                 "failed_seeds": pipe.failed_seeds()}
 
     @app.get("/api/events")
@@ -308,30 +320,22 @@ def create_app(project: Project | None = None, pipeline: Pipeline | None = None,
 
     # ---- remembered alignments (qaview.remember) ------------------------------------
 
-    def _layout(s: Session, lid: str, view: dict | None = None):
+    def _layout(s: Session, lid: str, q: RegionQuery | None = None):
         """(segs_info1, segs_info2, flips1, flips2) of the locus as drawn. The built
-        layout needs no reads; a sorted one is the view's own region (`view`: the
+        layout needs no reads; a sorted one is the view's own region (`q`: the
         view's query, cached by the view request that drew it)."""
         from qatool.plotters.axis import _build_axis_map
 
-        if view and view.get("sort"):
-            rd = region(s, lid, *(view[k] for k in REGION_ARGS))
+        if q and q.sort:
+            rd = region(s, lid, q)
             return (rd.asm1_segs_info, rd.asm2_segs_info,
                     rd.flips_of(rd.asm1), rd.flips_of(rd.asm2))
         segs = sorted(s.pipe.recruitment(lid)["segments"], key=lambda g: (g.contig, g.start, g.end))
         return (_build_axis_map(segs, s.project.asm1.name)[0],
                 _build_axis_map(segs, s.project.asm2.name)[0], None, None)
 
-    def _view_args(pid, plen, best_pid_delta, pid_tie_eps, binsize, supp_plen, partial_pid,
-                   min_indel, sort) -> dict:
-        return dict(zip(REGION_ARGS, (pid, plen, best_pid_delta, pid_tie_eps, binsize, supp_plen,
-                                      partial_pid, min_indel, sort)))
-
     @app.get("/api/loci/{lid}/remembered")
-    def remembered_here(lid: str, pid: float = 0.997, plen: float = 0.999,
-                        best_pid_delta: float = 0.001, pid_tie_eps: float = 0.0001,
-                        binsize: int = 0, supp_plen: float = 0.3, partial_pid: float = 0.99,
-                        min_indel: int = 50, sort: str = ""):
+    def remembered_here(lid: str, q: RegionQuery = Depends()):
         """Remembered alignments whose stretches lie in this locus, as plot rectangles
         in the view drawn with these settings."""
         from qaview import remember
@@ -339,9 +343,7 @@ def create_app(project: Project | None = None, pipeline: Pipeline | None = None,
         s = cur()
         if lid not in s.pipe.loci:
             raise HTTPException(404, f"no locus {lid}")
-        s1, s2, f1, f2 = _layout(s, lid, _view_args(pid, plen, best_pid_delta, pid_tie_eps,
-                                                    binsize, supp_plen, partial_pid,
-                                                    min_indel, sort))
+        s1, s2, f1, f2 = _layout(s, lid, q)
         return remember.place(remember.all_meta(s.project.output_dir), s1, s2,
                               s.project.asm1.name, s.project.asm2.name, f1, f2)
 
@@ -362,7 +364,7 @@ def create_app(project: Project | None = None, pipeline: Pipeline | None = None,
             raise HTTPException(400, str(exc)) from exc
         try:
             # typed as the view's query was, so the key finds the view's cached region
-            args = ({k: t(view[k]) for k, t in zip(REGION_ARGS, REGION_TYPES)}
+            args = (RegionQuery(**{f.name: type(f.default)(view[f.name]) for f in fields(RegionQuery)})
                     if view.get("sort") else None)
         except (KeyError, TypeError, ValueError):
             args = None
@@ -440,22 +442,16 @@ def create_app(project: Project | None = None, pipeline: Pipeline | None = None,
         pipe.prioritize(lid)
         return {"ok": True}
 
-    def region(s: Session, lid: str, pid: float, plen: float, best_pid_delta: float,
-               pid_tie_eps: float, binsize: int, supp_plen: float | None = None,
-               partial_pid: float | None = None, min_indel: int = 50,
-               sort: str = "") -> RegionData:
+    def region(s: Session, lid: str, q: RegionQuery) -> RegionData:
         """The locus reduced to arrays for these fetch/classify settings (cached).
-        `sort` "x" or "y" lays that axis's segments along the other's diagonal,
+        `q.sort` "x" or "y" lays that axis's segments along the other's diagonal,
         flipping those the reads run backwards on (`region.arrange`)."""
         p = s.project
-        if sort not in SORTS:
-            raise HTTPException(400, f"unknown sort {sort!r}")
-        key = (lid, pid, plen, best_pid_delta, pid_tie_eps, binsize, supp_plen, partial_pid,
-               min_indel)
-        if sort:
-            return s.regions.get(key + (sort,), lambda: arrange(
-                region(s, lid, pid, plen, best_pid_delta, pid_tie_eps, binsize, supp_plen,
-                       partial_pid, min_indel), sort))
+        if q.sort not in SORTS:
+            raise HTTPException(400, f"unknown sort {q.sort!r}")
+        key = (lid, *astuple(q))
+        if q.sort:
+            return s.regions.get(key, lambda: arrange(region(s, lid, replace(q, sort="")), q.sort))
 
         def build():
             rec = s.pipe.recruitment(lid)
@@ -463,10 +459,10 @@ def create_app(project: Project | None = None, pipeline: Pipeline | None = None,
                 rec["segments"], rec["reads"], p.db, p.asm1.bam, p.asm2.bam,
                 asm1_fasta=p.asm1.fasta, asm2_fasta=p.asm2.fasta,
                 asm1=p.asm1.name, asm2=p.asm2.name,
-                pid_threshold=pid, plen_threshold=plen, binsize=binsize or None,
-                best_pid_delta=best_pid_delta, pid_tie_eps=pid_tie_eps,
-                supp_plen_threshold=supp_plen, partial_pid_threshold=partial_pid,
-                min_indel=min_indel)
+                pid_threshold=q.pid, plen_threshold=q.plen, binsize=q.binsize or None,
+                best_pid_delta=q.best_pid_delta, pid_tie_eps=q.pid_tie_eps,
+                supp_plen_threshold=q.supp_plen, partial_pid_threshold=q.partial_pid,
+                min_indel=q.min_indel)
 
         return s.regions.get(key, build)
 
@@ -487,10 +483,7 @@ def create_app(project: Project | None = None, pipeline: Pipeline | None = None,
 
     @app.get("/api/loci/{lid}/align")
     def align(lid: str, x0: float, x1: float, y0: float, y1: float,
-              pid: float = 0.997, plen: float = 0.999, best_pid_delta: float = 0.001,
-              pid_tie_eps: float = 0.0001, binsize: int = 0, reads: bool = False,
-              supp_plen: float = 0.3, partial_pid: float = 0.99, min_indel: int = 50,
-              color_by: str = "log-ratio", sort: str = ""):
+              q: RegionQuery = Depends(), reads: bool = False, color_by: str = "log-ratio"):
         """Align the stretches under a rectangle on the dotplot (docs/qaview.md §13.4).
 
         With `reads`, also the reads on each stretch in the alignment's columns,
@@ -506,8 +499,7 @@ def create_app(project: Project | None = None, pipeline: Pipeline | None = None,
         loc = s.pipe.loci.get(lid)
         if loc is None:
             raise HTTPException(404, f"no locus {lid}")
-        rd = region(s, lid, pid, plen, best_pid_delta, pid_tie_eps, binsize, supp_plen,
-                    partial_pid, min_indel, sort)
+        rd = region(s, lid, q)
         p = s.project
         with pysam.FastaFile(p.asm1.fasta) as f1, pysam.FastaFile(p.asm2.fasta) as f2:
             try:
@@ -521,17 +513,13 @@ def create_app(project: Project | None = None, pipeline: Pipeline | None = None,
             out["reads"] = pileup(
                 rd, out, {p.asm1.name: p.asm1.bam, p.asm2.name: p.asm2.bam},
                 {p.asm1.name: p.asm1.fasta, p.asm2.name: p.asm2.fasta}, p.db, stacking,
-                pid=pid, plen=plen, best_pid_delta=best_pid_delta)
+                pid=q.pid, plen=q.plen, best_pid_delta=q.best_pid_delta)
         return out
 
     @app.get("/api/loci/{lid}/view")
     def view(lid: str, w: int = Query(900, ge=MIN_CELL), h: int = Query(700, ge=MIN_CELL),
-             pid: float = 0.997, plen: float = 0.999,
-             best_pid_delta: float = 0.001, pid_tie_eps: float = 0.0001,
-             binsize: int = 0, color_by: str = "log-ratio", C: float = 200.0,
-             layers: str = ",".join(LAYERS), reads: str = "hover", background: bool = True,
-             supp_plen: float = 0.3, partial_pid: float = 0.99, min_indel: int = 50,
-             sort: str = ""):
+             q: RegionQuery = Depends(), color_by: str = "log-ratio", C: float = 200.0,
+             layers: str = ",".join(LAYERS), reads: str = "hover", background: bool = True):
         """The report for one locus, sized to a w x h cell, as a Bokeh json_item.
 
         `reads`: "all" draws every read line, "hover" only the reads of a hovered
@@ -558,8 +546,7 @@ def create_app(project: Project | None = None, pipeline: Pipeline | None = None,
         # see more reads must not flood the background). The cache keeps cells
         # from similarity.FLOOR up, so a lower recruitment pid draws from there.
         bg_floor = max((loc.params or s.project.recruitment)["pid_threshold"], SIM_FLOOR)
-        rd = region(s, lid, pid, plen, best_pid_delta, pid_tie_eps, binsize, supp_plen,
-                    partial_pid, min_indel, sort)
+        rd = region(s, lid, q)
         score = loc.score
         ratios = {r.name: r.ratio for r in score.reads} if score is not None else None
         dropped = set(score.dropped) if score is not None else None
@@ -579,7 +566,7 @@ def create_app(project: Project | None = None, pipeline: Pipeline | None = None,
                               "grid": [bg["n1"], bg["n2"]] if bg is not None else None,
                               "binsize": bg["binsize"] if bg is not None else None,
                               "sampling": bg["settings"]["sampling_scale"] if bg is not None else None},
-               "tie_warning": pid_tie_eps >= best_pid_delta, "score": None,
+               "tie_warning": q.pid_tie_eps >= q.best_pid_delta, "score": None,
                # what the page needs to restyle without coming back: colouring,
                # C, layers, reads mode and the background are all applied there
                "style": {**style_spec(), "layers": dict(LAYERS)}}

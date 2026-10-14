@@ -335,6 +335,24 @@ def test_split_alignments_take_no_part_in_recruitment():
           f"no piece brings a segment: {spans(sc, 'A')} {spans(sc, 'B')}")
 
 
+def test_same_sequences():
+    """The common-read test: the same multiset of sequences, each up to reverse
+    complement, whatever the loci's order and strand."""
+    from qatool.aln_utils import revcomp, same_sequences
+    g = {"a": "ACGTTGCAAC", "b": "GGGTTTAAAC", "c": "ACGTTGCAAG"}
+    seq = lambda c, s, e: g[c][s:e]
+    loc = lambda *cs: [(c, 0, 10) for c in cs]
+    rc = {k: revcomp(v) for k, v in g.items()}
+    seq_rc = lambda c, s, e: rc[c][s:e]
+    check(same_sequences(loc("a"), loc("a"), seq, seq), "one locus, same strand")
+    check(same_sequences(loc("a"), loc("a"), seq, seq_rc), "one locus, other strand")
+    check(not same_sequences(loc("a"), loc("c"), seq, seq), "one base differs")
+    check(same_sequences(loc("a", "b"), loc("b", "a"), seq, seq_rc), "two loci, any order and strand")
+    check(not same_sequences(loc("a", "a"), loc("a", "b"), seq, seq), "multisets differ")
+    check(not same_sequences(loc("a"), [("a", 0, 9)], seq, seq), "lengths differ")
+    check(not same_sequences(loc("a"), loc("a", "a"), seq, seq), "counts differ")
+
+
 def test_merge_gap_either_order():
     """Segments merge_gap apart merge whichever is added first."""
     from qatool.SegmentStorage import Segment, SegmentCollection
@@ -349,7 +367,8 @@ def main():
              test_repeat_copies_get_segments, test_merged_loci_recruit_every_read_inside,
              test_gap_is_crossed_to_the_nearest_anchor, test_common_read_brings_its_other_copies,
              test_split_alignments_take_no_part_in_recruitment,
-             test_qaview_legacy_key_unchanged, test_merge_gap_either_order]
+             test_qaview_legacy_key_unchanged, test_merge_gap_either_order,
+             test_same_sequences]
     for fn in tests:
         print(f"{fn.__name__} ...")
         fn()

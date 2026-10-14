@@ -42,19 +42,15 @@ from __future__ import annotations
 import edlib
 import parasail
 
-MAX_SPAN = 200_000                  # bp per side
+from qatool.aln_utils import revcomp
 
-_COMP = str.maketrans("ACGTNacgtn", "TGCANtgcan")
+MAX_SPAN = 200_000                  # bp per side
 
 # Affine scoring for the displayed alignment: +2 match, -4 mismatch, a gap of
 # length k costs 6 + (k - 1). N matches nothing.
 _MATRIX = parasail.matrix_create("ACGTN", 2, -4)
 _GAP_OPEN, _GAP_EXTEND = 6, 1
 _PAD = 20                           # matching columns kept around a stretch being polished
-
-
-def revcomp(seq: str) -> str:
-    return seq.translate(_COMP)[::-1]
 
 
 def span_at(segs_info, binsize: int, p0: float, p1: float, flips=None):

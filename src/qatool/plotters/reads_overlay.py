@@ -11,7 +11,7 @@ from qatool.SegmentStorage import SegmentCollection
 from qatool.plotters.axis import _build_axis_map
 from qatool.plotters.colors import SUPPORT_COLORS, PID_TIE_EPS_DEFAULT
 from qatool.plotters.db import _fetch_aln_from_db
-from qatool.plotters.reads_dotplot import _map_in_segment, _overlapping_segment
+from qatool.plotters.reads_dotplot import _build_lookup, _map_in_segment, _overlapping_segment
 
 
 def reads_alignment_dotplot(sc: SegmentCollection, read_names: set[str], pid_threshold: float,
@@ -63,13 +63,7 @@ def reads_alignment_dotplot(sc: SegmentCollection, read_names: set[str], pid_thr
     asm1_segs, asm1_len = _build_axis_map(sc, asm1, binsize=binsize)
     asm2_segs, asm2_len = _build_axis_map(sc, asm2, binsize=binsize)
 
-    # Build contig-keyed lookups for O(1) contig access in _map_pos.
-    asm1_lookup: dict = {}
-    for contig, s, e, off in asm1_segs:
-        asm1_lookup.setdefault(contig, []).append((s, e, off))
-    asm2_lookup: dict = {}
-    for contig, s, e, off in asm2_segs:
-        asm2_lookup.setdefault(contig, []).append((s, e, off))
+    asm1_lookup, asm2_lookup = _build_lookup(asm1_segs), _build_lookup(asm2_segs)
 
     if not asm1_segs or not asm2_segs:
         raise ValueError("SegmentCollection must contain both asm1 and asm2 segments")

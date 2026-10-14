@@ -847,6 +847,15 @@ function qvBinsOf(M, reads, gs) {
     return Array.from(out);
 }
 
+// The reads with a placement in bin b of M; with band >= 0, only those in it.
+function qvReadsInBin(M, b, band, read_band) {
+    const h = M.hit.data, I = M.iv.data, gs = new Set();
+    for (let i = 0; i < I.p0.length; i++)
+        if (I.seg[i] === h.seg[b] && I.p0[i] < h.right[b] && I.p1[i] > h.left[b]
+            && (band < 0 || read_band[I.read[i]] === band)) gs.add(I.read[i]);
+    return gs;
+}
+
 // Read g's line rows. The map is built once per lines data (its `read` column).
 function qvRowsOf(lines, g) {
     const read = lines.data["read"];
@@ -978,13 +987,7 @@ def _link_bins_to_reads(cov_fig, marg, other_marg, main, status, orientation,
             below = top;
         }
 
-        const lo = hit.data.left[b], hi = hit.data.right[b], k = hit.data.seg[b];
-        const I = M.iv.data, gs = new Set();
-        for (let i = 0; i < I.p0.length; i++) {
-            if (I.seg[i] !== k || I.p0[i] >= hi || I.p1[i] <= lo) continue;
-            const g = I.read[i];
-            if (band < 0 || read_band[g] === band) gs.add(g);   // narrow to the band
-        }
+        const gs = qvReadsInBin(M, b, band, read_band);       // narrowed to the band
         const rows = [];
         for (const g of gs) for (const r of qvRowsOf(lines, g)) rows.push(r);
         lines.selected.indices = rows;
@@ -1021,14 +1024,12 @@ def _link_bin_click(cov_fig, marg, reads, mode: Div, stackings: dict, orientatio
                             label=cov_fig.name or "",
                             names={k: list(st.keys) for k, st in stackings.items()},
                             colors={k: list(st.colors) for k, st in stackings.items()}),
-                  code="""
+                  code=REBIN_JS + """
         const h = M.hit.data, p = vertical ? cb_obj.x : cb_obj.y;
         let lo = 0, hi = h.right.length;                // first bin ending past p
         while (lo < hi) { const mid = (lo + hi) >> 1; if (h.right[mid] > p) hi = mid; else lo = mid + 1; }
         if (lo >= h.left.length || h.left[lo] > p) return;
-        const b = lo, I = M.iv.data, gs = new Set();
-        for (let i = 0; i < I.p0.length; i++)
-            if (I.seg[i] === h.seg[b] && I.p0[i] < h.right[b] && I.p1[i] > h.left[b]) gs.add(I.read[i]);
+        const b = lo, gs = qvReadsInBin(M, b, -1, null);
         const m = mode.text, band = reads.data["band_" + m];
         const list = Array.from(gs);
         document.dispatchEvent(new CustomEvent("qv-bin", {detail: {
