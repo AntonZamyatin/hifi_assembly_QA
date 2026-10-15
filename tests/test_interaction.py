@@ -114,7 +114,7 @@ def test_reverse_link_registered(tmp):
 
 def test_draw_order_and_widths(tmp):
     """Rows must be stored back-to-front, so one glyph renderer paints the layers."""
-    from qaview.glyphs import LAYER_STYLE
+    from qaview.glyphs import LAYER_COLOR, LINE_WIDTH
     from qaview.region import (
         LAYER_COMMON, LAYER_OTHER, LAYER_SUPPLEMENTARY, LAYER_SUPPORT, _layer_of,
     )
@@ -127,20 +127,17 @@ def test_draw_order_and_widths(tmp):
     check(_layer_of("common", True) == LAYER_SUPPLEMENTARY,
           "supplementary must win over classification")
 
-    widths = [LAYER_STYLE[i][1] for i in (LAYER_COMMON, LAYER_OTHER, LAYER_SUPPORT)]
-    check(widths[0] > widths[1] >= widths[2],
-          f"common must be the widest line, got {widths}")
-    check(LAYER_STYLE[LAYER_SUPPORT][0] is None,
+    check(LAYER_COLOR[LAYER_SUPPORT] is None,
           "support lines take their colour from the read class, not the layer")
 
     rd = make_region_data(tmp, "ord")
     layers = list(rd.lines.layer)
     check(layers == sorted(layers), f"stored rows must be in draw order, got {layers}")
 
-    src = dotplot_figure(rd).renderers[0].data_source.data
-    check(len(src["width"]) == len(rd.lines), "every line needs its own width")
-    for lay, w in zip(layers, src["width"]):
-        check(w == LAYER_STYLE[int(lay)][1], f"layer {lay} should draw at {LAYER_STYLE[int(lay)][1]}")
+    for mode in ("all", "hover"):
+        r = dotplot_figure(rd, reads=mode).renderers[0]
+        widths = {r.glyph.line_width, r.selection_glyph.line_width, r.nonselection_glyph.line_width}
+        check(widths == {LINE_WIDTH} and LINE_WIDTH == 3, f"{mode}: every read line 3 px, got {widths}")
 
 
 def test_hover_links_both_panels(tmp):
@@ -214,10 +211,10 @@ def test_band_detection_data(tmp):
 
 
 def test_common_colour_matches_marginals(tmp):
-    from qaview.glyphs import LAYER_STYLE
+    from qaview.glyphs import LAYER_COLOR
     from qaview.region import LAYER_COMMON
     from qatool.plotters.colors import SUPPORT_COLORS
-    check(LAYER_STYLE[LAYER_COMMON][0] == SUPPORT_COLORS["common"],
+    check(LAYER_COLOR[LAYER_COMMON] == SUPPORT_COLORS["common"],
           "common reads must use the same colour as the marginal stack")
 
 

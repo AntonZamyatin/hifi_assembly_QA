@@ -15,6 +15,8 @@ const state = {
   alignAbort: null,
   lastRect: null,           // the rectangle the alignment panel shows
   showReads: false,
+  diffs: null,              // the shown alignment's differences, for previous/next
+  piles: null,              // the reads under the shown alignment, for layoutPiles
   lastAlignment: null,      // the result the panel shows, for "Remember"
   lastSettings: null,
   savedId: null,            // set when the panel shows a remembered alignment
@@ -384,37 +386,35 @@ function ratioRgba(st, t) {
 
 function lineStyle(st, colorBy, shown, C, data, ratio) {
   const n = data.layer.length;
-  const color = new Uint32Array(n), width = new Float32Array(n);
-  const alpha = new Float32Array(n), hover = new Float32Array(n), sel = new Float32Array(n);
+  const color = new Uint32Array(n), alpha = new Float32Array(n), sel = new Float32Array(n);
   const l1c = Math.log1p(C);
   for (let i = 0; i < n; i++) {
     const lay = data.layer[i];
-    let a = shown.has(lay) ? st.line_alpha : 0;
+    const a = shown.has(lay) ? st.line_alpha : 0;
     if (colorBy === "log-ratio") {
       const r = ratio[data.read[i]];
-      if (Number.isNaN(r)) { color[i] = st.unscored_rgba; width[i] = 1; a *= 0.3; }
+      if (Number.isNaN(r)) color[i] = st.unscored_rgba;
       else {
         let t = Math.log1p(Math.min(Math.abs(r), C)) / l1c;
         if (!(r > 0)) t = -t;
-        color[i] = ratioRgba(st, t); width[i] = 1 + 2.5 * Math.abs(t); a *= 0.3 + 0.7 * Math.abs(t);
+        color[i] = ratioRgba(st, t);
       }
     } else if (colorBy === "block") {
-      color[i] = data.supp[i] ? st.supp_rgba : st.black_rgba; width[i] = st.layer_width[lay];
+      color[i] = data.supp[i] ? st.supp_rgba : st.black_rgba;
     } else {
       const base = st.layer_rgba[lay];
-      color[i] = base === null ? data.cls_color[i] : base; width[i] = st.layer_width[lay];
+      color[i] = base === null ? data.cls_color[i] : base;
     }
     if (lay === st.partial_layer) {        // a one-sided read's partial alignment: on selection only
-      color[i] = st.partial_rgba; width[i] = st.layer_width[lay];
+      color[i] = st.partial_rgba;
       sel[i] = shown.has(lay) ? st.partial_alpha : 0;
       alpha[i] = 0;
     } else {
       alpha[i] = a;
       sel[i] = a;
     }
-    hover[i] = width[i] * 1.5 + 1.5;
   }
-  return { color, width, alpha, sel_alpha: sel, hover_width: hover };
+  return { color, alpha, sel_alpha: sel };
 }
 
 // Delta S at another C, from the per-read log-ratios (score.py: clamp to +/-C).
@@ -448,7 +448,6 @@ function restyle() {
   if (glyph) {
     const all = $("#reads_mode .on").dataset.v === "all";
     glyph.glyph.line_alpha = all ? { field: "alpha" } : { value: 0 };
-    glyph.selection_glyph.line_width = { field: all ? "width" : "hover_width" };
   }
   // marginals: log-ratio bands once scored, support classes otherwise
   const stack = want === "log-ratio" && d.score ? "ratio" : "class";
@@ -678,6 +677,7 @@ function clearAlignment() {
   $("#align-meta").textContent = "Shift+drag a rectangle on the dotplot to align the stretches under it.";
   $("#align-strip").hidden = true;
   $("#align-legend").hidden = true;
+  $("#diff-nav").hidden = true;
   state.lastRect = null;
   state.lastAlignment = null;
   setSaved(null);
@@ -685,6 +685,7 @@ function clearAlignment() {
 }
 
 function clearPiles() {
+  state.piles = null;
   for (const id of ["#pile-top", "#pile-bottom"]) { $(id).replaceChildren(); $(id).hidden = true; }
   $("#reads-legend").hidden = true;
 }
@@ -718,6 +719,7 @@ async function alignRect(x0, x1, y0, y1) {
       $("#align-meta").textContent = `Alignment failed: ${e.message}`;
       $("#align-strip").hidden = true;
       $("#align-legend").hidden = true;
+      $("#diff-nav").hidden = true;
     }
     return;
   }
@@ -762,15 +764,22 @@ function renderAlignment(a, saved = null) {
     return a.top[i] === " " || a.bottom[i] === " " ? "out" : "gap";
   };
   const rows = [a.top, a.mid, a.bottom].map(() => []);
+  const stops = [];                     // differences, [first col, last col, spans], for previous/next
   let start = 0;
   for (let i = 1; i <= a.mid.length; i++) {
     if (i < a.mid.length && kindAt(i) === kindAt(start)) continue;
     const k = kindAt(start);
+    const spans = [];
     [a.top, a.mid, a.bottom].forEach((row, r) => {
       const text = row.slice(start, i);
       if (!k) { rows[r].push(document.createTextNode(text)); return; }
-      const sp = el("span", text); sp.className = k; rows[r].push(sp);
+      const sp = el("span", text); sp.className = k; rows[r].push(sp); spans.push(sp);
     });
+    if (k === "mm" || k === "gap") {   // a mismatch run next to a gap run is one difference
+      const last = stops[stops.length - 1];
+      if (last && last[1] === start - 1) { last[1] = i - 1; last[2].push(...spans); }
+      else stops.push([start, i - 1, spans]);
+    }
     start = i;
   }
   const pre = $("#align-rows");
@@ -782,11 +791,47 @@ function renderAlignment(a, saved = null) {
   const k = [...a.mid].findIndex((c, i) => c === "|" || c === "." || a.top[i] === "-" || a.bottom[i] === "-");
   const grid = measureGrid(pre);
   strip.scrollLeft = k > 0 ? Math.max(0, grid.x0 + k * grid.cw - 24) : 0;
+  state.diffs = { stops, grid, cur: -1, left: strip.scrollLeft };
+  $("#diff-nav").hidden = false;
+  showDiffPos();
+  fitStrip();
   if (a.reads) renderPiles(a.reads, grid);
   else clearPiles();
   const top = pre.getBoundingClientRect().top - strip.getBoundingClientRect().top + strip.scrollTop;
   strip.scrollTop = Math.max(0, top - (strip.clientHeight - pre.offsetHeight) / 2);
   $("#align-legend").hidden = false;
+}
+
+// ---- previous / next difference ----------------------------------------------------
+
+// Centres the next difference right (dir 1) or left (-1) of the last one stepped
+// to (the first, on a fresh alignment) -- or, once the strip has been scrolled by
+// hand, of the strip's centre.
+function stepDiff(dir) {
+  const d = state.diffs, strip = $("#align-strip");
+  if (!d || !d.stops.length) return;
+  const centre = (s) => (s[0] + s[1] + 1) / 2;
+  let k;
+  if (strip.scrollLeft === d.left) k = d.cur + dir;
+  else {
+    const mid = (strip.scrollLeft + strip.clientWidth / 2 - d.grid.x0) / d.grid.cw;
+    k = dir > 0 ? d.stops.findIndex((s) => centre(s) > mid + 0.5)
+                : d.stops.findLastIndex((s) => centre(s) < mid - 0.5);
+  }
+  if (k < 0 || k >= d.stops.length) return;
+  if (d.cur >= 0) for (const sp of d.stops[d.cur][2]) sp.classList.remove("cur");
+  for (const sp of d.stops[k][2]) sp.classList.add("cur");
+  d.cur = k;
+  strip.scrollLeft = d.grid.x0 + centre(d.stops[k]) * d.grid.cw - strip.clientWidth / 2;
+  d.left = strip.scrollLeft;                           // as clamped by the browser
+  showDiffPos();
+}
+
+function showDiffPos() {
+  const d = state.diffs, n = d.stops.length;
+  $("#diff-pos").textContent = !n ? "no differences"
+    : d.cur < 0 ? `${n.toLocaleString()} differences` : `${(d.cur + 1).toLocaleString()} / ${n.toLocaleString()}`;
+  $("#diff-prev").disabled = $("#diff-next").disabled = !n;
 }
 
 // ---- reads under the alignment ------------------------------------------------------
@@ -808,25 +853,24 @@ function measureGrid(pre) {
 }
 
 function renderPiles(reads, grid) {
-  // Both pileups grow away from the alignment: band 0 (the marginal's bottom band)
-  // sits next to the sequence rows, above the top row and below the bottom row.
+  // Reads placed on the top stretch above the alignment, on the bottom stretch
+  // below it, each projected through its own row; a read on both is in both.
+  // Every read's box is built once; layoutPiles shows those in view.
   const { x0, cw } = grid;
   const X = (c) => x0 + c * cw;
-  for (const [side, id] of [["top", "#pile-top"], ["bottom", "#pile-bottom"]]) {
-    const pile = $(id);
-    const rows = reads[side];
-    const n = rows.length;
-    pile.style.height = `${n * ROW_H + (n ? 3 : 0)}px`;
+  const P = { grid };
+  for (const side of ["top", "bottom"]) {
     const parts = [];
-    rows.forEach((r, i) => {
-      const y = side === "top" ? (n - 1 - i) * ROW_H + 1 : i * ROW_H + 2;
+    P[side] = reads[side].map((r) => {
       const band = reads.bands[r.band];
       // One box per read carries the tooltip; its runs are drawn inside it.
-      const row = el("div");
-      row.className = "read";
-      row.style.cssText = `left:${X(r.col0)}px;width:${(r.col1 - r.col0 + 1) * cw}px;top:${y}px`;
-      row.title = `${r.name}\n${band.name}\npid ${r.pid}  ${r.strand}${r.supplementary ? "  supplementary" : ""}\n` +
-                  `${(r.start + 1).toLocaleString()}\u2013${r.end.toLocaleString()}` +
+      const box = el("div");
+      box.className = r.name === browser.name ? "read picked" : "read";
+      box.dataset.name = r.name;
+      box.addEventListener("click", () => openRead(r.name, band));
+      box.style.cssText = `left:${X(r.col0)}px;width:${(r.col1 - r.col0 + 1) * cw}px`;
+      box.title = `${r.name}\n${band.name}\npid ${r.pid}  ${r.strand}${r.supplementary ? "  supplementary" : ""}\n` +
+                  `${(r.start + 1).toLocaleString()}–${r.end.toLocaleString()}` +
                   (r.sequence ? "" : "\n(no stored sequence: differences not shown)");
       for (const [c0, c1, kind] of r.runs) {
         const seg = el("div");
@@ -834,21 +878,25 @@ function renderPiles(reads, grid) {
         seg.style.left = `${(c0 - r.col0) * cw}px`;
         seg.style.width = `${(c1 - c0 + 1) * cw}px`;
         if (kind === "b" || kind === "g") seg.style.background = band.color;
-        row.append(seg);
+        box.append(seg);
       }
-      parts.push(row);
-      for (const [c, len] of r.ticks) {
+      parts.push(box);
+      const ticks = r.ticks.map(([c, len]) => {
         const t = el("div");
         t.className = "tick";
         t.title = `${len} base${len > 1 ? "s" : ""} the read has and its assembly lacks, ` +
                   "with no gap column in the alignment to put them in";
-        t.style.cssText = `left:${X(c) - 1}px;top:${y - 1}px`;
+        t.style.left = `${X(c) - 1}px`;
         parts.push(t);
-      }
+        return t;
+      });
+      return { col0: r.col0, col1: r.col1, band: r.band, box, ticks };
     });
+    const pile = $(`#pile-${side}`);
     pile.replaceChildren(...parts);
-    pile.hidden = n === 0;
   }
+  state.piles = P;
+  layoutPiles();
   const legend = $("#reads-legend");
   const used = new Set([...reads.top, ...reads.bottom].map((r) => r.band));
   const item = (cls, color, text) => {
@@ -867,6 +915,80 @@ function renderPiles(reads, grid) {
   legend.hidden = false;
 }
 
+const BAND_GAP = 2;                                // px between bands
+
+// The most reads in any view `w` columns wide: a read is in the view starting at
+// column c when c lies in (col0 - w, col1 + 1). Ends sort before starts at a tie.
+function maxInView(rows, w) {
+  const ev = [];
+  for (const r of rows) ev.push([r.col0 - w, 1], [r.col1 + 1, -1]);
+  ev.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  let n = 0, most = 0;
+  for (const [, d] of ev) { n += d; most = Math.max(most, n); }
+  return most;
+}
+
+// Each pile shows only the reads overlapping the columns in view, packed against
+// the sequence rows in a fixed order (band, then first column): band 0 next to
+// the sequence, no row left empty. Scrolling sideways, a read entering or leaving
+// view slides the ones beyond it by a row. Both piles keep one fixed height, the
+// most any view this wide needs, so the sequence sits in the middle and does not
+// move; reads past the strip's edge are a vertical scroll away.
+function layoutPiles() {
+  const P = state.piles;
+  if (!P) return;
+  const strip = $("#align-strip"), { x0, cw } = P.grid;
+  const c0 = (strip.scrollLeft - x0) / cw, c1 = (strip.scrollLeft + strip.clientWidth - x0) / cw;
+  if (c1 - c0 !== P.w) {
+    P.w = c1 - c0;
+    P.H = Math.max(...["top", "bottom"].map((side) => {
+      const n = maxInView(P[side], P.w);
+      return n && n * ROW_H + (new Set(P[side].map((r) => r.band)).size - 1) * BAND_GAP + 3;
+    }));
+  }
+  for (const side of ["top", "bottom"]) {
+    const pile = $(`#pile-${side}`);
+    let y = 0, band = null;
+    const at = new Map();
+    for (const r of P[side]) {
+      if (r.col1 + 1 <= c0 || r.col0 >= c1) continue;
+      if (band !== null && r.band !== band) y += BAND_GAP;
+      band = r.band;
+      at.set(r, y);
+      y += ROW_H;
+    }
+    for (const r of P[side]) {
+      const d = at.get(r), on = d !== undefined;
+      const top = !on ? 0 : side === "top" ? P.H - 2 - ROW_H - d : d + 2;
+      r.box.style.display = on ? "" : "none";
+      if (on) r.box.style.top = `${top}px`;
+      for (const t of r.ticks) { t.style.display = r.box.style.display; if (on) t.style.top = `${top - 1}px`; }
+    }
+    pile.style.height = `${P.H}px`;
+    pile.hidden = !P.H;
+  }
+  if (P.H !== P.centred || strip.clientHeight !== P.ch) {      // new height: centre the sequence
+    P.centred = P.H;
+    P.ch = strip.clientHeight;
+    const pre = $("#align-rows");
+    const top = pre.getBoundingClientRect().top - strip.getBoundingClientRect().top + strip.scrollTop;
+    strip.scrollTop = Math.max(0, top - (strip.clientHeight - pre.offsetHeight) / 2);
+  }
+}
+
+// Caps the strip at the panel's height below it, less the previous/next row.
+function fitStrip() {
+  const panel = $("#align-panel"), strip = $("#align-strip");
+  if (strip.hidden) return;
+  const room = panel.clientHeight - strip.offsetTop - $("#diff-nav").offsetHeight - 6;
+  strip.style.maxHeight = `${Math.max(60, room)}px`;
+}
+
+let pilesFrame = 0;
+function schedulePiles() {
+  if (!pilesFrame) pilesFrame = requestAnimationFrame(() => { pilesFrame = 0; layoutPiles(); });
+}
+
 function toggleReads() {
   state.showReads = !state.showReads;
   const b = $("#reads-toggle");
@@ -881,7 +1003,21 @@ function toggleReads() {
 // `qv-bin` event); a click on one of them selects it in the plot (`qv-pick`) and
 // lists all its alignments.
 
-const browser = { gen: 0, pick: 0, picked: null, rows: [], alns: [] };
+const browser = { gen: 0, pick: 0, picked: null, name: null, marked: new Set(), rows: [], alns: [] };
+
+// A drag on header `th`'s right edge sets its column's width: `set(px)`. The
+// click that ends the drag is not a sort (`table._resized`).
+function addColGrip(table, th, set) {
+  const grip = el("span");
+  grip.className = "col-grip";
+  let x0 = 0, w0 = 0;
+  onDrag(grip, {
+    start: (e) => { e.stopPropagation(); x0 = e.clientX; w0 = th.offsetWidth; },
+    move: (ev) => set(Math.max(16, w0 + ev.clientX - x0)),
+    end: (ev) => { table._resized = ev.clientX !== x0; },
+  });
+  th.append(grip);
+}
 
 // A table filled from `rows`: a click on a header sorts by that column (again:
 // the other way), a drag on a header's right edge narrows or widens the column.
@@ -909,19 +1045,7 @@ function fillTable(table, cols, rows, onRow) {
       st.key = c.key;
       fillTable(table, cols, rows, onRow);
     });
-    const grip = el("span");
-    grip.className = "col-grip";
-    let x0 = 0, w0 = 0;
-    onDrag(grip, {
-      start: (e) => { e.stopPropagation(); x0 = e.clientX; w0 = th.offsetWidth; },
-      move: (ev) => {
-        widths[c.key] = Math.max(16, w0 + ev.clientX - x0);
-        th.style.width = `${widths[c.key]}px`;
-        fit();
-      },
-      end: (ev) => { table._resized = ev.clientX !== x0; },
-    });
-    th.append(grip);
+    addColGrip(table, th, (w) => { widths[c.key] = w; th.style.width = `${w}px`; fit(); });
     head.append(th);
   }
   table.tHead.replaceChildren(head);
@@ -966,6 +1090,7 @@ function clearBrowser() {
 
 function clearReadAlns() {
   browser.alns = [];
+  browser.marked.clear();
   $("#read-meta").hidden = true;
   $("#read-alns tbody").replaceChildren();
   $("#read-alns-wrap").hidden = true;
@@ -1016,7 +1141,34 @@ function renderReadAlns() {
   fillTable($("#read-alns"), ALN_COLS, browser.alns, (a, tr) => {
     if (a.best) tr.className = "best";
     else if (!a.passes) tr.className = "fails";
+    if (browser.marked.has(a)) tr.classList.add("on");
+    tr.addEventListener("click", () => markAln(a, tr));
   });
+}
+
+// Draws the marked alignments on the dotplot (glyphs._mark_alignment).
+function showMarks() {
+  const m = viewDoc() && viewDoc().get_model_by_name("qv-mark");
+  if (m) m.text = JSON.stringify([...browser.marked].map(
+    (a) => ({ assembly: a.assembly, contig: a.contig, start: a.start, end: a.end })));
+}
+
+// A click marks the row's alignment, a second click unmarks it.
+function markAln(a, tr) {
+  if (browser.marked.delete(a)) tr.classList.remove("on");
+  else { browser.marked.add(a); tr.classList.add("on"); }
+  showMarks();
+}
+
+// Back to the plain view: no read picked, nothing marked; the hover drives the plot again.
+function clearPick() {
+  browser.picked = null;
+  markPileRead(null);
+  browser.marked.clear();
+  showMarks();
+  const pick = viewDoc() && viewDoc().get_model_by_name("qv-pick");
+  if (pick) pick.text = "";
+  for (const x of document.querySelectorAll("#bin-reads tr.on, #read-alns tr.on")) x.classList.remove("on");
 }
 
 async function onBin(e) {
@@ -1024,7 +1176,7 @@ async function onBin(e) {
   const reads = doc && doc.get_model_by_name("qv-reads");
   if (!reads) return;
   const gen = ++browser.gen;
-  browser.picked = null;
+  clearPick();                                   // a new list: the plot follows the pointer again
   // unsorted, the rows come by band, then name
   browser.rows = d.reads.map((g, i) => ({
     g, band: d.bands[i], color: d.band_colors[d.bands[i]], bandName: d.band_names[d.bands[i]],
@@ -1036,7 +1188,10 @@ async function onBin(e) {
   renderBinReads();
   $("#bin-reads-wrap").hidden = false;
   clearReadAlns();
-  if (!rows.length) return;
+  if (rows.length) fetchLengths(rows, gen);
+}
+
+async function fetchLengths(rows, gen) {
   try {
     const res = await fetch("/api/reads/lengths", {
       method: "POST", headers: { "Content-Type": "application/json" },
@@ -1049,13 +1204,44 @@ async function onBin(e) {
   } catch (_) { /* lengths are a nicety */ }
 }
 
+// Outlines read `name` in the alignment's piles (null: none).
+function markPileRead(name) {
+  browser.name = name;
+  for (const b of document.querySelectorAll(".pile .read")) b.classList.toggle("picked", b.dataset.name === name);
+}
+
+// A click on a read in the alignment's piles picks it in the read browser: in the
+// bin's list when it is there, else alone in a list of its own.
+function openRead(name, band) {
+  let r = browser.rows.find((x) => x.name === name);
+  if (!r) {
+    const reads = viewDoc() && viewDoc().get_model_by_name("qv-reads");
+    const g = reads ? reads.data.name.indexOf(name) : -1;   // -1: not one of the locus's reads
+    const gen = ++browser.gen;
+    r = { g, name, band: 0, color: band.color, bandName: band.name,
+          ratio: g < 0 ? NaN : reads.data.ratio[g], txt: g < 0 ? "not scored in this locus" : reads.data.ratio_txt[g] };
+    browser.rows = [r];
+    $("#bin-meta").textContent = "a read picked in the alignment";
+    $("#bin-reads-wrap").hidden = false;
+    fetchLengths(browser.rows, gen);
+  }
+  browser.picked = r.g;
+  renderBinReads();
+  const tr = $("#bin-reads tr.on");
+  tr.scrollIntoView({ block: "nearest" });
+  pickRead(r, tr);
+}
+
 async function pickRead(r, tr) {
   for (const x of document.querySelectorAll("#bin-reads tr.on")) x.classList.remove("on");
   tr.classList.add("on");
   browser.picked = r.g;
+  browser.marked.clear();
+  showMarks();
+  markPileRead(r.name);
   const doc = viewDoc();
   const pick = doc && doc.get_model_by_name("qv-pick");
-  if (pick) pick.text = `${r.g}#${++browser.pick}`;      // a new text, so a re-click fires too
+  if (pick) pick.text = r.g < 0 ? "" : `${r.g}#${++browser.pick}`;   // a new text, so a re-click fires too
   const gen = browser.gen;
   $("#read-meta").hidden = false;
   $("#read-meta").textContent = `${r.name}: alignments…`;
@@ -1086,7 +1272,7 @@ const SPLIT_KEY = "qaview.readsHeight";
 function setReadsHeight(px) {
   const body = $("#right .side-body");
   const h = Math.round(Math.min(body.clientHeight - 120, Math.max(100, px)));
-  $("#reads-panel").style.flexBasis = `${h}px`;
+  $("#reads-panel").style.flex = `0 0 ${h}px`;
   return h;
 }
 
@@ -1112,7 +1298,7 @@ function wireSplit() {
     },
   });
   handle.addEventListener("dblclick", () => {
-    $("#reads-panel").style.flexBasis = "";
+    $("#reads-panel").style.flex = "";
     try { localStorage.removeItem(SPLIT_KEY); } catch (_) { /* not critical */ }
   });
 }
@@ -1337,8 +1523,16 @@ function wire() {
     const tr = e.target.closest("tr");
     if (tr) openLocus(tr.dataset.id);
   });
-  for (const th of document.querySelectorAll("#loci th")) {
+  const loci = $("#loci");
+  for (const th of loci.tHead.rows[0].cells) {
+    addColGrip(loci, th, (w) => {
+      for (const x of loci.tHead.rows[0].cells) x.style.width = `${x.offsetWidth}px`;   // fix the rest
+      th.style.width = `${w}px`;
+      const sum = [...loci.tHead.rows[0].cells].reduce((t, x) => t + parseFloat(x.style.width), 0);
+      loci.style.width = `max(100%, ${sum}px)`;
+    });
     th.addEventListener("click", () => {
+      if (loci._resized) { loci._resized = false; return; }
       const k = th.dataset.key;
       state.sort = { key: k, asc: state.sort.key === k ? !state.sort.asc : true };
       renderTable();
@@ -1371,6 +1565,12 @@ function wire() {
   wireRectAlign();
   wireHandles();
   $("#reads-toggle").addEventListener("click", toggleReads);
+  $("#clear-pick").addEventListener("click", clearPick);
+  $("#align-strip").addEventListener("scroll", schedulePiles);
+  new ResizeObserver(schedulePiles).observe($("#align-strip"));
+  new ResizeObserver(fitStrip).observe($("#align-panel"));
+  $("#diff-prev").addEventListener("click", () => stepDiff(-1));
+  $("#diff-next").addEventListener("click", () => stepDiff(1));
   $("#remember-toggle").addEventListener("click", toggleRemember);
   $("#recruit-run").addEventListener("click", runRecruit);
   wireAddSeed();

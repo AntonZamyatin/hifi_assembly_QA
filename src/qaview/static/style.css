@@ -117,7 +117,8 @@ body.resizing #plot { pointer-events: none; }
 }
 /* min-width: a narrow sidebar scrolls the table sideways rather than squeeze the seeds column to nothing. */
 #loci { width: 100%; min-width: 350px; border-collapse: collapse; font-size: 12px; table-layout: fixed; }
-#loci th, #loci td { padding: 3px 5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#loci th, #loci td { padding: 3px 5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+                     border-right: 1px solid var(--line); }
 #loci th {
   position: sticky; top: 0; background: var(--panel); z-index: 1;
   text-align: left; font-weight: 600; color: var(--muted);
@@ -212,16 +213,18 @@ dl.files dd { font-family: ui-monospace, monospace; font-size: 11px; }
 /* ---- right sidebar: bin alignment -------------------------------------------- */
 
 #right .side-body { padding-left: 16px; }
-/* Reserved above and below: they share the spare height, and never shrink below
-   their content -- a short window scrolls the sidebar instead of overlapping them. */
-#right .slot { flex: 1 0 auto; }
-#align-panel { display: flex; flex-direction: column; gap: 6px; }
+/* The read browser and the alignment panel split the height evenly, or as the
+   border between them was dragged (app.js setReadsHeight); their content never
+   resizes them. The buttons below keep their own height. */
+#right .slot { flex: 0 0 auto; }
+#align-panel { flex: 1 1 0; min-height: 0; overflow-y: auto; position: relative; display: flex; flex-direction: column; gap: 6px; }
 #align-meta { line-height: 1.5; }
 #align-meta b { color: var(--ink); font-weight: 600; }
-/* Capped in height so its horizontal scrollbar stays in view when reads make it
-   tall: it scrolls both ways itself, opened on the sequence rows (app.js). */
+/* As tall as the reads need (app.js layoutPiles), at most the panel's height
+   below the meta lines (fitStrip): it scrolls both ways itself, centred on the
+   sequence rows. The legends under it are a scroll of the panel away. */
 .strip {
-  overflow: auto; max-height: 60vh; max-height: 60dvh;
+  flex: 0 0 auto; min-height: 60px; overflow: auto;
   border: 1px solid var(--line); border-radius: 3px; background: var(--panel);
 }
 .strip pre {
@@ -231,6 +234,9 @@ dl.files dd { font-family: ui-monospace, monospace; font-size: 11px; }
 }
 .strip .mm  { background: #fbd9b8; }
 .strip .gap { background: #d6e4f5; }
+.strip .mm.cur  { background: #f2a865; }
+.strip .gap.cur { background: #9dbde6; }
+#diff-nav { display: flex; align-items: center; gap: 8px; }
 .strip .out { color: #a3a39b; background: repeating-linear-gradient(135deg, #f4f4f0 0 3px, #fafaf8 3px 6px); }
 .legend { display: flex; flex-wrap: wrap; gap: 4px 12px; }
 .legend .sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
@@ -246,7 +252,7 @@ dl.files dd { font-family: ui-monospace, monospace; font-size: 11px; }
 
 /* ---- read browser (top half of the right sidebar) -------------------------------- */
 
-#reads-panel { flex: 0 0 50%; min-height: 0; margin-top: 18px;   /* clear of the collapse button */
+#reads-panel { flex: 1 1 0; min-height: 0; margin-top: 18px;   /* clear of the collapse button */
                display: flex; flex-direction: column; gap: 6px; padding-bottom: 4px; }
 #right-split { flex: 0 0 9px; margin: 0 -4px 6px; cursor: ns-resize; position: relative; }
 #right-split::after { content: ""; position: absolute; left: 4px; right: 4px; top: 4px;
@@ -259,20 +265,25 @@ body.resizing-v, body.resizing-v * { cursor: ns-resize !important; user-select: 
 /* Fixed layout: columns keep the widths their headers set (app.js fillTable sets
    the table's width to their sum, at least the panel's); cut text ellipsizes. */
 .tbl { width: 100%; table-layout: fixed; border-collapse: collapse; font-size: 12px; }
-.tbl th, .tbl td { padding: 2px 5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tbl th, .tbl td { padding: 2px 5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+                   border-right: 1px solid var(--line); }
+#loci th:last-child, #loci td:last-child, .tbl th:last-child, .tbl td:last-child { border-right: 0; }
 .tbl th { position: sticky; top: 0; z-index: 1; background: var(--panel); text-align: left;
           font-weight: 600; border-bottom: 1px solid var(--line); cursor: pointer; user-select: none; }
 .tbl th.sorted.asc::after { content: " \25B4"; }
 .tbl th.sorted.desc::after { content: " \25BE"; }
 .tbl th:not(.sorted):hover::after { content: " \2195"; opacity: .5; }
-.tbl .col-grip { position: absolute; top: 0; right: 0; width: 6px; height: 100%; cursor: col-resize; }
-.tbl .col-grip:hover { background: color-mix(in srgb, var(--accent) 30%, transparent); }
+.col-grip { position: absolute; top: 0; right: 0; width: 6px; height: 100%; cursor: col-resize; z-index: 1; }   /* over the hover arrow */
+.col-grip:hover { background: color-mix(in srgb, var(--accent) 30%, transparent); }
 .tbl .num { text-align: right; font-variant-numeric: tabular-nums; }
 .tbl td.sw { padding: 0 0 0 4px; }
 .tbl td.sw i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; }
 #bin-reads tbody tr { cursor: pointer; }
 #bin-reads tbody tr:hover { filter: brightness(0.95); }
 #bin-reads tbody tr.on { outline: 1.5px solid var(--accent); outline-offset: -1.5px; }
+#read-alns tbody tr { cursor: pointer; }
+#read-alns tbody tr:hover { background: var(--hover); }
+#read-alns tbody tr.on { outline: 1.5px solid var(--accent); outline-offset: -1.5px; }
 #read-alns tr.best td { font-weight: 600; }
 #read-alns tr.fails td { color: var(--muted); }
 
@@ -295,7 +306,8 @@ body.resizing-v, body.resizing-v * { cursor: ns-resize !important; user-select: 
 .btn:hover { background: var(--hover); }
 .btn.on { background: var(--select); border-color: var(--accent); }
 .pile { position: relative; }
-.pile .read { position: absolute; height: 4px; }
+.pile .read { position: absolute; height: 4px; cursor: pointer; }
+.pile .read.picked { outline: 2px solid #e6007e; outline-offset: 1px; z-index: 1; }
 .pile .run { position: absolute; top: 0; height: 4px; pointer-events: none; }
 .pile .run.x { background: #1d1d1b; }
 .pile .run.i { background: #7b3fa0; }

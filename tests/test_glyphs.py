@@ -244,9 +244,9 @@ def test_color_modes(tmp):
     from qaview.glyphs import SUPPLEMENTARY_COLOR
     from qatool.plotters.colors import SUPPORT_COLORS
 
-    from qaview.glyphs import LAYER_STYLE, pack_rgba
+    from qaview.glyphs import LAYER_COLOR, pack_rgba
     # colours travel packed (0xRRGGBBAA), one binary array
-    allowed = {pack_rgba(c) for c in ({c for c, _ in LAYER_STYLE.values() if c is not None}
+    allowed = {pack_rgba(c) for c in ({c for c in LAYER_COLOR.values() if c is not None}
                                       | set(SUPPORT_COLORS.values()))}
     by_class = dotplot_figure(rd, color_by="class").renderers[0].data_source.data["color"]
     check(by_class.dtype == np.uint32 and set(by_class.tolist()) <= allowed,

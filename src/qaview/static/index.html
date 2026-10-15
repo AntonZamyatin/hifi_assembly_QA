@@ -181,6 +181,7 @@
             <tbody></tbody>
           </table>
         </div>
+        <button id="clear-pick" class="btn" title="unselect the read and its alignment: the plot follows the pointer again">Clear selection</button>
       </section>
       <div id="right-split" title="drag to resize; double-click to reset"></div>
       <section id="align-panel">
@@ -190,6 +191,11 @@
           <div id="pile-top" class="pile" hidden></div>
           <pre id="align-rows"></pre>
           <div id="pile-bottom" class="pile" hidden></div>
+        </div>
+        <div id="diff-nav" class="small muted" hidden>
+          <button id="diff-prev" class="btn" title="centre the previous difference">&lsaquo; previous</button>
+          <button id="diff-next" class="btn" title="centre the next difference">next &rsaquo;</button>
+          <span id="diff-pos"></span>
         </div>
         <div id="align-legend" class="small muted legend" hidden>
           <span><i class="sw mm"></i>mismatch</span><span><i class="sw gap"></i>gap</span>

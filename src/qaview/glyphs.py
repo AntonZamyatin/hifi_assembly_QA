@@ -30,7 +30,7 @@ SUPPLEMENTARY_COLOR = "#d62728"
 # A one-sided read's partial alignments in the other candidate (region.LAYER_PARTIAL):
 # drawn only when a hover or a tap selects the read, in their own colour.
 PARTIAL_COLOR = "#ff7f0e"
-PARTIAL_ALPHA = 0.9
+PARTIAL_ALPHA = 1.0
 # A large indel on a partial row: a cross on its line, with it on selection only.
 INDEL_COLOR = "#4a148c"
 # a read picked in the read browser: rings on its best-placement lines
@@ -66,16 +66,16 @@ def contig_colors(rd) -> dict:
     return {c: to_hex(cmap(i % cmap.N)) for i, c in enumerate(all_contigs)}
 
 
-# Per-layer style, indexed by qaview.region.LAYER_*.  Widths decrease going up so the
-# wide grey common backbone stays readable under the narrower, more informative lines.
-# A colour of None means "take it from SUPPORT_COLORS[class]".
-LAYER_STYLE = {
-    0: (SUPPORT_COLORS["common"], 4.0),  # common — bottom, widest; matches the marginals
-    1: ("black", 2.0),                   # unclassified ("other")
-    2: (None, 1.5),                      # support — coloured by class
-    3: (SUPPLEMENTARY_COLOR, 1.5),       # supplementary — top
-    4: (PARTIAL_COLOR, 1.5),             # partial: a one-sided read's partial alignments, on selection only
+# Per-layer colour, indexed by qaview.region.LAYER_*. None means "take it from
+# SUPPORT_COLORS[class]".
+LAYER_COLOR = {
+    0: SUPPORT_COLORS["common"],         # common — bottom; matches the marginals
+    1: "black",                          # unclassified ("other")
+    2: None,                             # support — coloured by class
+    3: SUPPLEMENTARY_COLOR,              # supplementary — top
+    4: PARTIAL_COLOR,                    # partial: a one-sided read's partial alignments, on selection only
 }
+LINE_WIDTH = 3.0                         # every read line, in screen pixels: visible at any zoom
 
 
 def _hex_rgb(h: str) -> tuple:
@@ -120,7 +120,7 @@ def ratio_color(t: float) -> str:
 # ColorSpec takes as is. The page restyles lines itself (static/app.js
 # `lineStyle`, mirroring `line_style`), so a colouring change needs no server.
 
-LINE_ALPHA = 0.55
+LINE_ALPHA = 1.0                         # read lines are opaque: always plainly visible
 
 
 def pack_rgba(color: str, alpha: int = 255) -> int:
@@ -149,7 +149,7 @@ def ratio_rgba(t) -> np.ndarray:
 
 def line_style(color_by: str, layer, supp, cls_rgba, ratio, visible_layers=None,
                line_alpha: float = LINE_ALPHA, C: float = 200.0) -> tuple:
-    """(colour uint32, width float32, alpha float32, selected alpha float32) per line.
+    """(colour uint32, alpha float32, selected alpha float32) per line.
 
     `cls_rgba` is each line's support-class colour, `ratio` its read's log-ratio
     (NaN: not scored). Hidden layers are drawn at alpha 0 rather than removed: the
@@ -157,49 +157,37 @@ def line_style(color_by: str, layer, supp, cls_rgba, ratio, visible_layers=None,
     (LAYER_PARTIAL) are never drawn unselected, and orange in every mode.
     """
     layer = np.asarray(layer, dtype=np.int64)
-    nl = len(LAYER_STYLE)
-    base = np.array([pack_rgba(LAYER_STYLE[i][0]) if LAYER_STYLE[i][0] else 0 for i in range(nl)],
+    nl = len(LAYER_COLOR)
+    base = np.array([pack_rgba(LAYER_COLOR[i]) if LAYER_COLOR[i] else 0 for i in range(nl)],
                     dtype=np.uint32)
-    has_base = np.array([LAYER_STYLE[i][0] is not None for i in range(nl)])
-    lw = np.array([LAYER_STYLE[i][1] for i in range(nl)], dtype=float)
+    has_base = np.array([LAYER_COLOR[i] is not None for i in range(nl)])
     if color_by == "class":
         color = np.where(has_base[layer], base[layer], np.asarray(cls_rgba, dtype=np.uint32))
-        width = lw[layer]
     elif color_by == "block":
         # Convention inherited from reads_dotplot.py: black backbone, supplementary red.
         color = np.where(np.asarray(supp, dtype=bool), np.uint32(pack_rgba(SUPPLEMENTARY_COLOR)),
                          np.uint32(pack_rgba("black")))
-        width = lw[layer]
     elif color_by == "log-ratio":
-        # Rows cannot be re-sorted to put decisive reads on top: the hover and
-        # selection callbacks index rows by position. Width and opacity carry the
-        # emphasis instead, so indifferent reads recede and decisive ones stand out.
         ratio = np.asarray(ratio, dtype=float)
         scored = ~np.isnan(ratio)
         t = ratio_strengths(ratio, C)
         color = np.where(scored, ratio_rgba(t), np.uint32(pack_rgba(UNSCORED_COLOR)))
-        width = np.where(scored, 1.0 + 2.5 * np.abs(t), 1.0)
     else:
         raise ValueError("color_by must be 'class', 'block' or 'log-ratio'")
     shown = (np.ones(len(layer), bool) if visible_layers is None
              else np.isin(layer, [int(x) for x in visible_layers]))
     alpha = np.where(shown, line_alpha, 0.0)
-    if color_by == "log-ratio":
-        alpha = alpha * np.where(scored, 0.3 + 0.7 * np.abs(t), 0.3)
     part = layer == 4
     color = np.where(part, np.uint32(pack_rgba(PARTIAL_COLOR)), color)
-    width = np.where(part, LAYER_STYLE[4][1], width)
     sel_alpha = np.where(part, np.where(shown, PARTIAL_ALPHA, 0.0), alpha)
     alpha = np.where(part, 0.0, alpha)
-    return (color.astype(np.uint32), width.astype(np.float32), alpha.astype(np.float32),
-            sel_alpha.astype(np.float32))
+    return color.astype(np.uint32), alpha.astype(np.float32), sel_alpha.astype(np.float32)
 
 
 def style_spec() -> dict:
     """The constants `line_style` uses, for the page's own restyling."""
-    return {"layer_rgba": [pack_rgba(LAYER_STYLE[i][0]) if LAYER_STYLE[i][0] else None
-                           for i in range(len(LAYER_STYLE))],
-            "layer_width": [LAYER_STYLE[i][1] for i in range(len(LAYER_STYLE))],
+    return {"layer_rgba": [pack_rgba(LAYER_COLOR[i]) if LAYER_COLOR[i] else None
+                           for i in range(len(LAYER_COLOR))],
             "partial_layer": 4, "partial_rgba": pack_rgba(PARTIAL_COLOR),
             "partial_alpha": PARTIAL_ALPHA,
             "supp_rgba": pack_rgba(SUPPLEMENTARY_COLOR), "black_rgba": pack_rgba("black"),
@@ -306,9 +294,9 @@ def _line_sources(rd, color_by: str, visible_layers=None, line_alpha: float = LI
                          for c in cls_names], dtype=np.uint32)
     cls = read_cls[read] if n else np.zeros(0, np.int32)
     ratio = _read_ratios(rd, ratios)
-    color, width, alpha, sel_alpha = line_style(color_by, layer, supp, cls_rgba[cls],
-                                                ratio[read] if n else np.zeros(0),
-                                                visible_layers, line_alpha, C)
+    color, alpha, sel_alpha = line_style(color_by, layer, supp, cls_rgba[cls],
+                                         ratio[read] if n else np.zeros(0),
+                                         visible_layers, line_alpha, C)
     # what each row is: a full-length placement, or which partial alignment
     labels = list(getattr(rd.lines, "part", None) or [])
     part_names = ["full-length"] + sorted({x for x in labels if x})
@@ -332,8 +320,7 @@ def _line_sources(rd, color_by: str, visible_layers=None, line_alpha: float = LI
         ref1_0=i32(rd.lines.ref1_0), ref1_1=i32(rd.lines.ref1_1),
         ref2_0=i32(rd.lines.ref2_0), ref2_1=i32(rd.lines.ref2_1),
         pid1=np.asarray(rd.lines.pid1, np.float32), pid2=np.asarray(rd.lines.pid2, np.float32),
-        cls_color=cls_rgba[cls], color=color, width=width, alpha=alpha, sel_alpha=sel_alpha,
-        part=part, hover_width=(width * 1.5 + 1.5).astype(np.float32),
+        cls_color=cls_rgba[cls], color=color, alpha=alpha, sel_alpha=sel_alpha, part=part,
     ), name="qv-lines")
     reads = ColumnDataSource(dict(
         name=list(rd.read_names), ratio=ratio,
@@ -431,9 +418,6 @@ def dotplot_figure(rd, color_by: str = "class", line_alpha: float = LINE_ALPHA,
                    reads: str = "all"):
     """Read-correspondence dotplot: asm2 on X, asm1 on Y.
 
-    Depth is conveyed by alpha overplotting rather than merged line width — merging
-    is resolution-dependent and would have to be redone on every zoom.
-
     `background` (qaview.similarity) draws the k-mer similarity of the segments
     underneath, from `floor` (the locus's recruitment pid) up.
     `reads="hover"` draws no read until reads are selected -- by hovering a
@@ -454,22 +438,20 @@ def dotplot_figure(rd, color_by: str = "class", line_alpha: float = LINE_ALPHA,
     lines, reads_src, tables = _line_sources(rd, color_by, visible_layers, line_alpha,
                                              ratios=ratios, dropped=dropped, C=C)
     r = p.segment(x0="x0", y0="y0", x1="x1", y1="y1", source=lines,
-                  color="color", line_width="width", alpha="alpha", name="qv-lines-glyph")
+                  color="color", line_width=LINE_WIDTH, alpha="alpha", name="qv-lines-glyph")
     # Selecting reads (by tap, or from a coverage bin) hides every other read outright,
     # so a hovered bin shows only the reads that pass through it.  The selected glyph
     # honours `sel_alpha` -- a row's alpha, so a hidden layer stays hidden even when
     # selected, except partial rows, which only a selection shows.
     r.selection_glyph = SegmentGlyph(x0="x0", y0="y0", x1="x1", y1="y1",
-                                     line_color="color", line_width="width",
+                                     line_color="color", line_width=LINE_WIDTH,
                                      line_alpha="sel_alpha")
     r.nonselection_glyph = SegmentGlyph(x0="x0", y0="y0", x1="x1", y1="y1",
-                                        line_color="color", line_width="width", line_alpha=0.0)
+                                        line_color="color", line_width=LINE_WIDTH, line_alpha=0.0)
     if reads == "hover":
         # A scalar alpha of 0 is skipped outright when drawing, not stroked 180,000
-        # times; the selection glyph still draws the reads of a hovered bin -- a
-        # little thicker, as they stand alone over the genome alignment.
+        # times; the selection glyph still draws the reads of a hovered bin.
         r.glyph.line_alpha = 0.0
-        r.selection_glyph.line_width = "hover_width"
     if background is not None:
         _draw_background(p, background, floor, rd)
     _draw_indels(p, rd, lines)
@@ -941,9 +923,10 @@ def _wire_rebin(rd, main, shared, lines, margs: list, reads):
 
 
 def _link_bins_to_reads(cov_fig, marg, other_marg, main, status, orientation,
-                        reads, stackings: dict, mode: Div):
+                        reads, stackings: dict, mode: Div, pick: Div):
     """Hover a coverage bin: stripe that bin, light the matching bins on the other
-    assembly, and show only the reads passing through it.
+    assembly, and show only the reads passing through it -- unless the page has
+    picked a read (`pick`, see `_pick_read`): that one stays shown until cleared.
 
     The stack is per band, so the cursor's position along the *value* axis says
     which band is under it -- the hover then narrows to that band alone. Above the
@@ -958,10 +941,11 @@ def _link_bins_to_reads(cov_fig, marg, other_marg, main, status, orientation,
     cb = CustomJS(
         args=dict(
             lines=line_renderer(main).data_source, M=marg, O=other_marg, reads=reads,
-            status=status, mode=mode, names=names,
+            status=status, mode=mode, names=names, pick=pick,
             vertical=(orientation == "x"), label=cov_fig.name or "",
         ),
         code=REBIN_JS + """
+        if (pick.text) return;
         const hit = M.hit, other = O.hit;
         const hovered = cb_data.index.indices;
         if (!hovered || hovered.length === 0) {
@@ -1076,18 +1060,67 @@ def _pick_read(main, margs: list, reads) -> Div:
     return pick
 
 
+def _segs_js(rd) -> dict:
+    """Each axis's segments as [contig, start, end, plot offset, flipped], for CustomJS."""
+    return dict(ysegs=[[c, s, e, o, f] for (c, s, e, o), f in
+                       zip(rd.asm1_segs_info, rd.flips_of(rd.asm1))],
+                xsegs=[[c, s, e, o, f] for (c, s, e, o), f in
+                       zip(rd.asm2_segs_info, rd.flips_of(rd.asm2))],
+                a1=rd.asm1, a2=rd.asm2)
+
+
+def _mark_alignment(rd, main) -> Div:
+    """A hidden model the page sets to a JSON list of alignments {assembly, contig,
+    start, end} to mark them: each a translucent band across the dotplot where it
+    lies inside the segments (horizontal for asm1, vertical for asm2), else the edge
+    of the nearest segment of its contig, on the side it lies past. An alignment on
+    a contig the locus does not hold marks nothing."""
+    mark = Div(text="", visible=False, name="qv-mark")
+    band = ColumnDataSource(dict(left=[], right=[], bottom=[], top=[]), name="qv-mark-band")
+    edge = ColumnDataSource(dict(x0=[], y0=[], x1=[], y1=[]), name="qv-mark-edge")
+    main.quad(left="left", right="right", bottom="bottom", top="top", source=band,
+              fill_color=PICK_COLOR, fill_alpha=0.15, line_color=PICK_COLOR, line_alpha=0.5,
+              line_width=1)
+    main.segment(x0="x0", y0="y0", x1="x1", y1="y1", source=edge, line_color=PICK_COLOR,
+                 line_width=4)
+    mark.js_on_change("text", CustomJS(
+        args=dict(band=band, edge=edge, W=rd.plot_w, H=rd.plot_h, **_segs_js(rd)), code="""
+        const bands = {left: [], right: [], bottom: [], top: []}, edges = {x0: [], y0: [], x1: [], y1: []};
+        for (const m of (cb_obj.text ? JSON.parse(cb_obj.text) : [])) {
+            const onY = m.assembly === a1;
+            if (!onY && m.assembly !== a2) continue;
+            const spans = [];
+            let near = null, dist = Infinity;
+            for (const [c, s, e, o, f] of (onY ? ysegs : xsegs)) {
+                if (c !== m.contig) continue;
+                const lo = Math.max(s, m.start), hi = Math.min(e, m.end);
+                if (lo < hi) { spans.push(f ? [o + e - hi, o + e - lo] : [o + lo - s, o + hi - s]); continue; }
+                const before = m.end <= s, d = before ? s - m.end : m.start - e;
+                // the segment's start edge is at o, unless the segment is shown flipped
+                if (d < dist) { dist = d; near = before !== !!f ? o : o + (e - s); }
+            }
+            for (const [a, b] of spans) {
+                bands.left.push(onY ? 0 : a); bands.right.push(onY ? W : b);
+                bands.bottom.push(onY ? a : 0); bands.top.push(onY ? b : H);
+            }
+            if (!spans.length && near !== null) {
+                edges.x0.push(onY ? 0 : near); edges.x1.push(onY ? W : near);
+                edges.y0.push(onY ? near : 0); edges.y1.push(onY ? near : H);
+            }
+        }
+        band.data = bands;
+        edge.data = edges;
+        """))
+    return mark
+
+
 def _coordinate_readout(rd, main):
     """Live contig:position readout for the crosshair, both axes."""
     div = Div(text="<i>hover the dotplot for coordinates</i>",
               styles={"font-family": "monospace", "font-size": "12px",
                       "padding": "2px 0 4px 0"})
     cb = CustomJS(
-        args=dict(div=div,
-                  ysegs=[[c, s, e, o, f] for (c, s, e, o), f in
-                         zip(rd.asm1_segs_info, rd.flips_of(rd.asm1))],
-                  xsegs=[[c, s, e, o, f] for (c, s, e, o), f in
-                         zip(rd.asm2_segs_info, rd.flips_of(rd.asm2))],
-                  a1=rd.asm1, a2=rd.asm2),
+        args=dict(div=div, **_segs_js(rd)),
         code="""
         function loc(segs, p) {
             for (const [c, s, e, o, f] of segs)
@@ -1216,13 +1249,14 @@ def report_layout(rd, color_by: str = "class", visible_layers=None,
     reads = _reads_source(rd, stackings)
     mx = _marginal_model(rd, cov_top, rd.asm2, "x")
     my = _marginal_model(rd, cov_right, rd.asm1, "y")
-    _link_bins_to_reads(cov_top, mx, my, main, status, "x", reads, stackings, mode)
-    _link_bins_to_reads(cov_right, my, mx, main, status, "y", reads, stackings, mode)
+    pick = _pick_read(main, [mx, my], reads)
+    _link_bins_to_reads(cov_top, mx, my, main, status, "x", reads, stackings, mode, pick)
+    _link_bins_to_reads(cov_right, my, mx, main, status, "y", reads, stackings, mode, pick)
     _link_reads_to_bins(main, [mx, my], reads)
     _wire_rebin(rd, main, shared, line_renderer(main).data_source, [mx, my], reads)
     _link_bin_click(cov_top, mx, reads, mode, stackings, "x")
     _link_bin_click(cov_right, my, reads, mode, stackings, "y")
-    pick = _pick_read(main, [mx, my], reads)
+    mark = _mark_alignment(rd, main)
     readout = _coordinate_readout(rd, main)
 
     corner = Spacer(width=BAR_SIZE, height=margin_size, tags=["qv:corner"])
@@ -1252,7 +1286,7 @@ def report_layout(rd, color_by: str = "class", visible_layers=None,
         div.width = BAR_SIZE + w + margin_size
         div.styles = {**div.styles, "white-space": "nowrap", "overflow": "hidden",
                       "text-overflow": "ellipsis"}
-    return column(readout, status, grid, pick)   # pick: hidden, for the page
+    return column(readout, status, grid, pick, mark)   # pick, mark: hidden, for the page
 
 
 def save_html(layout, path: str, title: str = "qaview", inline: bool = True) -> str:
