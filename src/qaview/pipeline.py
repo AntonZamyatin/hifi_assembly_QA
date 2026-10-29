@@ -44,7 +44,8 @@ from qaview.project import Project, Seed, validate_recruitment
 
 # Bump when a recruiter change alters results, so older recruitments are redone.
 # Not bumped: segments exactly merge_gap apart now merge in either order (rare).
-RECRUIT_VERSION = 1
+# 2: the pickle keeps the round each read was recruited in.
+RECRUIT_VERSION = 2
 # The same for the anchor extension alone, so its fixes leave legacy results be.
 # 2: reads at a seal that a merge put inside a segment are recruited.
 # 3: edges move to the nearest anchor region; anchors' copies become segments;
@@ -101,8 +102,8 @@ def recruit_one(job: dict) -> str:
     tmp = f"{job['out']}.{os.getpid()}.tmp"
     with open(tmp, "wb") as fh:
         # edge_log: why each edge stopped. params: what it was recruited with -- the
-        # scorer takes its pid/plen.
-        pickle.dump({"segments": list(segments), "reads": set(reads),
+        # scorer takes its pid/plen. rounds: read -> the round that recruited it.
+        pickle.dump({"segments": list(segments), "reads": set(reads), "rounds": dict(srr.read_round),
                      "edge_log": list(srr.edge_log), "params": dict(r)}, fh)
     os.replace(tmp, job["out"])
     return job["out"]

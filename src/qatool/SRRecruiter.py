@@ -102,6 +102,7 @@ class Recruiter:
     def reset(self):
         self.sc = SegmentCollection(merge_gap=self.merge_gap)
         self.seen_reads = set()
+        self.read_round: Dict[str, int] = {}     # read -> the round that recruited it
         self.aln_df = pd.DataFrame(columns=["read_name", "asm", "contig",
                                             "start", "end", "pid", "plen", "ed"])
         self._sealed = {}
@@ -141,12 +142,14 @@ class Recruiter:
                 if self.verbose: print(f"STOPPED no new reads")
                 break
             self.seen_reads.update(new_reads)
+            self.read_round.update(dict.fromkeys(new_reads, cur_round))
             self.expand_reads_to_segments(new_reads)
         if self.verbose: print(f"DONE segments recruited:", self.sc)
         # Final pass: include reads fully contained in the final segments
         final_reads = self.expand_segments_to_reads()
         if final_reads:
             self.seen_reads.update(final_reads)
+            self.read_round.update(dict.fromkeys(final_reads, cur_round))
         return self.sc, self.seen_reads, self.aln_df
 
     def _prime_contig_lengths(self):

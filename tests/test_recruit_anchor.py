@@ -144,6 +144,8 @@ def test_edges_move_to_the_nearest_anchors():
             check(any(s <= 50_000 and e >= 55_000 for _, s, e in spans(sc, asm)[1:]),
                   f"{asm}: r20's other qualifying alignment is a segment too: {spans(sc, asm)}")
         check(reads >= {f"r{i}" for i in range(20, 36)}, f"reads inside, anchors too: {sorted(reads)}")
+        check(set(r.read_round) == reads and r.read_round["r30"] == 1
+              and max(r.read_round.values()) > 1, f"each read's round: {r.read_round}")
         log = [(e["assembly"], e["side"], e["from"], e["to"], e["why"], e["read"]) for e in r.edge_log]
         check(("A", "L", 28_000, 20_000, "anchor", "r20") in log
               and ("A", "R", 32_000, 40_000, "anchor", "r35") in log, f"asm1's edges: {log}")

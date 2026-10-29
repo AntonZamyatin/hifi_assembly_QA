@@ -384,7 +384,8 @@ function ratioRgba(st, t) {
   return ((r << 24) | (g << 16) | (b << 8) | 255) >>> 0;
 }
 
-function lineStyle(st, colorBy, shown, C, data, ratio) {
+// `round`: {band: each read's round index, rgba: each round's colour}.
+function lineStyle(st, colorBy, shown, C, data, ratio, round) {
   const n = data.layer.length;
   const color = new Uint32Array(n), alpha = new Float32Array(n), sel = new Float32Array(n);
   const l1c = Math.log1p(C);
@@ -401,6 +402,8 @@ function lineStyle(st, colorBy, shown, C, data, ratio) {
       }
     } else if (colorBy === "block") {
       color[i] = data.supp[i] ? st.supp_rgba : st.black_rgba;
+    } else if (colorBy === "round") {
+      color[i] = round.rgba[round.band[data.read[i]]] ?? st.unscored_rgba;
     } else {
       const base = st.layer_rgba[lay];
       color[i] = base === null ? data.cls_color[i] : base;
@@ -434,8 +437,10 @@ function restyle() {
   const st = d.style;
   const C = parseFloat($("#C").value) || 200;
   const want = $("#color_by .on").dataset.v;
-  // until a score exists, log-ratio draws the support classes, as the server does
-  const colorBy = want === "log-ratio" && !d.score ? "class" : want;
+  // until a score exists, log-ratio draws the support classes, as the server does;
+  // so does round, for a recruitment made before rounds were kept
+  const bands = d.rounds && doc.get_model_by_name("qv-bands");
+  const colorBy = (want === "log-ratio" && !d.score) || (want === "round" && !bands) ? "class" : want;
   const shown = new Set([...document.querySelectorAll("#layers input:checked")]
     .map((b) => st.layers[b.value]));
   const src = doc.get_model_by_name("qv-lines");
@@ -443,14 +448,30 @@ function restyle() {
   const glyph = doc.get_model_by_name("qv-lines-glyph");
   if (src && reads) {
     const data = src.data;
-    src.data = { ...data, ...lineStyle(st, colorBy, shown, C, data, reads.data.ratio) };
+    const round = bands && { band: bands.data.band_round,
+                             rgba: d.rounds.map((h) => ((parseInt(h.slice(1), 16) << 8) | 255) >>> 0) };
+    src.data = { ...data, ...lineStyle(st, colorBy, shown, C, data, reads.data.ratio, round) };
   }
   if (glyph) {
     const all = $("#reads_mode .on").dataset.v === "all";
     glyph.glyph.line_alpha = all ? { field: "alpha" } : { value: 0 };
   }
   // marginals: log-ratio bands once scored, support classes otherwise
-  const stack = want === "log-ratio" && d.score ? "ratio" : "class";
+  const stack = want === "log-ratio" && d.score ? "ratio" : want === "round" && bands ? "round" : "class";
+  const legend = $("#round-legend");
+  legend.hidden = want !== "round";
+  if (!bands) legend.textContent = "no rounds kept for this locus";
+  else {
+    // rounds past the rainbow share one grey: one swatch for them all
+    const n = d.rounds.length, late = n > 8 ? `rounds 8–${n}` : "round 8";
+    legend.replaceChildren(...d.rounds.slice(0, 8).map((c, k) => {
+      const sp = el("span"), i = el("i");
+      i.className = "sw";
+      i.style.background = c;
+      sp.append(i, k < 7 ? `round ${k + 1}` : late);
+      return sp;
+    }));
+  }
   const mode = doc.get_model_by_name("qv-mode");
   if (mode) mode.text = stack;
   for (const m of doc.all_models) {

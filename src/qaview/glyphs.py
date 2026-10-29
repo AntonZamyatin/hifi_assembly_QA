@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from bokeh.layouts import column, gridplot
 from bokeh.models import (
     ColumnDataSource, CrosshairTool, CustomJS, CustomJSHover, Div, HoverTool, Quad, Range1d,
-    Scatter, Segment as SegmentGlyph, Spacer, Span, TapTool, WheelZoomTool,
+    Scatter, Segment as SegmentGlyph, Spacer, Span, TapTool, Title, WheelZoomTool,
 )
 from bokeh.plotting import figure
 
@@ -46,6 +46,8 @@ MAIN_WIDTH = 1100
 MIN_MAIN = 40               # fit_main's floor, per side
 MARGIN_SIZE = 200
 BAR_SIZE = 15
+AXIS_LABEL = 22            # the genome's name beside its contig bar
+BAR_BOX = BAR_SIZE + AXIS_LABEL
 
 
 def main_height(rd, width: int = MAIN_WIDTH) -> int:
@@ -262,6 +264,26 @@ def ratio_stacking(rd, ratios: dict) -> Stacking:
               ratio_color(0.5), ratio_color(1.0), UNSCORED_COLOR]
     read_band = [ratio_band(ratios.get(n)) for n in rd.read_names]
     return Stacking(keys, colors, read_band)
+
+
+# Recruitment rounds 1-7 in rainbow order; every later round grey.
+ROUND_COLORS = ["#e41a1c", "#ff7f00", "#ffd700", "#4daf4a", "#377eb8", "#3f2a9c", "#984ea3"]
+LATE_ROUND_COLOR = "#7f7f7f"
+
+
+def round_colors(n: int) -> list:
+    """The colours of `n` recruitment rounds, first to last."""
+    return [ROUND_COLORS[k] if k < len(ROUND_COLORS) else LATE_ROUND_COLOR for k in range(n)]
+
+
+def round_stacking(rd, rounds: dict) -> Stacking:
+    """Coverage split by the recruitment round that took each read in, first round
+    at the bottom. Reads the final pass over the finished segments takes in count
+    in the round that found nothing new."""
+    n = max(rounds.values(), default=1)
+    keys = [f"round {k}" for k in range(1, n + 1)] + ["no round recorded"]
+    read_band = [rounds.get(nm, n + 1) - 1 for nm in rd.read_names]
+    return Stacking(keys, round_colors(n) + [UNSCORED_COLOR], read_band)
 
 
 def _read_ratios(rd, ratios) -> np.ndarray:
@@ -704,11 +726,14 @@ def contig_bar_figure(rd, assembly: str, orientation: str, colors: dict,
     rng = rng if rng is not None else Range1d(0, total)
 
     if orientation == "x":
-        p = figure(width=width, height=BAR_SIZE, x_range=rng,
+        p = figure(width=width, height=BAR_BOX, x_range=rng,
                    y_range=Range1d(0, 1), tools="")
     else:
-        p = figure(width=BAR_SIZE, height=height or main_height(rd, width),
+        p = figure(width=BAR_BOX, height=height or main_height(rd, width),
                    y_range=rng, x_range=Range1d(0, 1), tools="")
+    p.add_layout(Title(text=assembly, align="center", text_font_size="14px",
+                       text_font_style="bold", standoff=0),
+                 "below" if orientation == "x" else "left")
 
     for contig, off, end in contig_runs(segs_info, total):
         if orientation == "x":
@@ -888,7 +913,8 @@ def _reads_source(rd, stackings: dict) -> ColumnDataSource:
     p1, p2 = rd.placements[rd.asm1], rd.placements[rd.asm2]
     return ColumnDataSource(dict(
         first_x=p2.first, last_x=p2.last, first_y=p1.first, last_y=p1.last,
-        **{f"band_{k}": np.asarray(st.read_band, dtype=np.int32) for k, st in stackings.items()}))
+        **{f"band_{k}": np.asarray(st.read_band, dtype=np.int32) for k, st in stackings.items()}),
+        name="qv-bands")
 
 
 def _wire_rebin(rd, main, shared, lines, margs: list, reads):
@@ -1159,17 +1185,20 @@ def report_layout(rd, color_by: str = "class", visible_layers=None,
                   ratios=None, dropped=None, C: float = 200.0,
                   max_width: int = MAIN_WIDTH, max_height: int | None = None,
                   margin_size: int = MARGIN_SIZE, background: dict | None = None,
-                  floor: float = 0.997, reads: str = "all"):
+                  floor: float = 0.997, reads: str = "all", rounds: dict | None = None):
     """Assemble the full interactive report.
+
+    `rounds`: read -> the recruitment round that took it in, for colouring by round.
 
     Layout mirrors report_plot: coverage above (asm2) and right (asm1), contig bars
     hugging the dotplot on the bottom (asm2) and left (asm1). `max_width` and
-    `max_height` bound the dotplot alone; the marginals add `margin_size` + BAR_SIZE.
+    `max_height` bound the dotplot alone; the marginals add `margin_size` + BAR_BOX.
     """
     colors = contig_colors(rd)
     # Until a score arrives, log-ratio mode draws the support classes rather than an
     # all-grey plot, matching what the marginals show in the same state.
-    line_mode = "class" if color_by == "log-ratio" and ratios is None else color_by
+    # Colouring by round is the page's alone (static/app.js `lineStyle`).
+    line_mode = "class" if (color_by == "log-ratio" and ratios is None) or color_by == "round" else color_by
     w, h = fit_main(rd, max_width, max_height)
     main = dotplot_figure(rd, color_by=line_mode, width=w, height=h,
                           visible_layers=visible_layers,
@@ -1182,7 +1211,10 @@ def report_layout(rd, color_by: str = "class", visible_layers=None,
     stackings = {"class": class_stacking(rd)}
     if ratios is not None:
         stackings["ratio"] = ratio_stacking(rd, ratios)
-    active = "ratio" if color_by == "log-ratio" and ratios is not None else "class"
+    if rounds:
+        stackings["round"] = round_stacking(rd, rounds)
+    active = ("ratio" if color_by == "log-ratio" and ratios is not None else
+              "round" if color_by == "round" and rounds else "class")
     mode = Div(text=active, visible=False, name="qv-mode")
     # One coverage scale for both marginals, as in report_plot: equal coverage is
     # equally long on either, so the two candidates compare at a glance. The scale
@@ -1259,7 +1291,7 @@ def report_layout(rd, color_by: str = "class", visible_layers=None,
     mark = _mark_alignment(rd, main)
     readout = _coordinate_readout(rd, main)
 
-    corner = Spacer(width=BAR_SIZE, height=margin_size, tags=["qv:corner"])
+    corner = Spacer(width=BAR_BOX, height=margin_size, tags=["qv:corner"])
     grid = gridplot(
         [[corner, cov_top, None],
          [ybar,                                       main,    cov_right],
@@ -1282,8 +1314,8 @@ def report_layout(rd, color_by: str = "class", visible_layers=None,
     xbar.tags = ["qv:xbar"]
     ybar.tags = ["qv:ybar"]
     for div in (readout, status):
-        div.tags = ["qv:line", {"bar": BAR_SIZE}]
-        div.width = BAR_SIZE + w + margin_size
+        div.tags = ["qv:line", {"bar": BAR_BOX}]
+        div.width = BAR_BOX + w + margin_size
         div.styles = {**div.styles, "white-space": "nowrap", "overflow": "hidden",
                       "text-overflow": "ellipsis"}
     return column(readout, status, grid, pick, mark)   # pick, mark: hidden, for the page

@@ -26,8 +26,8 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from qaview.glyphs import (BACKGROUND_COLORS, BAR_SIZE, MARGIN_SIZE, RATIO_NEG, RATIO_POS,
-                           report_layout, style_spec)
+from qaview.glyphs import (BACKGROUND_COLORS, BAR_BOX, MARGIN_SIZE, RATIO_NEG, RATIO_POS,
+                           report_layout, round_colors, style_spec)
 from qamodel.phmm.reads import FALLBACK_QUAL
 from qaview.similarity import FLOOR as SIM_FLOOR
 from qaview.pipeline import Pipeline
@@ -492,7 +492,7 @@ def create_app(project: Project | None = None, pipeline: Pipeline | None = None,
         import pysam
 
         from qaview.align import align_rect
-        from qaview.glyphs import class_stacking, ratio_stacking
+        from qaview.glyphs import class_stacking, ratio_stacking, round_stacking
         from qaview.pileup import pileup
 
         s = cur()
@@ -508,8 +508,10 @@ def create_app(project: Project | None = None, pipeline: Pipeline | None = None,
                 raise HTTPException(400, str(exc)) from exc
         if reads:
             score = loc.score
+            rounds = s.pipe.recruitment(lid).get("rounds") if color_by == "round" else None
             stacking = (ratio_stacking(rd, {r.name: r.ratio for r in score.reads})
-                        if color_by == "log-ratio" and score is not None else class_stacking(rd))
+                        if color_by == "log-ratio" and score is not None else
+                        round_stacking(rd, rounds) if rounds else class_stacking(rd))
             out["reads"] = pileup(
                 rd, out, {p.asm1.name: p.asm1.bam, p.asm2.name: p.asm2.bam},
                 {p.asm1.name: p.asm1.fasta, p.asm2.name: p.asm2.fasta}, p.db, stacking,
@@ -533,7 +535,7 @@ def create_app(project: Project | None = None, pipeline: Pipeline | None = None,
         loc = s.pipe.loci.get(lid)
         if loc is None:
             raise HTTPException(404, f"no locus {lid}")
-        if color_by not in ("class", "block", "log-ratio"):
+        if color_by not in ("class", "block", "log-ratio", "round"):
             raise HTTPException(400, f"unknown colour mode {color_by!r}")
         if reads not in ("all", "hover"):
             raise HTTPException(400, f"unknown reads mode {reads!r}")
@@ -547,6 +549,7 @@ def create_app(project: Project | None = None, pipeline: Pipeline | None = None,
         # from similarity.FLOOR up, so a lower recruitment pid draws from there.
         bg_floor = max((loc.params or s.project.recruitment)["pid_threshold"], SIM_FLOOR)
         rd = region(s, lid, q)
+        rounds = s.pipe.recruitment(lid).get("rounds")    # None: recruited before rounds were kept
         score = loc.score
         ratios = {r.name: r.ratio for r in score.reads} if score is not None else None
         dropped = set(score.dropped) if score is not None else None
@@ -556,9 +559,9 @@ def create_app(project: Project | None = None, pipeline: Pipeline | None = None,
         visible = {LAYERS[x] for x in layers.split(",") if x in LAYERS}
         layout = report_layout(
             rd, color_by=color_by, visible_layers=visible, ratios=ratios, dropped=dropped,
-            C=C, max_width=w - BAR_SIZE - margin - PAD_W,
-            max_height=h - BAR_SIZE - margin - PAD_H, margin_size=margin,
-            background=bg, floor=bg_floor, reads=reads)
+            C=C, max_width=w - BAR_BOX - margin - PAD_W,
+            max_height=h - BAR_BOX - margin - PAD_H, margin_size=margin,
+            background=bg, floor=bg_floor, reads=reads, rounds=rounds)
         out = {"item": json_item(layout), "locus": loc.row(),
                "background": {"status": loc.background, "error": loc.background_error,
                               "drawn": bg is not None, "floor": bg_floor,
@@ -567,6 +570,7 @@ def create_app(project: Project | None = None, pipeline: Pipeline | None = None,
                               "binsize": bg["binsize"] if bg is not None else None,
                               "sampling": bg["settings"]["sampling_scale"] if bg is not None else None},
                "tie_warning": q.pid_tie_eps >= q.best_pid_delta, "score": None,
+               "rounds": round_colors(max(rounds.values(), default=1)) if rounds else None,
                # what the page needs to restyle without coming back: colouring,
                # C, layers, reads mode and the background are all applied there
                "style": {**style_spec(), "layers": dict(LAYERS)}}

@@ -23,7 +23,7 @@ from bokeh.models import CrosshairTool, GridPlot, WheelZoomTool
 from fixtures import make_region_data
 
 from qaview.glyphs import (
-    BAR_SIZE, MAIN_WIDTH, MARGIN_SIZE, contig_bar_figure, contig_colors,
+    BAR_BOX, MAIN_WIDTH, MARGIN_SIZE, contig_bar_figure, contig_colors,
     END_MARK, contig_end_marks, coverage_figure, dotplot_figure, fit_main, main_height, report_layout, save_html,
     hit_renderer,
 )
@@ -144,8 +144,8 @@ def test_panel_proportions(tmp):
           "top marginal must be as wide as the dotplot")
     check(p["cov_right"].height == h and p["cov_right"].width == MARGIN_SIZE,
           "right marginal must be as tall as the dotplot")
-    check(p["xbar"].width == MAIN_WIDTH and p["xbar"].height == BAR_SIZE, "bottom contig bar")
-    check(p["ybar"].height == h and p["ybar"].width == BAR_SIZE, "left contig bar")
+    check(p["xbar"].width == MAIN_WIDTH and p["xbar"].height == BAR_BOX, "bottom contig bar")
+    check(p["ybar"].height == h and p["ybar"].width == BAR_BOX, "left contig bar")
 
 
 def test_coverage_areas_stack(tmp):

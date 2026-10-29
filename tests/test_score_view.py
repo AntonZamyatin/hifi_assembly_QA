@@ -211,6 +211,10 @@ def test_layout_marginals_follow_colour(tmp):
     check(len(pre) == 1 and "unassigned" in next(iter(pre)),
           "before scoring, log-ratio mode falls back to class marginals")
     check(drawn(lay) == {"stack:class": {True}}, f"no ratio stacking before scoring: {drawn(lay)}")
+    rounds = {n: 1 + i % 3 for i, n in enumerate(names)}
+    lay = report_layout(rd, color_by="round", ratios=ratios, rounds=rounds)
+    check(shown(lay) == {("round 1", "round 2", "round 3", "no round recorded")}, f"{shown(lay)}")
+    check(drawn(lay)["stack:round"] == {True} and drawn(lay)["stack:class"] == {False}, f"{drawn(lay)}")
 
 
 def main():
