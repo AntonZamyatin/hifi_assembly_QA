@@ -37,6 +37,3 @@ extension        = "anchor"
 [resources]
 recruit_workers = 32
 score_workers   = 32
-
-[output]
-dir = "../analysis/mDelDel1"

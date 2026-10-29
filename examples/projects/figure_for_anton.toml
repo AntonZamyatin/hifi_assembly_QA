@@ -38,6 +38,3 @@ extension        = "anchor"
 [resources]
 recruit_workers = 32
 score_workers   = 32
-
-[output]
-dir = "../analysis/figure_for_anton"

@@ -60,6 +60,7 @@ def test_checks_save_and_reload():
     from qaview.project import load_project, new_seed, save_added_seed
 
     with tempfile.TemporaryDirectory() as tmp:
+        os.environ["QAVIEW_CACHE"] = tmp   # results beside the test data
         path = make(tmp)
         fastas(tmp)
         p = load_project(path)
@@ -88,6 +89,7 @@ def test_pipeline_and_endpoint():
     from qaview.server import create_app
 
     with tempfile.TemporaryDirectory() as tmp:
+        os.environ["QAVIEW_CACHE"] = tmp   # results beside the test data
         os.environ["XDG_CONFIG_HOME"] = os.path.join(tmp, "xdg")
         path = make(tmp)
         fastas(tmp)

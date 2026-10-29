@@ -53,3 +53,6 @@ __pycache__/
 
 # ── symlinks to sibling projects ─────────────────────────────────────────────
 /genome_patcher
+
+# ── qaview results (qaview_config.toml cache_dir) ────────────────────────────
+/cache/

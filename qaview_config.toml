@@ -1,0 +1,5 @@
+# qaview settings. Paths are relative to this file.
+
+# Results of every project (recruitment, scores, seeds added in the page) go to
+# <cache_dir>/<project name>.
+cache_dir = "cache"

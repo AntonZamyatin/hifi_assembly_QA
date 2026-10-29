@@ -98,8 +98,6 @@ path     = "../quast/hg002/misassemblies.tsv"
 assembly = "hifiasm"
 
 {RECRUITMENT}
-[output]
-dir = "../analysis/hg002"                 # beside the notebooks
 """)
 
 
@@ -145,8 +143,6 @@ path     = "seeds/{label}_ig.bed"
 assembly = "ref"
 
 {RECRUITMENT}
-[output]
-dir = "../analysis/{label}"
 """)
 
 
@@ -194,8 +190,6 @@ path     = "seeds/figure_for_anton.bed"
 assembly = "ref"
 
 {RECRUITMENT}
-[output]
-dir = "../analysis/figure_for_anton"
 """)
 
 

@@ -1,13 +1,13 @@
 """The project file: one comparison of two assembly candidates (docs/qaview.md §13.2).
 
 A TOML file names the two candidates (FASTA and BAM each), the alignment
-database, where the seeds come from and where results go. Paths are relative to
-the file. Everything the app shows is derived from it, so opening the file is the
-whole of the user's setup.
+database and where the seeds come from. Paths are relative to the file. Everything
+the app shows is derived from it, so opening the file is the whole of the user's
+setup. Results go to the tool's cache, `<cache_dir>/<project name>` (`cache_dir`).
 
 Seeds are source-neutral: each `[[seeds]]` entry is read by the loader for its
 `format` into `Seed` records, and a new source is a new loader in `LOADERS`.
-Seeds added from the page are kept in `<output>/qaview_seeds.json`, not in the
+Seeds added from the page are kept in `<results>/qaview_seeds.json`, not in the
 project file, and read with the rest every time the project is opened.
 """
 
@@ -21,6 +21,24 @@ import re
 import tomllib
 from collections import defaultdict
 from dataclasses import dataclass, field
+from pathlib import Path
+
+# The repository qaview runs from (installed with `pip install -e .`); its config
+# file and, by default, its cache sit there.
+TOOL_ROOT = Path(__file__).resolve().parents[2]
+CONFIG_FILE = TOOL_ROOT / "qaview_config.toml"
+
+
+def cache_dir() -> str:
+    """Where projects' results go: $QAVIEW_CACHE, else the config's `cache_dir`
+    (relative to the config file), else `cache/` beside qaview."""
+    if os.environ.get("QAVIEW_CACHE"):
+        return os.path.abspath(os.path.expanduser(os.environ["QAVIEW_CACHE"]))
+    d = "cache"
+    if CONFIG_FILE.exists():
+        with open(CONFIG_FILE, "rb") as fh:
+            d = tomllib.load(fh).get("cache_dir", d)
+    return os.path.normpath(os.path.join(CONFIG_FILE.parent, os.path.expanduser(d)))
 
 # The notebooks' values (examples/scripts/generate_notebooks_hg002_hic.py), so a
 # project without [recruitment] reproduces the batch.
@@ -233,12 +251,10 @@ def load_project(path: str, check_files: bool = True) -> Project:
         raise ProjectError(f"[resources] unknown keys: {', '.join(sorted(unknown))}")
     resources = {**RESOURCE_DEFAULTS, **t.get("resources", {})}
 
-    output_dir = p(_need(_need(t, "output", path), "dir", "[output]"))
-    # `qaview --output ROOT` (QAVIEW_OUTPUT): results go to ROOT/<project name>, so a
-    # second user can open someone else's project and write only to their own folder.
-    if os.environ.get("QAVIEW_OUTPUT"):
-        output_dir = os.path.join(os.path.abspath(os.path.expanduser(os.environ["QAVIEW_OUTPUT"])),
-                                  t.get("name", os.path.splitext(os.path.basename(path))[0]))
+    name = t.get("name", os.path.splitext(os.path.basename(path))[0])
+    # ponytail: keyed by name alone, so two projects of one name share a folder;
+    # their recruitment and scores are keyed by content, only page-added seeds mix.
+    output_dir = os.path.join(cache_dir(), name)
 
     sources = t.get("seeds", [])
     if isinstance(sources, dict):
@@ -281,7 +297,7 @@ def load_project(path: str, check_files: bool = True) -> Project:
                             "assembly": ", ".join(sorted({x.assembly for x in added})),
                             "seeds": len(added)})
 
-    return Project(path=path, name=t.get("name", os.path.splitext(os.path.basename(path))[0]),
+    return Project(path=path, name=name,
                    asm1=asm1, asm2=asm2, db=db, library_assembly=library,
                    seeds=_dedupe(seeds), recruitment=recruitment, resources=resources,
                    output_dir=output_dir, seed_sources=source_info)

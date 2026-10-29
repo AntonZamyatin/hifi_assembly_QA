@@ -12,7 +12,7 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from qaview.project import (RECRUITMENT_DEFAULTS, ProjectError, load_bed, load_project,
+from qaview.project import (RECRUITMENT_DEFAULTS, ProjectError, cache_dir, load_bed, load_project,
                             load_quast)
 
 _failures = []
@@ -54,8 +54,6 @@ fasta = "b.fa"
 bam = "b.bam"
 [data]
 db = "aln.sqlite"
-[output]
-dir = "out"
 """
 
 
@@ -96,18 +94,18 @@ def test_project_defaults_and_sources():
         check(p.library_assembly == "B", "lambda defaults to asm2")
         check(p.recruitment == RECRUITMENT_DEFAULTS, "recruitment defaults to the notebooks'")
         check(p.resources == {"recruit_workers": 32, "score_workers": 32}, "resources default 32")
-        check(p.output_dir == os.path.join(tmp, "out"), "paths resolve against the file")
+        check(p.output_dir == os.path.join(cache_dir(), p.name), "results go to <cache>/<project name>")
         check(len(p.seeds) == 4, f"3 QUAST + 2 BED with one shared interval -> 4, got {len(p.seeds)}")
         first = p.seeds[0]
         check(first.name == "c1_relocation_001" and first.meta.get("aliases") == ["same_as_quast"],
               f"a shared interval is one seed with an alias: {first}")
         check([s["seeds"] for s in p.seed_sources] == [3, 2], "per-source counts")
-        os.environ["QAVIEW_OUTPUT"] = os.path.join(tmp, "mine")
+        os.environ["QAVIEW_CACHE"] = os.path.join(tmp, "mine")
         try:
             p = load_project(path)
         finally:
-            del os.environ["QAVIEW_OUTPUT"]
-        check(p.output_dir == os.path.join(tmp, "mine", p.name), "--output: ROOT/<project name>")
+            del os.environ["QAVIEW_CACHE"]
+        check(p.output_dir == os.path.join(tmp, "mine", p.name), "--cache: DIR/<project name>")
 
 
 def test_errors_are_reported():
@@ -143,8 +141,8 @@ def test_example_project_parses():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     p = load_project(os.path.join(root, "examples/projects/hg002_hic.toml"), check_files=False)
     check((p.asm1.name, p.asm2.name) == ("hifiasm_hic", "curated"), "example candidates")
-    check(p.loci_dir.endswith("examples/analysis/hg002_hic/loci"),
-          "the example shares the notebooks' score cache")
+    check(p.loci_dir == os.path.join(root, "cache", "hg002_hic", "loci"),
+          "by default the cache is beside qaview")
 
 
 def main():

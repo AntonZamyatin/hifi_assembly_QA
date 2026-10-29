@@ -36,6 +36,3 @@ max_rounds       = 100
 [resources]
 recruit_workers = 32
 score_workers   = 32
-
-[output]
-dir = "../analysis/hg002_hic"             # shares loci/ (the score cache) with the notebooks

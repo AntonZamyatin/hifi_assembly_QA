@@ -46,23 +46,41 @@ tools; the viewer does not need them.
 ## Run qaview
 
 ```bash
-qaview <project.toml> [--port 5006] [--output <dir>]
+qaview <project.toml> [--port 5006] [--cache <dir>]
 ```
 
-On a server, forward the port first (`ssh -L 5006:localhost:5006 <host>`), then open
-http://localhost:5006. With no project given, the page asks for one.
+With no project given, the page asks for one.
 
-**Opening another user's project.** A project file names its data by paths relative to
-itself, so open it where it lies. qaview writes its results (recruitment, scores, seeds
-added in the page) to the project's `[output] dir`; give `--output` to write them to
-`<dir>/<project name>` in your own space instead:
+**From a laptop.** `scripts/qaview-connect.sh` starts qaview on the server and tunnels
+to it in one command; the laptop needs only bash, ssh and curl (macOS, Linux, WSL or
+Git Bash), not this repository:
 
 ```bash
-qaview /scratch/projects/assemblyQA/examples/projects/ferrets.toml --output ~/qaview_out
+curl -O https://raw.githubusercontent.com/AntonZamyatin/hifi_assembly_QA/master/scripts/qaview-connect.sh
+bash qaview-connect.sh <host> --port 5011 --open
+```
+
+The page opens on a form to choose a project (`--project <file>` opens one directly).
+
+`<host>` is anything ssh accepts. It finds the clone's `venv` or the conda env
+`assemblyqa` on the server (`--python` otherwise); users sharing a server each pick a
+`--port`. Ctrl-C stops qaview there. Defaults can live in `QAVIEW_HOST`, `QAVIEW_PORT`,
+`QAVIEW_DIR` and `QAVIEW_PYTHON`. By hand instead: `ssh -L 5006:localhost:5006 <host>`,
+run `qaview` there, open http://localhost:5006.
+
+**Results go to the cache.** Recruitment, scores, seeds added in the page and
+remembered views of a project are kept in `<cache_dir>/<project name>`. `cache_dir` is
+set in `qaview_config.toml` beside qaview (default `cache/` in this clone; `--cache`
+overrides it for one run). Each clone has its own cache, so another user's project
+opens where it lies -- its file names the data by paths relative to itself -- and
+only your cache is written:
+
+```bash
+qaview /scratch/projects/assemblyQA/examples/projects/ferrets.toml
 ```
 
 To start from the owner's finished results rather than recomputing, copy them first:
-`cp -r /scratch/projects/assemblyQA/examples/analysis/ferrets ~/qaview_out/`.
+`cp -r /scratch/projects/assemblyQA/cache/ferrets cache/`.
 
 ## Development install
 
@@ -87,17 +105,3 @@ This aligns reads to each assembly (minimap2), bgzip-indexes the FASTAs, and bui
 combined SQLite alignment DB (`qatool.build_aln_db`). The script puts `src/` on
 `PYTHONPATH`, so it runs without a prior `pip install`. The tools come from `PATH` (the
 `assemblyqa` environment); set `MINIMAP2`, `SAMTOOLS`, `BGZIP` or `PYTHON` to override.
-
-## Secrets
-
-The comparative-study sheet updater needs Google OAuth credentials. They are kept in
-the untracked file `.secrets/google_oauth.env` (never committed). Load with:
-
-```bash
-set -a; source .secrets/google_oauth.env; set +a
-```
-
-## Related
-
-`genome_patcher/` (symlink to a separate repo) patches assemblies with curated patch
-sequences — see its own README.

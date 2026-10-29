@@ -11,4 +11,4 @@ dependencies:
   - htslib            # bgzip
   - pip
   - pip:
-      - .
+      - -e .           # editable: qaview finds its config and cache in this clone

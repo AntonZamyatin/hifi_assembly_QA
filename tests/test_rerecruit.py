@@ -43,8 +43,6 @@ db = "aln.sqlite"
 [[seeds]]
 format = "bed"
 path = "s.bed"
-[output]
-dir = "out"
 """
 
 
@@ -89,6 +87,7 @@ def test_rerecruit():
     from qaview.project import load_project
 
     with tempfile.TemporaryDirectory() as tmp:
+        os.environ["QAVIEW_CACHE"] = tmp   # results beside the test data
         project = load_project(make(tmp))
         pipe = Pipeline(project)
         defaults = dict(project.recruitment)
@@ -171,6 +170,7 @@ def test_failure_keeps_the_seed():
     from qaview.project import load_project
 
     with tempfile.TemporaryDirectory() as tmp:
+        os.environ["QAVIEW_CACHE"] = tmp   # results beside the test data
         project = load_project(make(tmp))
         pipe = Pipeline(project)
         put(pipe, "seed1", {}, 100, ["r1"])
@@ -199,6 +199,7 @@ def test_endpoints():
     from qaview.server import create_app
 
     with tempfile.TemporaryDirectory() as tmp:
+        os.environ["QAVIEW_CACHE"] = tmp   # results beside the test data
         os.environ["XDG_CONFIG_HOME"] = os.path.join(tmp, "xdg")
         project = load_project(make(tmp))
         pipe = Pipeline(project)
@@ -237,6 +238,7 @@ def test_same_reads_share_a_locus_whatever_the_segments():
     from qaview.project import load_project
 
     with tempfile.TemporaryDirectory() as tmp:
+        os.environ["QAVIEW_CACHE"] = tmp   # results beside the test data
         project = load_project(make(tmp))
         pipe = Pipeline(project)
         put(pipe, "seed1", {}, 100, ["r1", "r2"])

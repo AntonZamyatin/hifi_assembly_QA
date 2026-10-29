@@ -41,8 +41,6 @@ db = "aln.sqlite"
 [[seeds]]
 format = "bed"
 path = "s.bed"
-[output]
-dir = "out_{name}"
 """
 
 
@@ -61,6 +59,7 @@ def test_open_and_switch():
     from qaview.server import create_app
 
     with tempfile.TemporaryDirectory() as tmp:
+        os.environ["QAVIEW_CACHE"] = tmp   # results beside the test data
         os.environ["XDG_CONFIG_HOME"] = os.path.join(tmp, "xdg")
         first, second = make(tmp, "first"), make(tmp, "second")
         broken = os.path.join(tmp, "broken.toml")

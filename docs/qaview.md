@@ -671,10 +671,11 @@ extension = "legacy"                      # or "anchor" (§10.1)
 recruit_workers = 32                      # seeds recruited at once
 score_workers = 32                        # processes scoring one locus
 synteny_threads = 32                      # minimap2 threads per genome alignment
-
-[output]
-dir = "../analysis/hg002_hic"             # recruit/, loci/ (score cache), state
 ```
+
+**Results are not the project's.** recruit/, loci/ (the score cache) and the page's
+state go to `<cache_dir>/<project name>`, `cache_dir` from `qaview_config.toml` beside
+qaview (default `cache/`), so anyone can open a project file without writing near it.
 
 **Seeds are a source-neutral list.** Each `[[seeds]]` entry is read by a loader for
 its `format` into `Seed(name, source, assembly, contig, start, end, meta)`. QUAST
@@ -815,7 +816,7 @@ since it knows everything except the seeds.
   coordinates; commas allowed) and an optional name (default
   `<contig>_<start>_<end>`, 0-based like BED). It is checked against the FASTA
   (contig, length) and the project's seeds (same region, name taken), saved to
-  `<output>/qaview_seeds.json` -- not the project file -- which `load_project`
+  `<cache_dir>/<project>/qaview_seeds.json` -- not the project file -- which `load_project`
   reads as one more seed source every time, and recruited at once with the
   project's parameters; its locus is scored next and opens when it appears.
   `POST /api/seeds`.
