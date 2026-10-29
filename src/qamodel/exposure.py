@@ -114,8 +114,11 @@ def library_stats(db_path: str, assembly: str, genome_length: int, *,
     hist = hist[:last]
     if cache:
         store[key] = {"n_reads": int(n), "hist": hist.tolist()}
-        with open(path, "w") as fh:
-            json.dump(store, fh)
+        try:
+            with open(path, "w") as fh:
+                json.dump(store, fh)
+        except OSError:                 # a DB shared read-only: recount next time
+            pass
     return Library(int(n), genome_length, bin_bp, hist)
 
 

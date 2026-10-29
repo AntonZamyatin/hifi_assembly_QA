@@ -102,6 +102,12 @@ def test_project_defaults_and_sources():
         check(first.name == "c1_relocation_001" and first.meta.get("aliases") == ["same_as_quast"],
               f"a shared interval is one seed with an alias: {first}")
         check([s["seeds"] for s in p.seed_sources] == [3, 2], "per-source counts")
+        os.environ["QAVIEW_OUTPUT"] = os.path.join(tmp, "mine")
+        try:
+            p = load_project(path)
+        finally:
+            del os.environ["QAVIEW_OUTPUT"]
+        check(p.output_dir == os.path.join(tmp, "mine", p.name), "--output: ROOT/<project name>")
 
 
 def test_errors_are_reported():

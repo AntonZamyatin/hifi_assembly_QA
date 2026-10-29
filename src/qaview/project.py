@@ -234,6 +234,11 @@ def load_project(path: str, check_files: bool = True) -> Project:
     resources = {**RESOURCE_DEFAULTS, **t.get("resources", {})}
 
     output_dir = p(_need(_need(t, "output", path), "dir", "[output]"))
+    # `qaview --output ROOT` (QAVIEW_OUTPUT): results go to ROOT/<project name>, so a
+    # second user can open someone else's project and write only to their own folder.
+    if os.environ.get("QAVIEW_OUTPUT"):
+        output_dir = os.path.join(os.path.abspath(os.path.expanduser(os.environ["QAVIEW_OUTPUT"])),
+                                  t.get("name", os.path.splitext(os.path.basename(path))[0]))
 
     sources = t.get("seeds", [])
     if isinstance(sources, dict):

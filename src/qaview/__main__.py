@@ -21,7 +21,13 @@ def main(argv=None):
     ap.add_argument("--port", type=int, default=5006)
     ap.add_argument("--host", default="127.0.0.1",
                     help="interface to listen on; keep the default and forward the port")
+    ap.add_argument("--output", metavar="DIR",
+                    help="write results to DIR/<project name> instead of the project's "
+                         "[output] dir, e.g. to open another user's project")
     args = ap.parse_args(argv)
+    if args.output:
+        import os
+        os.environ["QAVIEW_OUTPUT"] = args.output   # read by load_project, here and in the scorer
 
     from qaview.project import ProjectError, load_project
 

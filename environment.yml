@@ -1,0 +1,14 @@
+# One environment for qaview and the data preparation, from the repository root:
+#   mamba env create -f environment.yml && mamba activate assemblyqa
+name: assemblyqa
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.12
+  - minimap2          # scripts/prepare_data.sh
+  - samtools
+  - htslib            # bgzip
+  - pip
+  - pip:
+      - .

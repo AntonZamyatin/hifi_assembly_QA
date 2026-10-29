@@ -2,10 +2,11 @@
 set -euo pipefail
 
 # ── tool paths ───────────────────────────────────────────────────────────────
-MINIMAP2=/scratch/azz5280/mambaforge/bin/minimap2
-SAMTOOLS=samtools
-BGZIP=bgzip
-PYTHON=/scratch/azz5280/mambaforge/bin/python3
+# from PATH (the conda environment of environment.yml); override by exporting them
+MINIMAP2=${MINIMAP2:-minimap2}
+SAMTOOLS=${SAMTOOLS:-samtools}
+BGZIP=${BGZIP:-bgzip}
+PYTHON=${PYTHON:-python3}
 
 THREADS=40
 OUTDIR=.

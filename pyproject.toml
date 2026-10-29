@@ -7,21 +7,29 @@ name = "qatool"
 version = "0.1.0"
 description = "HiFi assembly QA: read recruitment and diagnostic plotting"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"          # tomllib
+# qaview: bokeh draws, fastapi/uvicorn serve the page, edlib and parasail align
+# the stretches under a shift+drag rectangle.
 dependencies = [
     "pysam",
     "pandas",
     "numpy",
     "matplotlib",
+    "bokeh>=3.9,<4",
+    "numba",                    # the compiled pair-HMM engine; scoring is ~28x slower without
+    "fastapi",
+    "uvicorn",
+    "edlib",
+    "parasail",
 ]
 
+[project.scripts]
+qaview = "qaview.__main__:main"
+
 [project.optional-dependencies]
-# qaview: bokeh draws, fastapi/uvicorn serve the page, edlib and parasail align
-# the stretches under a shift+drag rectangle.
-view = ["bokeh", "fastapi", "uvicorn", "edlib", "parasail"]
-# The compiled pair-HMM engine. Without it qamodel still works;
-# forward_window is the same recursion in numpy, about 28x slower.
-model = ["numba"]
+# kept so `pip install .[view]` / `.[model]` still work; both are in the defaults now
+view = []
+model = []
 
 [[project.authors]]
 name = "Anton Zamyatin"
@@ -29,3 +37,6 @@ email = "zamyatin.anton@gmail.com"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+qaview = ["static/*"]
